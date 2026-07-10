@@ -342,9 +342,9 @@ fn parse_term(c: &mut Cursor) -> Result<MTerm, ParseError> {
 fn build_app(ident: &[u8], args: Vec<MTerm>) -> MTerm {
     // AC/C operators are all `tam`-prefixed.  Strip the prefix once and
     // compare the suffix against the (compile-time) symbol-name constants,
-    // avoiding the per-call `Vec` allocations that `pp_maude_ac_sym` /
-    // `pp_maude_c_sym` would do.  The compared bytes are exactly what those
-    // helpers would have produced (`tam` + name), so the dispatch is
+    // avoiding the per-call `Vec` allocations that `pp_maude_ac_sym` (and
+    // the C-symbol equivalent) would do.  The compared bytes are exactly
+    // what those helpers would have produced (`tam` + name), so the dispatch is
     // byte-identical; ordinary (non-`tam`) symbols short-circuit immediately.
     if let Some(suffix) = ident.strip_prefix(FUN_SYM_PREFIX.as_bytes()) {
         // AC operator?
@@ -393,8 +393,7 @@ fn build_app(ident: &[u8], args: Vec<MTerm>) -> MTerm {
         // just round-trip tests.  We intentionally keep a lenient pass here:
         // Maude only ever echoes symbols from the signature we sent it, so in
         // normal operation the check is redundant; we accept the decoded
-        // symbol rather than panicking on a malformed reply.  (The signature
-        // was therefore never consulted, so it is no longer threaded in.)
+        // symbol rather than panicking on a malformed reply.
         return Term::App(FunSym::NoEq(sym), args.into());
     }
     // Unknown — fall back to a public-constructor symbol with the raw name

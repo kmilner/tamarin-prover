@@ -503,14 +503,13 @@ pub fn abstract_rule_and_variants(
     // order.  `abstractedTerms = map snd eqsAbstr` (RuleVariants.hs:69)
     // is consequently a term-`Ord`-sorted list, and it is exactly the
     // payload of the `get variants in MSG : list(cons(...))` Maude query
-    // (`fAppList abstractedTerms`, RuleVariants.hs:72).  RS previously
-    // walked `bindings` in INSERTION order (the order terms were first
-    // visited), so the `list(...)` query had its arguments in a different
-    // order than HS — which seeds Maude's persistent variable-name
-    // interning table differently and flips the enumeration order of
-    // AC-symmetric unifiers far downstream (the UM_three_pass
-    // `CK_secure_UM3` `R_Complete_case_1↔case_2` arm swap at proof line
-    // 1305).  Mirror `M.toList` by iterating the binding entries in
+    // (`fAppList abstractedTerms`, RuleVariants.hs:72).  A different
+    // query-argument order flips downstream AC-symmetric unifier
+    // enumeration (e.g. the UM_three_pass `CK_secure_UM3`
+    // `R_Complete_case_1↔case_2` arm swap), so `abstractedTerms` must
+    // follow HS's ORIGINAL-term `Ord` order — which `bindings.iter()`
+    // (a BTreeMap) already yields.  Mirror `M.toList` by iterating the
+    // binding entries in
     // ORIGINAL-term key order.  Both `abstractionSubst` (substFromList —
     // itself a Map, so order-insensitive) and `abstractedTerms` (the
     // ordered query payload) read from this sorted view.  `bindings` is a
@@ -614,13 +613,10 @@ pub fn abstract_rule_and_variants(
             // counter (RuleVariants.hs:64 `convertRule \`evalFreshTAvoiding\` ru`)
             // because `evalFreshAvoiding` nests its OWN Fresh state.
             //
-            // RS previously used `maude.fresh_idx()` per variant, which
-            // advances the per-rule Maude counter by one per filter call.
-            // For Handshake_Resp's 133 raw variants, that pushed the per-rule
-            // counter from 27 (post-abstrTerm) to 160 BEFORE the simp pipeline
-            // even started.  That high counter then propagated into every
-            // downstream avoid_max computation: variant subst range vars
-            // ended up at idxs ~2255 (RS) instead of ~393 (HS).
+            // Advancing the per-rule Maude counter per filter call would
+            // inflate it across all raw variants (e.g. Handshake_Resp:
+            // 27→160 pre-simp) and propagate into every downstream
+            // avoid_max, producing range-var idxs ~2255 vs HS's ~393.
             //
             // Mirror HS by seeding LOCALLY from `frees premiseTerms` and
             // advancing only a local `counter`.  Maude's global counter
@@ -754,14 +750,12 @@ pub fn abstract_rule_and_variants(
     // `eqsNextSplitId` by 1 at EVERY `labelNodeId` for such a rule even though
     // `simp`'s `simpSingleton` immediately folds the singleton and
     // `removeSolvedSplitGoals` later deletes the orphaned SplitG (the
-    // split-id counter bump persists).  RS previously used `Vec::new()` here,
-    // dropping the trivial disjunction entirely → no `add_disj` → its
-    // `eqsNextSplitId` ran one BEHIND HS for each rule whose variants collapse
-    // to the identity (spdm121 `I_KE_Request`/`I_KE_RequestPK`: Maude returns
-    // the single identity variant, `simp` collapses it to `residual=Nothing`).
-    // That under-bump shifted every later `splitEqs(N)` render label by -1
-    // (spdm121 `Attack_Responder_Requester_Mode_Switch`: HS `splitEqs(4)` vs
-    // RS `splitEqs(3)`).
+    // split-id counter bump persists).  Dropping the trivial
+    // disjunction here would skip `add_disj`'s `eqsNextSplitId` bump
+    // that HS always performs for rules whose variants collapse to
+    // identity, shifting every later `splitEqs(N)` render label by -1
+    // (spdm121 `Attack_Responder_Requester_Mode_Switch`: HS
+    // `splitEqs(4)` vs RS `splitEqs(3)`).
     //
     // Mirror HS exactly: `Nothing -> trueDisj`, `Just fs -> fs` (the
     // pre-simp `removeRenamings`/`isFreshRedundant` already ran on the
@@ -827,13 +821,11 @@ pub fn abstract_rule_and_variants(
 ///     range terms are passed through unchanged (`mapDomain (v, t) = (,t) <$>
 ///     mapFrees f v`).
 ///
-/// Past RS bug: walking + renaming subst RANGE introduced extra names into
-/// PreciseFreshState (contaminating per-name counters) and rewrote range
-/// vars HS leaves alone — diverging the abstrTerm-vs-original variable
-/// idxs that downstream `someRuleACInst`'s uniform shift produces, then
-/// flipping AC-sorted variant-subst order, then rotating
-/// performSplit-case numbering. Symptom on JKL_TS1_2004:
-/// `Sessk_reveal_case_3` (RS) vs `Sessk_reveal_case_4` (HS).
+/// Walking/renaming the subst RANGE (instead of keys-only) would
+/// introduce extra names into PreciseFreshState and rewrite range vars
+/// HS leaves alone, diverging downstream variable idxs and AC-sorted
+/// variant order (symptom on JKL_TS1_2004: `Sessk_reveal_case_3` vs HS
+/// `Sessk_reveal_case_4`).
 /// Would HS's `renamePrecise` (per-name fresh indices, RuleVariants.hs:64)
 /// rewrite any of this rule's free vars?  True iff some var's renamePrecise
 /// index differs from its original — the realistic trigger being two free
@@ -940,28 +932,17 @@ fn rename_precise_rule_with_variants(
     let map_term = |t: LNTerm| -> LNTerm {
         t.map_free(&mut |v| map_var(&v))
     };
+    let map_facts = |fs: Vec<Fact<LNTerm>>| -> Vec<Fact<LNTerm>> {
+        fs.into_iter().map(|f| Fact {
+            tag: f.tag,
+            annotations: f.annotations,
+            terms: f.terms.into_iter().map(map_term).collect(),
+        }).collect()
+    };
 
-    let new_premises: Vec<Fact<LNTerm>> = rule.premises.into_iter().map(|f| {
-        Fact {
-            tag: f.tag,
-            annotations: f.annotations,
-            terms: f.terms.into_iter().map(map_term).collect(),
-        }
-    }).collect();
-    let new_conclusions: Vec<Fact<LNTerm>> = rule.conclusions.into_iter().map(|f| {
-        Fact {
-            tag: f.tag,
-            annotations: f.annotations,
-            terms: f.terms.into_iter().map(map_term).collect(),
-        }
-    }).collect();
-    let new_actions: Vec<Fact<LNTerm>> = rule.actions.into_iter().map(|f| {
-        Fact {
-            tag: f.tag,
-            annotations: f.annotations,
-            terms: f.terms.into_iter().map(map_term).collect(),
-        }
-    }).collect();
+    let new_premises = map_facts(rule.premises);
+    let new_conclusions = map_facts(rule.conclusions);
+    let new_actions = map_facts(rule.actions);
     let new_nvs: Vec<LNTerm> = rule.new_vars.into_iter().map(map_term).collect();
     let new_rule = crate::rule::Rule::new(
         rule.info,

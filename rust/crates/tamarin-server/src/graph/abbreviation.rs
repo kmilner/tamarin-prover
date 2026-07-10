@@ -93,21 +93,10 @@ pub fn apply_abbreviations_term(
     if let Some(abbrev) = lookup(t) {
         return abbrev;
     }
-    match t {
-        Term::Lit(_) => t.clone(),
-        Term::App(s, args) => {
-            let new_args: Vec<LNTerm> = args.iter()
-                .map(|a| apply_abbreviations_term(lookup, a))
-                .collect();
-            // Fast path: if no child changed and no abbreviation matched at
-            // this node, the rebuilt App is structurally identical to `t`, so
-            // return an O(1) Arc bump instead of allocating a fresh App.
-            if new_args.iter().zip(args.iter()).all(|(n, o)| n == o) {
-                return t.clone();
-            }
-            Term::App(s.clone(), new_args.into())
-        }
-    }
+    // No abbreviation matched at this node: recurse into the proper subterms.
+    // The Lit/App handling (with the same fast-path Arc bump and per-arg
+    // recursion via `apply_abbreviations_term`) is exactly `apply_proper_subterms`.
+    apply_proper_subterms(lookup, t)
 }
 
 /// Apply abbreviation substitution to all terms of a fact.
@@ -419,7 +408,7 @@ fn lnterm_doc(t: &LNTerm) -> Doc {
             pp_terms(", ", 1, "<", ">", flat)
         }
         Term::App(FunSym::NoEq(sym), ts) if ts.is_empty() => {
-            Doc::text(String::from_utf8_lossy(sym.name).into_owned())
+            Doc::text(String::from_utf8_lossy(sym.name))
         }
         Term::App(FunSym::NoEq(sym), ts) => {
             pp_fun(&String::from_utf8_lossy(sym.name), ts)
@@ -492,31 +481,6 @@ fn judge_term(
     let relative = if occs == 1 && legend_occs == [1] { 0 } else { occs };
     if relative <= 1 { return -1; }
     relative * term_weight
-}
-
-// ---------------------------------------------------------------------
-// Subterm-counting (used to decrement occurrences after chosing a term)
-// ---------------------------------------------------------------------
-
-/// Number of times `needle` appears as a PROPER subterm of `haystack`.
-/// Mirror of `countProperSubterms t (FApp _ ts) = sum $ map (countSubterms t) ts`
-/// (Raw.hs `countProperSubterms`).
-fn count_proper_subterms(needle: &LNTerm, haystack: &LNTerm) -> i64 {
-    match haystack {
-        Term::App(_, args) => args.iter().map(|a| count_subterms(needle, a)).sum(),
-        _ => 0,
-    }
-}
-
-/// Mirror of `countSubterms t1 t2 = if t1 == t2 then 1 else countProperSubterms t1 t2`
-/// (Raw.hs `countSubterms`).  Note: when `needle == haystack` it returns 1 and does NOT
-/// descend further (matches `if ... then 1 else ...`).
-fn count_subterms(needle: &LNTerm, haystack: &LNTerm) -> i64 {
-    if needle == haystack {
-        1
-    } else {
-        count_proper_subterms(needle, haystack)
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -593,8 +557,9 @@ pub fn compute_abbreviations(
         for (term, (occs, legend_occs)) in term_occs {
             if term == candidate { continue; }
             // Haskell: `countProperSubterms term candidate` — occurrences of
-            // `term` (needle) inside `candidate` (haystack).
-            let sub_count = count_proper_subterms(&term, &candidate);
+            // `term` (needle) inside `candidate` (haystack).  Shared generic
+            // helper (term.rs, Raw.hs port); usize→i64 is exact here.
+            let sub_count = tamarin_term::term::count_proper_subterms(&term, &candidate) as i64;
             let mut new_legend_occs = legend_occs;
             new_legend_occs.push(sub_count);
             new_term_occs.insert(term, (occs, new_legend_occs));

@@ -34,22 +34,7 @@ fn pub_name_is(t: &SapicTerm, id: &str) -> bool {
 
 /// `freeset = fromList . frees` over an `LNTerm`.
 fn freeset(t: &LNTerm) -> BTreeSet<LVar> {
-    fn go(t: &LNTerm, out: &mut BTreeSet<LVar>) {
-        match t {
-            VTerm::Lit(Lit::Var(v)) => {
-                out.insert(v.clone());
-            }
-            VTerm::Lit(_) => {}
-            VTerm::App(_, args) => {
-                for a in args.iter() {
-                    go(a, out);
-                }
-            }
-        }
-    }
-    let mut out = BTreeSet::new();
-    go(t, &mut out);
-    out
+    tamarin_term::vterm::vars_vterm(t).into_iter().collect()
 }
 
 /// `reliableChannelInit anP (initrules, initTx)` (ReliableChannelTranslation.hs:27-35):

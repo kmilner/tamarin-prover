@@ -121,9 +121,8 @@ pub(crate) fn eq_term_subs(
 //     preserving its sort, and is applied across the whole range.
 //
 // This is a FAITHFUL port of HS `canonizeSubst` (the occurrence-set
-// ordering), distinct from the earlier count-based approximation that
-// lived here before `0b242f4a` — `bpVariantsIntruder` depends on the
-// exact HS ordering to dedup BP destructor variants byte-identically.
+// ordering) — `bpVariantsIntruder` depends on the exact HS ordering to
+// dedup BP destructor variants byte-identically.
 // =============================================================================
 
 use crate::lterm::LVar;
@@ -178,8 +177,7 @@ fn show_funsym_ac_c(sym: &FunSym) -> String {
 ///     FApp o        as -> mconcat $ map (foldFreesOcc f (show o:c)) as
 /// ```
 ///
-/// **The NoEq vs AC/C asymmetry is load-bearing** (the bug that an
-/// earlier version of this port got wrong): for a `NoEq` symbol the
+/// **The NoEq vs AC/C asymmetry is load-bearing**: for a `NoEq` symbol the
 /// children `as :: [Term]` are folded via the `[a]` HasFrees instance
 /// (LTerm.hs:843), which prepends each child's `show argIdx` to the
 /// context.  But for an AC/C symbol HS does `mconcat $ map

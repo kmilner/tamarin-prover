@@ -406,6 +406,88 @@ fn gather_reusable_lemmas(
     Ok(reuse_lemmas)
 }
 
+/// Gather the typing assumptions folded into a lemma's refined-source
+/// computation, plus the SORTED `source_key` identifying that computation
+/// (the set of `[sources]`-lemma names used; callers off the session cache
+/// path ignore the key).
+///
+/// HS-faithful per-lemma RAW-vs-REFINED selection (ClosedTheory.hs:116-118
+/// `cases = case lemmaSourceKind l of RawSource -> crcRawSources;
+/// RefinedSource -> crcRefinedSources`).  `[sources]` lemmas (RawSource,
+/// Lemma.hs:40) use the RAW precomputed sources — `refineWithSourceAsms` is
+/// NEVER applied to them — so they carry NO typing assumptions (an empty
+/// list makes `ensure_saturated` skip the refine and use the raw cases
+/// verbatim).  All other lemmas (RefinedSource) use the refined sources
+/// (`refineWithSourceAsms parameters typAsms`, Rule.hs:157), so they fold in
+/// every prior `[sources]`-lemma assumption (HS `typAsms`, Prover.hs:142-144,
+/// which uses `formulaToGuarded_` — fail-loud, so a non-guardable formula
+/// propagates a `ProveError` rather than being silently dropped).  The proved
+/// lemma is excluded (self-refinement is circular).
+fn gather_typing_assumptions(
+    theory: &crate::theory::Theory,
+    lemma_name: &str,
+    kind: SourceKind,
+) -> Result<(Vec<Guarded>, Vec<String>), ProveError> {
+    let mut typing_assumptions: Vec<Guarded> = Vec::new();
+    let mut source_key: Vec<String> = Vec::new();
+    if kind >= SourceKind::RefinedSources {
+        for prior in theory.lemmas() {
+            if prior.name == lemma_name { continue; }
+            if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
+                continue;
+            }
+            if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
+                continue;
+            }
+            let rg = formula_to_guarded(&prior.formula)
+                .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
+            typing_assumptions.push(rg);
+            source_key.push(prior.name.clone());
+        }
+    }
+    source_key.sort();
+    Ok((typing_assumptions, source_key))
+}
+
+/// Resolve the goal-ranking heuristic for a lemma, mirroring HS
+/// `selectHeuristic prover ctx = apDefaultHeuristic prover <|> L.get
+/// pcHeuristic ctx` (Proof.hs:707-708): the CLI `--heuristic`
+/// (`apDefaultHeuristic`) OVERRIDES the per-lemma / theory heuristic when
+/// present.  Otherwise fall back to per-lemma `[heuristic=..]` > theory-level
+/// `heuristic:` > None (`getProofContext.specifiedHeuristic`,
+/// ClosedTheory.hs:123-131); `None` becomes `SmartRanking False` downstream.
+/// The in-file fallback resolves oracle paths against the theory dir and
+/// `{name}` tactic rankings against `tactics`.
+fn resolve_heuristic(
+    cli: &CliHeuristic,
+    lemma: &crate::theory::Lemma,
+    theory_heuristic_first: Option<&str>,
+    tactics: &[crate::tactic::Tactic],
+    in_file: &str,
+) -> Option<Vec<crate::constraint::solver::goals::GoalRanking>> {
+    match resolve_cli_heuristic(cli, in_file, tactics) {
+        Some(rankings) => Some(rankings),
+        None => {
+            let lemma_heuristic: Option<&str> =
+                lemma.attributes.iter().find_map(|a| match a {
+                    crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
+                    _ => None,
+                });
+            let heuristic_raw: Option<String> = match lemma_heuristic {
+                Some(h) => Some(h.to_string()),
+                None => theory_heuristic_first.map(|s| s.to_string()),
+            };
+            heuristic_raw.map(|h| {
+                let mut rankings =
+                    crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
+                        &h, in_file, tactics);
+                prepend_theory_dir_to_oracle_paths(&mut rankings, in_file);
+                rankings
+            })
+        }
+    }
+}
+
 impl ProverSession {
     /// Build the shared per-file state, also setting `theory.in_file` for
     /// oracle path resolution (HS Parser.hs).  Does the expensive
@@ -558,52 +640,16 @@ pub fn prove_system_in_session(
         crate::theory::TraceQuantifier::ExistsTrace,
     );
     let session_in_file = &theory.in_file;
-    ctx.heuristic = match resolve_cli_heuristic(
-        &session.cli_heuristic, session_in_file, &theory.tactic)
-    {
-        Some(rankings) => Some(rankings),
-        None => {
-            let lemma_heuristic: Option<&str> =
-                lemma.attributes.iter().find_map(|a| match a {
-                    crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
-                    _ => None,
-                });
-            let session_heuristic_raw: Option<String> = match lemma_heuristic {
-                Some(h) => Some(h.to_string()),
-                None => theory.heuristic.first().cloned(),
-            };
-            session_heuristic_raw.map(|h| {
-                let mut rankings =
-                    crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
-                        &h, session_in_file, &theory.tactic);
-                prepend_theory_dir_to_oracle_paths(&mut rankings, session_in_file);
-                rankings
-            })
-        }
-    };
+    ctx.heuristic = resolve_heuristic(
+        &session.cli_heuristic, lemma, theory.heuristic.first().map(|s| s.as_str()),
+        &theory.tactic, session_in_file);
     ctx.lemma_name = lemma_name.to_string();
     ctx.theory_file = session_in_file.clone();
     // `[sources]` lemmas prove against RAW sources (no typing
     // assumptions); all others fold in every prior `[sources]` lemma —
     // identical gate to `prove_lemma_in_session_mode`.
-    let mut typing_assumptions: Vec<Guarded> = Vec::new();
-    let mut source_key: Vec<String> = Vec::new();
-    if lemma_source_kind >= SourceKind::RefinedSources {
-        for prior in theory.lemmas() {
-            if prior.name == lemma_name { continue; }
-            if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
-                continue;
-            }
-            if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
-                continue;
-            }
-            let rg = formula_to_guarded(&prior.formula)
-                .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
-            typing_assumptions.push(rg);
-            source_key.push(prior.name.clone());
-        }
-    }
-    source_key.sort();
+    let (typing_assumptions, source_key) =
+        gather_typing_assumptions(theory, lemma_name, lemma_source_kind)?;
     ctx.typing_assumptions = typing_assumptions;
     // Saturate (or restore from the session's refined-source cache) —
     // the search below always consults source cases, so this is the
@@ -614,7 +660,14 @@ pub fn prove_system_in_session(
     if !cache_disabled {
         let guard = session.source_cache.lock().unwrap();
         if let Some(entry) = guard.get(&source_key) {
-            for src in &mut ctx.full_sources {
+            // `ctx` is a fresh `template_ctx.clone()` (deep copy), so its
+            // shared bundle is uniquely owned — `Arc::get_mut` succeeds and
+            // this per-lemma restore cannot touch any sibling lemma's
+            // sources.  `cases_set_list` alone is interior-mutable, but
+            // `src.incomplete = …` needs `&mut`, hence `get_mut` here.
+            let shared = std::sync::Arc::get_mut(&mut ctx.shared)
+                .expect("per-lemma ctx uniquely owns its source bundle before search");
+            for src in &mut shared.full_sources {
                 if let Some((_, cases, incomplete)) =
                     entry.sources.iter().find(|(g, _, _)| *g == src.goal)
                 {
@@ -730,73 +783,13 @@ fn prove_lemma_in_session_mode(
         crate::theory::TraceQuantifier::ExistsTrace,
     );
     let session_in_file = &theory.in_file;
-    // HS `selectHeuristic prover ctx = ... apDefaultHeuristic prover <|>
-    // L.get pcHeuristic ctx` (Proof.hs:707-708): the CLI `--heuristic`
-    // (apDefaultHeuristic) OVERRIDES the per-lemma / theory heuristic when
-    // present.  Otherwise fall back to per-lemma `[heuristic=..]` > theory
-    // `heuristic:`.
-    ctx.heuristic = match resolve_cli_heuristic(
-        &session.cli_heuristic, session_in_file, &theory.tactic)
-    {
-        Some(rankings) => Some(rankings),
-        None => {
-            let lemma_heuristic: Option<&str> =
-                lemma.attributes.iter().find_map(|a| match a {
-                    crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
-                    _ => None,
-                });
-            let session_heuristic_raw: Option<String> = match lemma_heuristic {
-                Some(h) => Some(h.to_string()),
-                None => theory.heuristic.first().cloned(),
-            };
-            session_heuristic_raw.map(|h| {
-                let mut rankings =
-                    crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
-                        &h, session_in_file, &theory.tactic);
-                prepend_theory_dir_to_oracle_paths(&mut rankings, session_in_file);
-                rankings
-            })
-        }
-    };
+    ctx.heuristic = resolve_heuristic(
+        &session.cli_heuristic, lemma, theory.heuristic.first().map(|s| s.as_str()),
+        &theory.tactic, session_in_file);
     ctx.lemma_name = lemma_name.to_string();
     ctx.theory_file = session_in_file.clone();
-    let mut typing_assumptions: Vec<Guarded> = Vec::new();
-    // `source_key` identifies the refined-source computation: the SORTED
-    // set of `[sources]`-lemma names folded into `typing_assumptions`.
-    //
-    // HS-faithful per-lemma RAW-vs-REFINED selection (ClosedTheory.hs:116-118
-    // `cases = case lemmaSourceKind l of RawSource -> crcRawSources;
-    // RefinedSource -> crcRefinedSources`).  `[sources]` lemmas (RawSource,
-    // Lemma.hs:40) use the RAW precomputed sources — `refineWithSourceAsms`
-    // is NEVER applied to them — so they must carry NO typing assumptions
-    // (an empty list makes `ensure_saturated` skip the refine and use the
-    // raw cases verbatim).  All other lemmas (RefinedSource) use the refined
-    // sources (`refineWithSourceAsms parameters typAsms`, Rule.hs:157), so
-    // they fold in every `[sources]`-lemma assumption.  Without this gate RS
-    // refined EVERY lemma's sources, which both (a) wrongly applied refine to
-    // the `[sources]` lemmas themselves (init_server) and (b) is the seam
-    // that lets the refine actually drop the extra coerce/open-chain `outL`
-    // deconstruction case for the non-`[sources]` lemmas.
-    let mut source_key: Vec<String> = Vec::new();
-    if lemma_source_kind >= SourceKind::RefinedSources {
-        for prior in theory.lemmas() {
-            if prior.name == lemma_name { continue; }
-            if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
-                continue;
-            }
-            if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
-                continue;
-            }
-            // HS `typAsms` (Prover.hs:142-144) uses `formulaToGuarded_`
-            // (fail-loud) on each source-lemma formula — propagate rather than
-            // silently drop.
-            let rg = formula_to_guarded(&prior.formula)
-                .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
-            typing_assumptions.push(rg);
-            source_key.push(prior.name.clone());
-        }
-    }
-    source_key.sort();
+    let (typing_assumptions, source_key) =
+        gather_typing_assumptions(theory, lemma_name, lemma_source_kind)?;
     ctx.typing_assumptions = typing_assumptions;
     let t_sat: Option<std::time::Instant> =
         if trace { Some(std::time::Instant::now()) } else { None };
@@ -838,7 +831,12 @@ fn prove_lemma_in_session_mode(
             // Restore cached cases onto this clone's lazy sources by goal,
             // then mark saturation Done so `cases(ctx)` reads them directly
             // and the expensive `ensure_saturated` pass is skipped.
-            for src in &mut ctx.full_sources {
+            // `ctx` is a fresh `template_ctx.clone()` (deep copy), so its
+            // shared bundle is uniquely owned; `Arc::get_mut` succeeds and
+            // the `src.incomplete = …` write cannot reach a sibling lemma.
+            let shared = std::sync::Arc::get_mut(&mut ctx.shared)
+                .expect("per-lemma ctx uniquely owns its source bundle before search");
+            for src in &mut shared.full_sources {
                 if let Some((_, cases, incomplete)) =
                     entry.sources.iter().find(|(g, _, _)| *g == src.goal)
                 {
@@ -1120,33 +1118,9 @@ pub fn prove_lemma_with_pool_file_heuristic(
     // ProofMethod.hs:576-595), resolves oracle paths, and resolves
     // `{name}` tactic rankings against `theory.tactic`.
     let in_file = &theory.in_file;
-    ctx.heuristic = match resolve_cli_heuristic(cli_heuristic, in_file, &theory.tactic) {
-        Some(rankings) => Some(rankings),
-        None => {
-            let lemma_heuristic: Option<&str> =
-                lemma.attributes.iter().find_map(|a| match a {
-                    crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
-                    _ => None,
-                });
-            // Build raw heuristic string: per-lemma overrides theory-level.
-            let heuristic_raw: Option<String> = match lemma_heuristic {
-                Some(h) => Some(h.to_string()),
-                None => theory.heuristic.first().cloned(),
-            };
-            heuristic_raw.map(|h| {
-                // Resolve oracle paths relative to theory file dir.
-                // HS `oraclePath oracle = takeDirectory inFile </> normalise
-                // relPath` (System.hs:574-575, Parser.hs:304).  Resolve
-                // `{name}` tactic rankings against `theory.tactic`
-                // (HS `chosenTactic`, ProofMethod.hs:494-496).
-                let mut rankings =
-                    crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
-                        &h, in_file, &theory.tactic);
-                prepend_theory_dir_to_oracle_paths(&mut rankings, in_file);
-                rankings
-            })
-        }
-    };
+    ctx.heuristic = resolve_heuristic(
+        cli_heuristic, lemma, theory.heuristic.first().map(|s| s.as_str()),
+        &theory.tactic, in_file);
     // Set lemma_name and theory_file on ctx for oracle invocation.
     ctx.lemma_name = lemma_name.to_string();
     ctx.theory_file = in_file.clone();
@@ -1162,29 +1136,10 @@ pub fn prove_lemma_with_pool_file_heuristic(
     // carry NO typing assumptions (empty list => `ensure_saturated` skips the
     // refine).  All other lemmas (RefinedSource) fold in every prior
     // `[sources]`-lemma assumption (HS `typAsms`, Prover.hs:142-144).
-    let mut typing_assumptions: Vec<Guarded> = Vec::new();
-    if lemma_source_kind >= SourceKind::RefinedSources {
-        for prior in theory.lemmas() {
-            // Exclude the lemma we're currently proving — using it as its
-            // own refinement assumption is circular.  In Haskell, [sources]
-            // lemmas are proved via induction (against unrefined source-
-            // cases); only AFTER they're proved do they become typing
-            // assumptions for OTHER lemmas' source-case refinement.
-            if prior.name == lemma_name { continue; }
-            if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
-                continue;
-            }
-            if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
-                continue;
-            }
-            // HS `typAsms` (Prover.hs:142-144) uses `formulaToGuarded_`
-            // (fail-loud) on each source-lemma formula — propagate rather than
-            // silently drop.
-            let rg = formula_to_guarded(&prior.formula)
-                .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
-            typing_assumptions.push(rg);
-        }
-    }
+    // The proved lemma is excluded (self-refinement is circular); the
+    // sorted source_key is unused off the session path.
+    let (typing_assumptions, _source_key) =
+        gather_typing_assumptions(&theory, lemma_name, lemma_source_kind)?;
     // HS-faithful saturation: store typing assumptions, then eagerly
     // run `ensure_saturated` (which applies `refine_with_source_asms`
     // with the assumptions just set).  This matches HS's
@@ -1395,12 +1350,9 @@ mod tests {
 
     #[test]
     fn probe_cr_recentalive_with_hashing_sig() {
-        // Pinning regression test for the substSystem-edge-uniqueness
-        // fixed-point bug: with the elaborated MaudeSig (hashing), the
-        // simplify loop used to spin 256 iters per case because
-        // `enforce_edge_uniqueness` kept signalling `Changed` on
-        // already-canonical edges. The fix drops trivially-equal node
-        // equalities before re-firing the pass.
+        // Regression test: with the elaborated MaudeSig (hashing), the
+        // simplify loop must converge instead of spinning on
+        // already-canonical edges.
         let mp = match maude_path_local() { Some(p) => p, None => return };
         let src = std::fs::read_to_string(
             concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/CR_external.spthy"))
@@ -1412,13 +1364,9 @@ mod tests {
         let t0 = std::time::Instant::now();
         let _ = prove_lemma(&pt, "recentalive", h, 200).expect("prove");
         let dt = t0.elapsed();
-        // Must complete promptly — without the fix this lemma would
-        // run for >30s before our wall-clock deadline kicked in.
-        // After fix #27 (full `exploit_prems` in solve_premise_goal),
-        // goal tracking is denser and this exists-trace probe takes
-        // longer to settle; threshold raised from 5s to 60s.  The
-        // load-bearing assertion is that the simplify loop *does
-        // converge* — the prior bug spun forever at every node.
+        // Must complete within a generous bound; the load-bearing
+        // assertion is that the simplify loop converges, not the specific
+        // timing.
         assert!(dt < std::time::Duration::from_secs(60),
             "recentalive ran {:?}, expected ≤60s (simplify-loop converges)", dt);
     }

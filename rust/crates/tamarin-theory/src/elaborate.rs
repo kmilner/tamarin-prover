@@ -91,7 +91,7 @@ thread_local! {
 }
 use tamarin_term::term::{f_app_no_eq, Term};
 use tamarin_term::lterm::{Name, NameTag};
-use tamarin_term::vterm::Lit;
+use tamarin_term::vterm::{Lit, VTerm};
 use tamarin_term::maude_sig::{
     asym_enc_dest_maude_sig, asym_enc_maude_sig, bp_maude_sig, dh_maude_sig,
     enable_diff_maude_sig, hash_maude_sig, location_report_maude_sig,
@@ -510,31 +510,45 @@ pub fn builtin_nullary_constants(name: &str) -> Vec<String> {
     }
 }
 
-/// RAII guard that swaps in a fresh `USER_UNARY_FUNS` set for the
-/// duration of an `elaborate()` call and restores the previous value
-/// on drop.  Ensures nested or sequential elaborations don't bleed
-/// each other's arity-1 function sets.
-struct UserUnaryFunsGuard {
-    previous: BTreeSet<String>,
+/// Generates an RAII guard that swaps a fresh `BTreeSet<String>` into a
+/// thread-local for the guard's lifetime and restores the previous value on
+/// drop.  All four user-declared-function thread-locals (`USER_UNARY_FUNS`,
+/// `USER_NULLARY_FUNS`, `USER_PRIVATE_FUNS`, `USER_DESTRUCTOR_FUNS`) share
+/// this identical swap/restore logic; the macro is their single source of
+/// truth.
+macro_rules! btreeset_swap_guard {
+    ($(#[$meta:meta])* $Guard:ident, $tl:path) => {
+        $(#[$meta])*
+        struct $Guard {
+            previous: BTreeSet<String>,
+        }
+
+        impl $Guard {
+            fn set(new: BTreeSet<String>) -> Self {
+                let previous = $tl.with(|c| {
+                    let mut b = c.borrow_mut();
+                    std::mem::replace(&mut *b, new)
+                });
+                $Guard { previous }
+            }
+        }
+
+        impl Drop for $Guard {
+            fn drop(&mut self) {
+                $tl.with(|c| {
+                    *c.borrow_mut() = std::mem::take(&mut self.previous);
+                });
+            }
+        }
+    };
 }
 
-impl UserUnaryFunsGuard {
-    fn set(new: BTreeSet<String>) -> Self {
-        let previous = USER_UNARY_FUNS.with(|c| {
-            let mut b = c.borrow_mut();
-            
-            std::mem::replace(&mut *b, new)
-        });
-        UserUnaryFunsGuard { previous }
-    }
-}
-
-impl Drop for UserUnaryFunsGuard {
-    fn drop(&mut self) {
-        USER_UNARY_FUNS.with(|c| {
-            *c.borrow_mut() = std::mem::take(&mut self.previous);
-        });
-    }
+btreeset_swap_guard! {
+    /// RAII guard that swaps in a fresh `USER_UNARY_FUNS` set for the
+    /// duration of an `elaborate()` call and restores the previous value
+    /// on drop.  Ensures nested or sequential elaborations don't bleed
+    /// each other's arity-1 function sets.
+    UserUnaryFunsGuard, USER_UNARY_FUNS
 }
 
 /// True if `name` is registered as a user-declared arity-1 function for
@@ -543,27 +557,9 @@ fn is_user_unary_fun(name: &str) -> bool {
     USER_UNARY_FUNS.with(|c| c.borrow().contains(name))
 }
 
-/// Same as `UserUnaryFunsGuard` but for the `USER_NULLARY_FUNS` set.
-struct UserNullaryFunsGuard {
-    previous: BTreeSet<String>,
-}
-
-impl UserNullaryFunsGuard {
-    fn set(new: BTreeSet<String>) -> Self {
-        let previous = USER_NULLARY_FUNS.with(|c| {
-            let mut b = c.borrow_mut();
-            std::mem::replace(&mut *b, new)
-        });
-        UserNullaryFunsGuard { previous }
-    }
-}
-
-impl Drop for UserNullaryFunsGuard {
-    fn drop(&mut self) {
-        USER_NULLARY_FUNS.with(|c| {
-            *c.borrow_mut() = std::mem::take(&mut self.previous);
-        });
-    }
+btreeset_swap_guard! {
+    /// Same as `UserUnaryFunsGuard` but for the `USER_NULLARY_FUNS` set.
+    UserNullaryFunsGuard, USER_NULLARY_FUNS
 }
 
 /// True if `name` is registered as a 0-arity function for the current
@@ -572,27 +568,9 @@ pub(crate) fn is_user_nullary_fun(name: &str) -> bool {
     USER_NULLARY_FUNS.with(|c| c.borrow().contains(name))
 }
 
-/// RAII guard for the USER_PRIVATE_FUNS thread-local.
-struct UserPrivateFunsGuard {
-    previous: BTreeSet<String>,
-}
-
-impl UserPrivateFunsGuard {
-    fn set(new: BTreeSet<String>) -> Self {
-        let previous = USER_PRIVATE_FUNS.with(|c| {
-            let mut b = c.borrow_mut();
-            std::mem::replace(&mut *b, new)
-        });
-        UserPrivateFunsGuard { previous }
-    }
-}
-
-impl Drop for UserPrivateFunsGuard {
-    fn drop(&mut self) {
-        USER_PRIVATE_FUNS.with(|c| {
-            *c.borrow_mut() = std::mem::take(&mut self.previous);
-        });
-    }
+btreeset_swap_guard! {
+    /// RAII guard for the USER_PRIVATE_FUNS thread-local.
+    UserPrivateFunsGuard, USER_PRIVATE_FUNS
 }
 
 /// Returns `Privacy::Private` if `name` is a user-declared private
@@ -604,27 +582,9 @@ fn user_fun_privacy(name: &str) -> Privacy {
     })
 }
 
-/// RAII guard for the USER_DESTRUCTOR_FUNS thread-local.
-struct UserDestructorFunsGuard {
-    previous: BTreeSet<String>,
-}
-
-impl UserDestructorFunsGuard {
-    fn set(new: BTreeSet<String>) -> Self {
-        let previous = USER_DESTRUCTOR_FUNS.with(|c| {
-            let mut b = c.borrow_mut();
-            std::mem::replace(&mut *b, new)
-        });
-        UserDestructorFunsGuard { previous }
-    }
-}
-
-impl Drop for UserDestructorFunsGuard {
-    fn drop(&mut self) {
-        USER_DESTRUCTOR_FUNS.with(|c| {
-            *c.borrow_mut() = std::mem::take(&mut self.previous);
-        });
-    }
+btreeset_swap_guard! {
+    /// RAII guard for the USER_DESTRUCTOR_FUNS thread-local.
+    UserDestructorFunsGuard, USER_DESTRUCTOR_FUNS
 }
 
 /// Returns `Constructability::Destructor` if `name` is a user-declared
@@ -1016,6 +976,7 @@ fn elaborate_lemma_attr(a: &p::LemmaAttr) -> LemmaAttr {
 ///   * `role='...'`        → `role`;
 ///   * `issapicrule`       → `isSAPiCRule = True`;
 ///   * `x-<ext>`           → ignored.
+///
 /// `fold` combines via the `RuleAttributes` `Semigroup` (Rule.hs:370-384):
 /// later duplicates win on the `Option` fields (`preferRight`), bools `||`.
 ///
@@ -1175,26 +1136,27 @@ fn subst_atom_in_place(a: &mut p::Atom, key: &p::Term, val: &p::Term) {
     }
 }
 
-pub fn fact_to_lnfact(f: &p::Fact) -> Result<crate::fact::LNFact, ElabError> {
-    use crate::fact::{Fact, FactTag, Multiplicity};
-    // Tag mapping mirrors Haskell's parser in
-    // `Theory.Text.Parser.Fact.mkProtoFact`:
-    //   "OUT" → outFact (Out)
-    //   "IN"  → inFact  (In)
-    //   "KU"  → kuFact  (KUFact)
-    //   "KD"  → kdFact  (KDFact)
-    //   "DED" → dedLogFact (DedFact)
-    //   "FR"  → freshFact (Fresh)
-    //   else  → protoFact (ProtoFact tag with name)
-    //
-    // Critically, `K` is *not* in this list — Haskell's parser falls
-    // through to the protoFact case for "K", giving `ProtoFact Linear "K"`.
-    // That matches ISend's action `kLogFact = protoFact Linear "K"`,
-    // so user lemma `K(t) @ j` correctly matches ISend instances.
-    // Do NOT alias "K" → FactTag::Ku: that breaks witness construction
-    // for any lemma using K(_) atoms (they can no longer satisfy via
-    // ISend; only Coerce/etc. routes would remain available).
-    let tag = match f.name.as_str() {
+/// Fact-tag mapping shared by [`fact_to_lnfact`] and [`fact_to_sapic_fact`].
+///
+/// Mirrors Haskell's parser in `Theory.Text.Parser.Fact.mkProtoFact`:
+///   "OUT" → outFact (Out)
+///   "IN"  → inFact  (In)
+///   "KU"  → kuFact  (KUFact)
+///   "KD"  → kdFact  (KDFact)
+///   "DED" → dedLogFact (DedFact)
+///   "FR"  → freshFact (Fresh)
+///   else  → protoFact (ProtoFact tag with name)
+///
+/// Critically, `K` is *not* in this list — Haskell's parser falls
+/// through to the protoFact case for "K", giving `ProtoFact Linear "K"`.
+/// That matches ISend's action `kLogFact = protoFact Linear "K"`,
+/// so user lemma `K(t) @ j` correctly matches ISend instances.
+/// Do NOT alias "K" → FactTag::Ku: that breaks witness construction
+/// for any lemma using K(_) atoms (they can no longer satisfy via
+/// ISend; only Coerce/etc. routes would remain available).
+fn fact_tag_of(f: &p::Fact) -> crate::fact::FactTag {
+    use crate::fact::{FactTag, Multiplicity};
+    match f.name.as_str() {
         "Fr" => FactTag::Fresh,
         "In" => FactTag::In,
         "Out" => FactTag::Out,
@@ -1206,12 +1168,12 @@ pub fn fact_to_lnfact(f: &p::Fact) -> Result<crate::fact::LNFact, ElabError> {
             tamarin_term::intern::intern_str(f.name.as_str()),
             f.args.len(),
         ),
-    };
-    let terms: Result<Vec<_>, _> = f.args.iter()
-        .map(|t| term_to_lnterm(t).ok_or_else(||
-            ElabError { message: format!("could not elaborate term in fact `{}`", f.name) }))
-        .collect();
-    let mut fact = Fact::new(tag, terms?);
+    }
+}
+
+/// Copy a parser fact's annotations into the typed `FactAnnotation` set.
+/// Shared by [`fact_to_lnfact`] and [`fact_to_sapic_fact`].
+fn copy_fact_annotations(f: &p::Fact) -> BTreeSet<crate::fact::FactAnnotation> {
     let mut anns: BTreeSet<crate::fact::FactAnnotation> = BTreeSet::new();
     for ann in &f.annotations {
         anns.insert(match ann {
@@ -1220,7 +1182,18 @@ pub fn fact_to_lnfact(f: &p::Fact) -> Result<crate::fact::LNFact, ElabError> {
             p::FactAnnotation::NoSources => crate::fact::FactAnnotation::NoSources,
         });
     }
-    fact = fact.with_annotations(anns);
+    anns
+}
+
+pub fn fact_to_lnfact(f: &p::Fact) -> Result<crate::fact::LNFact, ElabError> {
+    use crate::fact::Fact;
+    let tag = fact_tag_of(f);
+    let terms: Result<Vec<_>, _> = f.args.iter()
+        .map(|t| term_to_lnterm(t).ok_or_else(||
+            ElabError { message: format!("could not elaborate term in fact `{}`", f.name) }))
+        .collect();
+    let mut fact = Fact::new(tag, terms?);
+    fact = fact.with_annotations(copy_fact_annotations(f));
     Ok(fact)
 }
 
@@ -1719,31 +1692,25 @@ pub fn rewrite_arity1_formula(
     }
 }
 
-pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
+/// Shared conversion core for [`term_to_lnterm`] and [`term_to_sapic_term`].
+///
+/// Every arm except the `Var` case is byte-identical between the LNTerm and
+/// SAPIC term universes (same function-symbol / arity-1-fold / `em` / pair
+/// logic).  `mk_var` reproduces the per-universe `Var` behaviour: LNTerm
+/// builds a plain `LVar` literal (with `nullaryApp` 0-arity recovery); SAPIC
+/// builds a typed `SapicLVar` literal (same recovery, additionally gated on an
+/// un-annotated variable).  Recursion is threaded back through `term_to_vterm`
+/// so the whole tree is built in one universe.
+fn term_to_vterm<V, F>(t: &p::Term, mk_var: &F) -> Option<VTerm<Name, V>>
+where
+    V: Clone + Ord,
+    F: Fn(&p::VarSpec) -> Option<VTerm<Name, V>>,
+{
     use tamarin_term::function_symbols::AcSym;
     use tamarin_term::term::f_app_ac;
 
     match t {
-        p::Term::Var(v) => {
-            // A bare identifier in surface syntax may denote a 0-arity
-            // function symbol (e.g. `true` when `builtins: signing` is
-            // enabled).  Haskell's `term` parser disambiguates this
-            // via `nullaryApp` against the maudeSig in parser state;
-            // our parser doesn't, so the lexer leaves it as
-            // `Var{name, sort: Untagged}`.  We recover the constant
-            // here.  Only fires for `Untagged` sort + idx 0 — a user
-            // can still bind a Msg-sort var named `true` if they
-            // explicitly annotate it (e.g. `true:msg`), and the parser
-            // would emit `Untagged` only for the bare form anyway.
-            if matches!(v.sort, p::SortHint::Untagged) && v.idx == 0
-                && is_user_nullary_fun(&v.name) {
-                let sym = NoEqSym::new(v.name.as_bytes().to_vec(), 0,
-                    user_fun_privacy(&v.name), Constructability::Constructor);
-                return Some(f_app_no_eq(sym, vec![]));
-            }
-            let lv = LVar::new(v.name.clone(), sort_of(&v.sort), v.idx);
-            Some(Term::Lit(Lit::Var(lv)))
-        }
+        p::Term::Var(v) => mk_var(v),
         p::Term::PubLit(s) => {
             let n = Name::new(NameTag::Pub, s.clone());
             Some(Term::Lit(Lit::Con(n)))
@@ -1818,7 +1785,7 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
                     "h" | "fst" | "snd" | "inv" | "pk"
                     | "getMessage" | "get_rep" | "report")
                 || is_user_unary_fun(name.as_str());
-            let new_args: Option<Vec<_>> = args.iter().map(term_to_lnterm).collect();
+            let new_args: Option<Vec<_>> = args.iter().map(|a| term_to_vterm(a, mk_var)).collect();
             let mut new_args = new_args?;
             if unary_builtin && new_args.len() > 1 {
                 // Wrap args into a right-associative pair to make
@@ -1861,7 +1828,7 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
             Some(f_app_no_eq(sym, new_args))
         }
         p::Term::Pair(items) => {
-            let new_items: Option<Vec<_>> = items.iter().map(term_to_lnterm).collect();
+            let new_items: Option<Vec<_>> = items.iter().map(|i| term_to_vterm(i, mk_var)).collect();
             let new_items = new_items?;
             // Right-associative pair: <a, b, c> = pair(a, pair(b, c))
             let mut iter = new_items.into_iter().rev();
@@ -1876,8 +1843,8 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
         p::Term::AlgApp(name, a, b) => {
             // `f{a}b` desugars to `f(a, b)` semantically; users typically
             // use this for senc/aenc/sign/mac.
-            let aa = term_to_lnterm(a)?;
-            let bb = term_to_lnterm(b)?;
+            let aa = term_to_vterm(a, mk_var)?;
+            let bb = term_to_vterm(b, mk_var)?;
             // Haskell `binaryAlgApp` also reads `(k,priv,cnstr)` from the
             // signature via `lookupArity` (Theory/Text/Parser/Term.hs:101),
             // so thread user privacy/constructability here too.
@@ -1886,15 +1853,15 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
             Some(f_app_no_eq(sym, vec![aa, bb]))
         }
         p::Term::Diff(a, b) => {
-            let aa = term_to_lnterm(a)?;
-            let bb = term_to_lnterm(b)?;
+            let aa = term_to_vterm(a, mk_var)?;
+            let bb = term_to_vterm(b, mk_var)?;
             let sym = NoEqSym::new(b"diff".to_vec(), 2,
                 Privacy::Public, Constructability::Constructor);
             Some(f_app_no_eq(sym, vec![aa, bb]))
         }
         p::Term::BinOp(op, a, b) => {
-            let aa = term_to_lnterm(a)?;
-            let bb = term_to_lnterm(b)?;
+            let aa = term_to_vterm(a, mk_var)?;
+            let bb = term_to_vterm(b, mk_var)?;
             match op {
                 p::BinOp::Mult => Some(f_app_ac(AcSym::Mult, vec![aa, bb])),
                 p::BinOp::Union => Some(f_app_ac(AcSym::Union, vec![aa, bb])),
@@ -1909,6 +1876,29 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
         }
         p::Term::PatMatch(_) => None,
     }
+}
+
+pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
+    // LNTerm `Var` case: a bare identifier in surface syntax may denote a
+    // 0-arity function symbol (e.g. `true` when `builtins: signing` is
+    // enabled).  Haskell's `term` parser disambiguates this via `nullaryApp`
+    // against the maudeSig in parser state; our parser doesn't, so the lexer
+    // leaves it as `Var{name, sort: Untagged}`.  We recover the constant
+    // here.  Only fires for `Untagged` sort + idx 0 — a user can still bind a
+    // Msg-sort var named `true` if they explicitly annotate it (e.g.
+    // `true:msg`), and the parser would emit `Untagged` only for the bare
+    // form anyway.
+    let mk_var = |v: &p::VarSpec| -> Option<tamarin_term::lterm::LNTerm> {
+        if matches!(v.sort, p::SortHint::Untagged) && v.idx == 0
+            && is_user_nullary_fun(&v.name) {
+            let sym = NoEqSym::new(v.name.as_bytes().to_vec(), 0,
+                user_fun_privacy(&v.name), Constructability::Constructor);
+            return Some(f_app_no_eq(sym, vec![]));
+        }
+        let lv = LVar::new(v.name.clone(), sort_of(&v.sort), v.idx);
+        Some(Term::Lit(Lit::Var(lv)))
+    };
+    term_to_vterm(t, &mk_var)
 }
 
 // =============================================================================
@@ -1919,146 +1909,44 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
 // SAPIC term parser (`Theory.Text.Parser.Sapic.sapicterm = msetterm False
 // ltypedlit`, Sapic.hs:56), which builds `Term (Lit Name SapicLVar)` keeping
 // the `name:type` annotation on each typed variable.  Reuses the SAME
-// function-symbol / arity-1-fold / em / pair logic as `term_to_lnterm` so the
-// resulting term universe matches the protocol-rule path exactly.
+// function-symbol / arity-1-fold / em / pair logic as `term_to_lnterm` (via
+// `term_to_vterm`) so the resulting term universe matches the protocol-rule
+// path exactly.
 // =============================================================================
 
 /// `parser::Term` → `SapicTerm`.  Returns `None` on a `PatMatch` term (the
 /// surface SAPIC action parser never places one in a plain term position).
 pub fn term_to_sapic_term(t: &p::Term) -> Option<crate::sapic::SapicTerm> {
-    use tamarin_term::function_symbols::AcSym;
-    use tamarin_term::term::{f_app_ac, f_app_no_eq};
     use crate::sapic::SapicLVar;
 
-    // Build a typed SAPIC variable term from a parser VarSpec.
-    let sapic_var = |v: &p::VarSpec| -> crate::sapic::SapicTerm {
+    // SAPIC `Var` case: a bare untagged idx-0 identifier may be a 0-arity NoEq
+    // fun symbol (mirrors `term_to_lnterm`'s `nullaryApp` recovery, additionally
+    // gated on an un-annotated variable); otherwise a typed `SapicLVar`.
+    let mk_var = |v: &p::VarSpec| -> Option<crate::sapic::SapicTerm> {
+        if matches!(v.sort, p::SortHint::Untagged) && v.idx == 0
+            && v.typ.is_none() && is_user_nullary_fun(&v.name) {
+            let sym = NoEqSym::new(v.name.as_bytes().to_vec(), 0,
+                user_fun_privacy(&v.name), Constructability::Constructor);
+            return Some(f_app_no_eq(sym, vec![]));
+        }
         let lv = LVar::new(v.name.clone(), sort_of(&v.sort), v.idx);
-        Term::Lit(Lit::Var(SapicLVar::new(lv, v.typ.clone())))
+        Some(Term::Lit(Lit::Var(SapicLVar::new(lv, v.typ.clone()))))
     };
-
-    match t {
-        p::Term::Var(v) => {
-            // A bare untagged identifier may be a 0-arity NoEq fun symbol
-            // (mirrors `term_to_lnterm`'s `nullaryApp` recovery).
-            if matches!(v.sort, p::SortHint::Untagged) && v.idx == 0
-                && v.typ.is_none() && is_user_nullary_fun(&v.name) {
-                let sym = NoEqSym::new(v.name.as_bytes().to_vec(), 0,
-                    user_fun_privacy(&v.name), Constructability::Constructor);
-                return Some(f_app_no_eq(sym, vec![]));
-            }
-            Some(sapic_var(v))
-        }
-        p::Term::PubLit(s) => Some(Term::Lit(Lit::Con(Name::new(NameTag::Pub, s.clone())))),
-        p::Term::FreshLit(s) => Some(Term::Lit(Lit::Con(Name::new(NameTag::Fresh, s.clone())))),
-        p::Term::NatLit(s) => Some(Term::Lit(Lit::Con(Name::new(NameTag::Nat, s.clone())))),
-        p::Term::NumberOne => Some(f_app_no_eq(tamarin_term::function_symbols::one_sym(), vec![])),
-        p::Term::DhNeutral => Some(f_app_no_eq(tamarin_term::function_symbols::dh_neutral_sym(), vec![])),
-        p::Term::NatOne => Some(f_app_no_eq(tamarin_term::function_symbols::nat_one_sym(), vec![])),
-        p::Term::Number(_) => Some(Term::Lit(Lit::Con(Name::new(NameTag::Pub, "n".to_string())))),
-        p::Term::App(name, args) => {
-            let unary_builtin = matches!(name.as_str(),
-                    "h" | "fst" | "snd" | "inv" | "pk"
-                    | "getMessage" | "get_rep" | "report")
-                || is_user_unary_fun(name.as_str());
-            let new_args: Option<Vec<_>> = args.iter().map(term_to_sapic_term).collect();
-            let mut new_args = new_args?;
-            if unary_builtin && new_args.len() > 1 {
-                let mut iter = new_args.into_iter().rev();
-                let last = iter.next()?;
-                let mut acc = last;
-                let pair_sym = tamarin_term::function_symbols::pair_sym();
-                for prev in iter {
-                    acc = f_app_no_eq(pair_sym.clone(), vec![prev, acc]);
-                }
-                new_args = vec![acc];
-            }
-            if name == "em" && new_args.len() == 2 {
-                let mut it = new_args.into_iter();
-                let a = it.next().unwrap();
-                let b = it.next().unwrap();
-                return Some(tamarin_term::builtin::emap(a, b));
-            }
-            let sym = NoEqSym::new(name.as_bytes().to_vec(), new_args.len(),
-                user_fun_privacy(name), user_fun_constructability(name));
-            Some(f_app_no_eq(sym, new_args))
-        }
-        p::Term::Pair(items) => {
-            let new_items: Option<Vec<_>> = items.iter().map(term_to_sapic_term).collect();
-            let new_items = new_items?;
-            let mut iter = new_items.into_iter().rev();
-            let last = iter.next()?;
-            let mut acc = last;
-            let sym = tamarin_term::function_symbols::pair_sym();
-            for prev in iter {
-                acc = f_app_no_eq(sym.clone(), vec![prev, acc]);
-            }
-            Some(acc)
-        }
-        p::Term::AlgApp(name, a, b) => {
-            let aa = term_to_sapic_term(a)?;
-            let bb = term_to_sapic_term(b)?;
-            let sym = NoEqSym::new(name.as_bytes().to_vec(), 2,
-                user_fun_privacy(name), user_fun_constructability(name));
-            Some(f_app_no_eq(sym, vec![aa, bb]))
-        }
-        p::Term::Diff(a, b) => {
-            let aa = term_to_sapic_term(a)?;
-            let bb = term_to_sapic_term(b)?;
-            let sym = NoEqSym::new(b"diff".to_vec(), 2,
-                Privacy::Public, Constructability::Constructor);
-            Some(f_app_no_eq(sym, vec![aa, bb]))
-        }
-        p::Term::BinOp(op, a, b) => {
-            let aa = term_to_sapic_term(a)?;
-            let bb = term_to_sapic_term(b)?;
-            match op {
-                p::BinOp::Mult => Some(f_app_ac(AcSym::Mult, vec![aa, bb])),
-                p::BinOp::Union => Some(f_app_ac(AcSym::Union, vec![aa, bb])),
-                p::BinOp::Xor => Some(f_app_ac(AcSym::Xor, vec![aa, bb])),
-                p::BinOp::NatPlus => Some(f_app_ac(AcSym::NatPlus, vec![aa, bb])),
-                p::BinOp::Exp => {
-                    let sym = NoEqSym::new(b"exp".to_vec(), 2,
-                        Privacy::Public, Constructability::Constructor);
-                    Some(f_app_no_eq(sym, vec![aa, bb]))
-                }
-            }
-        }
-        p::Term::PatMatch(_) => None,
-    }
+    term_to_vterm(t, &mk_var)
 }
 
 /// `parser::Fact` → `SapicNFact<SapicLVar>` (`Fact<SapicTerm>`).  Mirrors
 /// `fact_to_lnfact` but over typed SAPIC terms.  The fact tag mapping is
 /// identical (`Fr`/`In`/`Out`/`KU`/`KD`/`Ded` → builtin tags, else ProtoFact).
 pub fn fact_to_sapic_fact(f: &p::Fact) -> Result<crate::sapic::SapicLNFact, ElabError> {
-    use crate::fact::{Fact, FactTag, Multiplicity};
-    let tag = match f.name.as_str() {
-        "Fr" => FactTag::Fresh,
-        "In" => FactTag::In,
-        "Out" => FactTag::Out,
-        "KU" => FactTag::Ku,
-        "KD" => FactTag::Kd,
-        "Ded" => FactTag::Ded,
-        _ => FactTag::Proto(
-            if f.persistent { Multiplicity::Persistent } else { Multiplicity::Linear },
-            tamarin_term::intern::intern_str(f.name.as_str()),
-            f.args.len(),
-        ),
-    };
+    use crate::fact::Fact;
+    let tag = fact_tag_of(f);
     let terms: Result<Vec<_>, _> = f.args.iter()
         .map(|t| term_to_sapic_term(t).ok_or_else(||
             ElabError { message: format!("could not elaborate term in fact `{}`", f.name) }))
         .collect();
     let mut fact = Fact::new(tag, terms?);
-    let mut anns: BTreeSet<crate::fact::FactAnnotation> = BTreeSet::new();
-    for ann in &f.annotations {
-        anns.insert(match ann {
-            p::FactAnnotation::SolveFirst => crate::fact::FactAnnotation::SolveFirst,
-            p::FactAnnotation::SolveLast => crate::fact::FactAnnotation::SolveLast,
-            p::FactAnnotation::NoSources => crate::fact::FactAnnotation::NoSources,
-        });
-    }
-    fact = fact.with_annotations(anns);
+    fact = fact.with_annotations(copy_fact_annotations(f));
     Ok(fact)
 }
 

@@ -809,23 +809,7 @@ fn fresh_msg_var_avoiding(name: &str, tildex: &BTreeSet<LVar>) -> LVar {
 
 /// `freeset = fromList . frees` over an `LNTerm` — its variables.
 fn ln_term_vars(t: &LNTerm) -> BTreeSet<LVar> {
-    use tamarin_term::vterm::{Lit, VTerm};
-    fn go(t: &LNTerm, out: &mut BTreeSet<LVar>) {
-        match t {
-            VTerm::Lit(Lit::Var(v)) => {
-                out.insert(v.clone());
-            }
-            VTerm::Lit(_) => {}
-            VTerm::App(_, args) => {
-                for a in args.iter() {
-                    go(a, out);
-                }
-            }
-        }
-    }
-    let mut out = BTreeSet::new();
-    go(t, &mut out);
-    out
+    tamarin_term::vterm::vars_vterm(t).into_iter().collect()
 }
 
 /// The else-arm restriction for a kept `let` (Basetranslation.hs:261-263):
@@ -848,23 +832,9 @@ fn let_else_restriction(
     if freevars.is_empty() {
         body
     } else {
-        let vs: Vec<p::VarSpec> = freevars.iter().map(lvar_to_varspec).collect();
+        let vs: Vec<p::VarSpec> = freevars.iter().map(crate::convert::lvar_to_varspec).collect();
         p::Formula::Forall(vs, Box::new(body))
     }
-}
-
-/// `LVar` → parser `VarSpec` (for the quantifier binder list / atom vars).
-fn lvar_to_varspec(v: &LVar) -> tamarin_parser::ast::VarSpec {
-    use tamarin_parser::ast as p;
-    use tamarin_term::lterm::LSort;
-    let sort = match v.sort {
-        LSort::Fresh => p::SortHint::Fresh,
-        LSort::Pub => p::SortHint::Pub,
-        LSort::Node => p::SortHint::Node,
-        LSort::Nat => p::SortHint::Nat,
-        LSort::Msg => p::SortHint::Msg,
-    };
-    p::VarSpec { name: v.name.to_string(), idx: v.idx, sort, typ: None }
 }
 
 /// `LNTerm` → parser-AST `Term` (for the `let` else restriction body).  The
@@ -876,7 +846,7 @@ pub(crate) fn ln_term_to_parser(t: &LNTerm) -> tamarin_parser::ast::Term {
     use tamarin_term::lterm::NameTag;
     use tamarin_term::vterm::{Lit, VTerm};
     match t {
-        VTerm::Lit(Lit::Var(v)) => p::Term::Var(lvar_to_varspec(v)),
+        VTerm::Lit(Lit::Var(v)) => p::Term::Var(crate::convert::lvar_to_varspec(v)),
         VTerm::Lit(Lit::Con(n)) => match n.tag {
             NameTag::Pub => p::Term::PubLit(n.id.0.to_string()),
             NameTag::Fresh => p::Term::FreshLit(n.id.0.to_string()),
@@ -933,82 +903,10 @@ fn collect_pair(t: &LNTerm, out: &mut Vec<tamarin_parser::ast::Term>) {
 /// WFUnbound `⊆ tildex` check (HS Basetranslation.hs:236).  Quantifier-bound
 /// vars are excluded; the special timepoint vars carry the `Node` sort.
 fn formula_free_lvars(f: &tamarin_parser::ast::Formula) -> BTreeSet<LVar> {
-    use tamarin_parser::ast as p;
-    fn sort_of(s: &p::SortHint) -> tamarin_term::lterm::LSort {
-        use tamarin_term::lterm::LSort;
-        match s {
-            p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) => LSort::Fresh,
-            p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) => LSort::Pub,
-            p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node) => LSort::Node,
-            p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat) => LSort::Nat,
-            p::SortHint::Msg | p::SortHint::Suffix(p::SuffixSort::Msg) | p::SortHint::Untagged => {
-                LSort::Msg
-            }
-        }
-    }
-    fn collect_term(t: &p::Term, bound: &[String], out: &mut BTreeSet<LVar>) {
-        match t {
-            p::Term::Var(v)
-                if !bound.iter().any(|n| n == &v.name) => {
-                    out.insert(LVar::new(v.name.clone(), sort_of(&v.sort), v.idx));
-                }
-            p::Term::App(_, args) | p::Term::Pair(args) => {
-                for a in args {
-                    collect_term(a, bound, out);
-                }
-            }
-            p::Term::AlgApp(_, a, b) | p::Term::Diff(a, b) | p::Term::BinOp(_, a, b) => {
-                collect_term(a, bound, out);
-                collect_term(b, bound, out);
-            }
-            p::Term::PatMatch(inner) => collect_term(inner, bound, out),
-            _ => {}
-        }
-    }
-    fn collect_atom(a: &p::Atom, bound: &[String], out: &mut BTreeSet<LVar>) {
-        use p::Atom::*;
-        match a {
-            Eq(l, r) | Less(l, r) | LessMset(l, r) | Subterm(l, r) => {
-                collect_term(l, bound, out);
-                collect_term(r, bound, out);
-            }
-            Action(fa, t) => {
-                for arg in &fa.args {
-                    collect_term(arg, bound, out);
-                }
-                collect_term(t, bound, out);
-            }
-            Last(t) => collect_term(t, bound, out),
-            Pred(fa) => {
-                for arg in &fa.args {
-                    collect_term(arg, bound, out);
-                }
-            }
-        }
-    }
-    fn collect(f: &p::Formula, bound: &mut Vec<String>, out: &mut BTreeSet<LVar>) {
-        use p::Formula::*;
-        match f {
-            True | False => {}
-            Atom(a) => collect_atom(a, bound, out),
-            Not(g) => collect(g, bound, out),
-            And(a, b) | Or(a, b) | Implies(a, b) | Iff(a, b) => {
-                collect(a, bound, out);
-                collect(b, bound, out);
-            }
-            Forall(vs, body) | Exists(vs, body) => {
-                let saved = bound.len();
-                for v in vs {
-                    bound.push(v.name.clone());
-                }
-                collect(body, bound, out);
-                bound.truncate(saved);
-            }
-        }
-    }
     let mut out = BTreeSet::new();
-    let mut bound = Vec::new();
-    collect(f, &mut bound, &mut out);
+    crate::convert::fold_free_vars(f, &mut |v, _bound| {
+        out.insert(LVar::new(v.name.clone(), crate::convert::sort_of_hint(&v.sort), v.idx));
+    });
     out
 }
 
@@ -1022,25 +920,7 @@ fn eq_fact(t1: &SapicTerm, t2: &SapicTerm) -> tamarin_theory::fact::LNFact {
 
 /// `fromList $ getFactVariables fa` — the set of variables occurring in a fact.
 fn fact_vars(f: &tamarin_theory::fact::LNFact) -> BTreeSet<LVar> {
-    use tamarin_term::vterm::{Lit, VTerm};
-    fn collect(t: &LNTerm, out: &mut BTreeSet<LVar>) {
-        match t {
-            VTerm::Lit(Lit::Var(v)) => {
-                out.insert(v.clone());
-            }
-            VTerm::Lit(_) => {}
-            VTerm::App(_, args) => {
-                for a in args.iter() {
-                    collect(a, out);
-                }
-            }
-        }
-    }
-    let mut out = BTreeSet::new();
-    for t in &f.terms {
-        collect(t, &mut out);
-    }
-    out
+    f.terms.iter().flat_map(tamarin_term::vterm::vars_vterm).collect()
 }
 
 /// `baseInit` (Basetranslation.hs:312-318): the `Init` rule plus the empty

@@ -34,6 +34,14 @@ fn corpus_root() -> PathBuf {
     })
 }
 
+fn maude_path() -> Option<String> {
+    if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
+    for c in ["/usr/local/bin/maude", "maude"] {
+        if std::path::Path::new(c).exists() { return Some(c.to_string()); }
+    }
+    None
+}
+
 fn tamarin_available() -> bool {
     Command::new("tamarin-prover")
         .arg("--help")
@@ -272,14 +280,6 @@ fn simplify_top_level_disj_lemma_left_intact() {
     use tamarin_theory::constraint::solver::simplify::simplify_system;
     use tamarin_theory::constraint::system::{formula_to_system, SourceKind};
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
-
     let path = match maude_path() { Some(p) => p, None => return };
     let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
     let ctx = ProofContext::new(h, Vec::new());
@@ -323,13 +323,6 @@ fn proof_search_disj_lemma_picks_induction_first() {
     use tamarin_theory::constraint::solver::search::run_proof_search;
     use tamarin_theory::constraint::system::{formula_to_system, SourceKind};
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let path = match maude_path() { Some(p) => p, None => return };
     let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
     let ctx = ProofContext::new(h, Vec::new());
@@ -373,13 +366,6 @@ fn verdict_match_suite_all_solved_against_tamarin() {
     use tamarin_theory::constraint::solver::search::NodeStatus;
     use tamarin_theory::prove::prove_lemma;
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
 
     // (fixture, lemma, expected our-side status) — tamarin must say
@@ -574,13 +560,6 @@ fn corpus_verdict_match_coverage_probe() {
         .stack_size(64 * 1024 * 1024)
         .build_global();
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
     if !tamarin_available() { return; }
 
@@ -746,10 +725,9 @@ fn corpus_verdict_match_coverage_probe() {
         // Budget 2000: the deadline (10s) is the real gate; budget
         // gives slack so search isn't budget-bounded into a Sorry on
         // healthy lemmas that just need a few more proof-method steps.
-        // Bumped from 200 after corpus probe showed several
-        // "INCOMPARABLE: Sorry" lemmas (NSLPK3::injective_agree,
-        // T&D::Responder_secrecy, TPM::exclusive_secrets) terminate
-        // correctly within 1-3 seconds at this budget.
+        // 200 was too tight for some healthy lemmas (e.g.
+        // NSLPK3::injective_agree) that terminate within 1-3s given a
+        // larger step budget.
         // catch_unwind: pre-existing overflow panics at multiple
         // bounds_max+1 sites in reduction.rs (task #151) surface on
         // some corpus lemmas; without catch_unwind the whole rayon
@@ -862,13 +840,6 @@ fn corpus_proof_skeleton_match_probe() {
         .stack_size(64 * 1024 * 1024)
         .build_global();
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
     if !tamarin_available() { return; }
 
@@ -877,9 +848,8 @@ fn corpus_proof_skeleton_match_probe() {
     let corpus_root = corpus_root();
 
     // Phase 1: collect candidate spthy paths — the WHOLE examples/ tree.
-    // (Folder allowlist dropped 2026-06-10, after BP/XOR/DH/multiset support
-    // reached byte-faithfulness; the content filters below still skip
-    // diff-mode and SAPIC files. 922 files / 597 comparable as of removal.)
+    // (Walks the whole examples/ tree; the content filters below still skip
+    // diff-mode and SAPIC files.)
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
     for e in walkdir::WalkDir::new(&corpus_root).into_iter().filter_map(|e| e.ok()) {
         if e.path().extension().and_then(|s| s.to_str()) == Some("spthy") {
@@ -906,13 +876,11 @@ fn corpus_proof_skeleton_match_probe() {
         // (tamarin_theory::macro_expand).
         if src.contains("predicates:") { return None; }
         if src.contains("process:") { return None; }
-        // XOR and bilinear-pairing builtins are SUPPORTED (we parse them,
-        // we have `AcSym::Xor` + cached `mk_dh/mk_bp_intruder_variants`,
-        // we elaborate `xor_maude_sig` / `bp_maude_sig`).  Earlier the
-        // probe excluded them as a TODO; that's stale now.  Removed so
-        // regressions in XOR/BP-using theories are caught — observed
-        // NSLPK3xor proof-shape divergence (RS 36/38 steps vs HS 11/13)
-        // which had been silently uncaught for the whole campaign.
+        // XOR and bilinear-pairing builtins are SUPPORTED (`AcSym::Xor`,
+        // cached `mk_dh`/`mk_bp_intruder_variants`, `xor_maude_sig`/
+        // `bp_maude_sig`), so theories using them are deliberately NOT
+        // filtered out here — this catches XOR/BP proof-shape regressions
+        // (e.g. NSLPK3xor: RS 36/38 vs HS 11/13 steps).
 
         let theory = tamarin_parser::parse_theory(&src, &[]).ok()?;
         let out_path = format!("/tmp/proof_skel_corpus_{}_{}.spthy", pid, idx);
@@ -1056,8 +1024,6 @@ fn corpus_proof_skeleton_match_probe() {
                     "{} — diverge line {}: ours={:?} theirs={:?}",
                     file_lemma, line, ours, theirs));
             }
-            // (Outcome::VerdictDiff removed: it was never produced — we
-            // always diff structurally now.)
             Outcome::NoHaskellSkeleton(s) => no_skel.push(s.clone()),
             Outcome::Incomparable => incomparable += 1,
         }
@@ -1086,13 +1052,6 @@ fn corpus_proof_skeleton_match_probe() {
 fn probe_tpm_left_reachable() {
     use tamarin_theory::prove::prove_lemma;
     use tamarin_theory::constraint::solver::search::ProofNode;
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
     let path = corpus_root().join("related_work/TPM_DKRS_CSF11/TPM_Exclusive_Secrets.spthy");
     let src = std::fs::read_to_string(&path).unwrap();
@@ -1158,13 +1117,6 @@ fn probe_tpm_left_reachable() {
 fn probe_nspk3_fresh_sources() {
     use tamarin_theory::constraint::solver::context::ProofContext;
     use tamarin_theory::constraint::solver::sources::precompute_full_sources;
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
     let path = corpus_root().join("classic/NSPK3.spthy");
     let src = std::fs::read_to_string(&path).unwrap();
@@ -1195,13 +1147,6 @@ fn probe_nspk3_fresh_sources() {
 fn probe_nspk3_cyclic_leaf() {
     use tamarin_theory::prove::prove_lemma;
     use tamarin_theory::constraint::solver::search::ProofNode;
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
     let path = corpus_root().join("classic/NSPK3.spthy");
     let src = std::fs::read_to_string(&path).unwrap();
@@ -1283,13 +1228,6 @@ fn probe_nspk3_cyclic_leaf() {
 fn probe_chaum_unforgeability() {
     use tamarin_theory::constraint::solver::context::ProofContext;
     use tamarin_theory::constraint::constraints::Goal;
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
     let path = corpus_root().join("post17/chaum_unforgeability.spthy");
     let src = std::fs::read_to_string(&path).unwrap();
@@ -1373,13 +1311,6 @@ fn probe_chaum_unforgeability() {
 #[test]
 #[ignore = "diagnostic probe — TLS S_2_case_N; run with --ignored"]
 fn probe_tls_setup_possible() {
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
     let path = corpus_root().join("classic/TLS_Handshake.spthy");
     let src = std::fs::read_to_string(&path).unwrap();
@@ -1471,13 +1402,6 @@ fn probe_tls_setup_possible() {
 #[test]
 #[ignore = "diagnostic probe — NSLPK3 line-7 case_1; run with --ignored"]
 fn probe_nslpk3_nonce_secrecy() {
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
     let path = corpus_root().join("classic/NSLPK3_untagged.spthy");
     let src = std::fs::read_to_string(&path).unwrap();
@@ -1561,13 +1485,6 @@ fn probe_nslpk3_nonce_secrecy() {
 #[test]
 #[ignore = "diagnostic probe — CR executable wrong-VERDICT; run with --ignored"]
 fn probe_cr_executable() {
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
     let path = corpus_root().join("features/xor/CR.spthy");
     let src = std::fs::read_to_string(&path).unwrap();
@@ -1634,13 +1551,6 @@ fn prove_lemma_tiny_setup_verdict_matches_tamarin() {
     use tamarin_theory::constraint::solver::search::NodeStatus;
     use tamarin_theory::prove::prove_lemma;
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
     let h = tamarin_term::maude_proc::MaudeHandle::start(
         &mp, tamarin_term::maude_sig::pair_maude_sig()).unwrap();
@@ -1675,13 +1585,6 @@ fn ex_decomposition_produces_action_goal_via_induction() {
     use tamarin_theory::constraint::solver::proof_method::{exec_proof_method, ProofMethod};
     use tamarin_theory::constraint::system::{formula_to_system, SourceKind};
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let path = match maude_path() { Some(p) => p, None => return };
     let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
     let ctx = ProofContext::new(h, Vec::new());
@@ -1725,13 +1628,6 @@ fn atom_decomposition_creates_action_goal_in_simplify() {
     use tamarin_theory::constraint::solver::simplify::simplify_system;
     use tamarin_theory::constraint::system::System;
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let path = match maude_path() { Some(p) => p, None => return };
     let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
     let ctx = ProofContext::new(h, Vec::new());
@@ -1769,13 +1665,6 @@ fn atom_decomposition_creates_action_goal_in_simplify() {
 fn prove_lemma_disj_lemma_terminates_and_tamarin_verifies() {
     use tamarin_theory::prove::prove_lemma;
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let mp = match maude_path() { Some(p) => p, None => return };
     let h = tamarin_term::maude_proc::MaudeHandle::start(
         &mp, tamarin_term::maude_sig::pair_maude_sig()).unwrap();
@@ -1818,13 +1707,6 @@ fn proof_search_disj_lemma_descends_into_disj_goal() {
     use tamarin_theory::constraint::solver::search::{run_proof_search, NodeStatus};
     use tamarin_theory::constraint::system::{formula_to_system, SourceKind};
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let path = match maude_path() { Some(p) => p, None => return };
     let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
     let ctx = ProofContext::new(h, Vec::new());
@@ -1877,13 +1759,6 @@ fn simplify_conj_wrapping_disj_produces_goal() {
     use tamarin_theory::constraint::solver::simplify::simplify_system;
     use tamarin_theory::constraint::system::System;
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let path = match maude_path() { Some(p) => p, None => return };
     let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
     let ctx = ProofContext::new(h, Vec::new());
@@ -1950,13 +1825,6 @@ fn proof_search_end_to_end_tiny_theory() {
     use tamarin_theory::constraint::solver::search::{run_proof_search, NodeStatus};
     use tamarin_theory::constraint::system::System;
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let path = match maude_path() { Some(p) => p, None => return };
     let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
     let ctx = ProofContext::new(h, Vec::new());
@@ -2001,13 +1869,6 @@ fn solve_premise_goal_against_fixture_matches_rule_count() {
     use tamarin_theory::constraint::solver::reduction::{GoalCases, Reduction};
     use tamarin_theory::constraint::system::System;
 
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/usr/local/bin/maude", "maude"] {
-            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-        }
-        None
-    }
     let path = match maude_path() { Some(p) => p, None => return };
     let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
 

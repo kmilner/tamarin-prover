@@ -192,10 +192,10 @@ pub fn find_connected_components<'a>(
     for n in nodes {
         if visited.contains(&n.id) { continue; }
         let mut stack = vec![n.id.clone()];
-        let mut comp_ids: Vec<NodeId> = Vec::new();
+        let mut comp_set: BTreeSet<NodeId> = BTreeSet::new();
         while let Some(cur) = stack.pop() {
             if !visited.insert(cur.clone()) { continue; }
-            comp_ids.push(cur.clone());
+            comp_set.insert(cur.clone());
             if let Some(neighbors) = adj.get(&cur) {
                 for nb in neighbors {
                     if !visited.contains(nb) && by_id.contains(nb) {
@@ -209,7 +209,6 @@ pub fn find_connected_components<'a>(
         // `nodes` order, not DFS discovery order.  Filtering the full `nodes`
         // slice is safe because each node belongs to exactly one component
         // (globally `visited`), so the per-component relative order matches HS.
-        let comp_set: BTreeSet<NodeId> = comp_ids.iter().cloned().collect();
         let comp: Vec<&'a GNode> = nodes.iter().copied()
             .filter(|n| comp_set.contains(&n.id))
             .collect();

@@ -5,7 +5,7 @@
 //! rules in the UI, and to wire `Autoprove` links the frontend
 //! recognises.
 
-use crate::handlers::path_parse::{url_path_escape, SourceKind, TheoryPath};
+use crate::handlers::path_parse::{encode_sub_path, url_path_escape, SourceKind, TheoryPath};
 use crate::handlers::root::html_escape;
 use crate::state::TheoryEntry;
 
@@ -456,7 +456,7 @@ fn pp_step(out: &mut String, cx: &PpCtx, path: &[String], node: &ProofNode,
     }
     let url = format!(
         "/thy/trace/{idx}/main/proof/{lemma}{path}",
-        idx = cx.idx, lemma = url_path_escape(cx.lemma), path = encode_index_path(path));
+        idx = cx.idx, lemma = url_path_escape(cx.lemma), path = encode_sub_path(path));
     if !node.annotated {
         // `superfluousStep = withTag "span" [("class","hl_superfluous")] ppMethod`.
         // HS appends `removeStep` regardless of the annotation branch
@@ -494,19 +494,6 @@ fn pp_step(out: &mut String, cx: &PpCtx, path: &[String], node: &ProofNode,
     }
 }
 
-
-fn encode_index_path(path: &[String]) -> String {
-    if path.is_empty() { return String::new(); }
-    let mut s = String::new();
-    for seg in path {
-        s.push('/');
-        let escaped = if seg.is_empty() { "_".to_string() }
-            else if seg.starts_with('_') { format!("_{}", seg) }
-            else { seg.to_string() };
-        s.push_str(&url_path_escape(&escaped));
-    }
-    s
-}
 
 fn render_attrs(attrs: &[LemmaAttr]) -> String {
     if attrs.is_empty() { return String::new(); }
@@ -662,7 +649,7 @@ const WRAP_TEXT_STYLE: &str =
     "<style>.wrap-text li {white-space: normal;\nword-wrap: break-word;}</style>";
 
 /// HS `helpHtml` (`src/Web/Theory.hs:1187-1285`): the static Quick-introduction
-/// + keyboard-shortcut help page, prefixed by the `Theory: NAME (Loaded at TIME
+/// and keyboard-shortcut help page, prefixed by the `Theory: NAME (Loaded at TIME
 /// from ORIGIN) ERRORS` env line.  The env line's `(Loaded at ...)` parenthetical
 /// is stripped by the parity normalizer (`norm_env`) on both sides, so its
 /// timestamp/origin need not be byte-identical to HS.  `errorsHtml` is the

@@ -14,8 +14,8 @@ use tamarin_parser::{parse_theory, Message};
 use walkdir::WalkDir;
 
 /// A representative message string for failure-category bucketing.  The
-/// `ParseError` no longer carries a single `msg`; it holds a parsec-style
-/// message list, so join the message strings for classification purposes.
+/// `ParseError` holds a parsec-style message list, so join the message
+/// strings for classification purposes.
 fn error_key_source(e: &tamarin_parser::ParseError) -> String {
     e.messages
         .iter()

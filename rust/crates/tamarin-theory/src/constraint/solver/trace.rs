@@ -476,14 +476,21 @@ fn canonical_fact_with_idx(fa: &crate::fact::LNFact) -> String {
     format!("{}({})", fact_tag_short(&fa.tag), terms.join(","))
 }
 
-fn canonical_lnterm_with_idx(t: &tamarin_term::lterm::LNTerm) -> String {
+/// Shared canonical LNTerm renderer for the diagnostic traces.  The
+/// `var_fmt` closure decides how a variable literal is rendered — the
+/// two callers differ ONLY there: `canonical_lnterm_with_idx` keeps the
+/// LVar idx (`name#idx`) while `canonical_lnterm` suppresses it and
+/// shows the sort (`name:sort`).  Constant / application arms are
+/// identical for both.
+fn write_lnterm_canon(
+    t: &tamarin_term::lterm::LNTerm,
+    var_fmt: &impl Fn(&tamarin_term::lterm::LVar) -> String,
+) -> String {
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
     use tamarin_term::function_symbols::FunSym;
     match t {
-        Term::Lit(Lit::Var(v)) => {
-            format!("{}{}#{}", sort_prefix(v.sort), v.name, v.idx)
-        }
+        Term::Lit(Lit::Var(v)) => var_fmt(v),
         Term::Lit(Lit::Con(n)) => {
             let nm = &n.id.0;
             match n.tag {
@@ -500,10 +507,17 @@ fn canonical_lnterm_with_idx(t: &tamarin_term::lterm::LNTerm) -> String {
                 FunSym::Ac(_) => "AC".to_string(),
                 FunSym::List => "List".to_string(),
             };
-            let args_s: Vec<String> = args.iter().map(canonical_lnterm_with_idx).collect();
+            let args_s: Vec<String> =
+                args.iter().map(|a| write_lnterm_canon(a, var_fmt)).collect();
             format!("{}({})", head, args_s.join(","))
         }
     }
+}
+
+fn canonical_lnterm_with_idx(t: &tamarin_term::lterm::LNTerm) -> String {
+    write_lnterm_canon(t, &|v: &tamarin_term::lterm::LVar| {
+        format!("{}{}#{}", sort_prefix(v.sort), v.name, v.idx)
+    })
 }
 
 fn state_forms_flag() -> bool {
@@ -538,33 +552,9 @@ fn canonical_eq_store_subst(sys: &crate::constraint::system::System) -> String {
 /// Canonicalize an LNTerm by suppressing LVar idxs.  Keeps name+sort,
 /// strips the numeric idx.  Same shape on HS / Rust => diff-able.
 fn canonical_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    use tamarin_term::function_symbols::FunSym;
-    match t {
-        Term::Lit(Lit::Var(v)) => {
-            format!("{}{}:{:?}", sort_prefix(v.sort), v.name, v.sort)
-        }
-        Term::Lit(Lit::Con(n)) => {
-            let nm = &n.id.0;
-            match n.tag {
-                tamarin_term::lterm::NameTag::Pub => format!("'{}'", nm),
-                tamarin_term::lterm::NameTag::Fresh => format!("~'{}'", nm),
-                tamarin_term::lterm::NameTag::Nat => format!("%{}", nm),
-                tamarin_term::lterm::NameTag::Node => format!("#'{}'", nm),
-            }
-        }
-        Term::App(sym, args) => {
-            let head = match sym {
-                FunSym::NoEq(s) => String::from_utf8_lossy(s.name).to_string(),
-                FunSym::C(_) => "C".to_string(),
-                FunSym::Ac(_) => "AC".to_string(),
-                FunSym::List => "List".to_string(),
-            };
-            let args_s: Vec<String> = args.iter().map(canonical_lnterm).collect();
-            format!("{}({})", head, args_s.join(","))
-        }
-    }
+    write_lnterm_canon(t, &|v: &tamarin_term::lterm::LVar| {
+        format!("{}{}:{:?}", sort_prefix(v.sort), v.name, v.sort)
+    })
 }
 
 fn canonical_fact(fa: &crate::fact::LNFact) -> String {
@@ -601,13 +591,11 @@ fn canonical_open_actions(sys: &crate::constraint::system::System) -> String {
     compress_dups(&acts)
 }
 
-/// Emit a [PICK] line indicating which goal was selected for this dispatch.
-/// RS-only; paired with the equivalent goal-pick trace in the private
-/// instrumented HS build so we can compare goal-ranking decisions.
-pub fn trace_pick(g: &crate::constraint::constraints::Goal) {
+/// One-line digest of a goal's shape (tag/arity for fact goals, a bare
+/// label otherwise).  Shared by [`trace_pick`] and `canonical_open_goals`.
+fn goal_digest(g: &crate::constraint::constraints::Goal) -> String {
     use crate::constraint::constraints::Goal;
-    if !state_flag() { return; }
-    let s = match g {
+    match g {
         Goal::Action(_, fa)  => format!("Action({}/{})",
             fact_tag_short(&fa.tag), fa.terms.len()),
         Goal::Premise(_, fa) => format!("Premise({}/{})",
@@ -616,7 +604,16 @@ pub fn trace_pick(g: &crate::constraint::constraints::Goal) {
         Goal::Split(_)       => "Split".to_string(),
         Goal::Disj(d)        => format!("Disj[{}]", disj_heads(d)),
         Goal::Subterm(_)     => "Subterm".to_string(),
-    };
+    }
+}
+
+/// Emit a [PICK] line indicating which goal was selected for this dispatch.
+/// RS-only; paired with the equivalent goal-pick trace in the private
+/// instrumented HS build so we can compare goal-ranking decisions.
+pub fn trace_pick(g: &crate::constraint::constraints::Goal) {
+    use crate::constraint::constraints::Goal;
+    if !state_flag() { return; }
+    let s = goal_digest(g);
     // For Disj goals, also dump the full alternatives (with var idxs
     // preserved) so HS↔Rust comparison can catch dispatch-order
     // divergences — e.g. Helper_Loop_and_success at case_3 has 2
@@ -660,19 +657,9 @@ fn canonical_nodes(sys: &crate::constraint::system::System) -> String {
 }
 
 fn canonical_open_goals(sys: &crate::constraint::system::System) -> String {
-    use crate::constraint::constraints::Goal;
     let mut digests: Vec<String> = sys.goals.iter()
         .filter(|(_, st)| !st.solved)
-        .map(|(g, _)| match g {
-            Goal::Action(_, fa)  => format!("Action({}/{})",
-                fact_tag_short(&fa.tag), fa.terms.len()),
-            Goal::Premise(_, fa) => format!("Premise({}/{})",
-                fact_tag_short(&fa.tag), fa.terms.len()),
-            Goal::Chain(_, _)    => "Chain".to_string(),
-            Goal::Split(_)       => "Split".to_string(),
-            Goal::Disj(d)        => format!("Disj[{}]", disj_heads(d)),
-            Goal::Subterm(_)     => "Subterm".to_string(),
-        })
+        .map(|(g, _)| goal_digest(g))
         .collect();
     digests.sort();
     format!("[{}]", digests.join(","))

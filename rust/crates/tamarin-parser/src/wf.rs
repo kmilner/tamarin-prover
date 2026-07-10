@@ -847,14 +847,7 @@ pub fn special_facts_usage(thy: &Theory) -> WfReport {
 fn pp_term_short(t: &Term) -> String {
     match t {
         Term::Var(v) => {
-            let prefix = match v.sort {
-                SortHint::Pub => "$",
-                SortHint::Fresh => "~",
-                SortHint::Node => "#",
-                SortHint::Nat => "%",
-                _ => "",
-            };
-            format!("{}{}", prefix, v.name)
+            format!("{}{}", sort_prefix(&v.sort), v.name)
         }
         Term::App(name, args) => {
             let parts: Vec<String> = args.iter().map(pp_term_short).collect();
@@ -1602,13 +1595,7 @@ pub fn message_derivation_report(thy: &Theory) -> WfReport {
 }
 
 fn render_var(v: &VarSpec) -> String {
-    let prefix = match v.sort {
-        SortHint::Fresh | SortHint::Suffix(SuffixSort::Fresh) => "~",
-        SortHint::Pub | SortHint::Suffix(SuffixSort::Pub) => "$",
-        SortHint::Node | SortHint::Suffix(SuffixSort::Node) => "#",
-        SortHint::Nat | SortHint::Suffix(SuffixSort::Nat) => "%",
-        _ => "",
-    };
+    let prefix = sort_prefix(&v.sort);
     if v.idx == 0 {
         format!("{}{}", prefix, v.name)
     } else {

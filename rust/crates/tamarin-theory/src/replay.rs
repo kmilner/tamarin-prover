@@ -205,6 +205,45 @@ pub fn annotated_sorry_root(sys: System) -> ProofNode {
     annotated_sorry(None, sys)
 }
 
+/// Shared body of the finished-leaf replay arms (`by contradiction`,
+/// `SOLVED`, `UNFINISHABLE`).  Each arm has the same shape: if runtime
+/// `is_finished` agrees with the skeleton's claimed terminal method
+/// (`matches_expected`), emit a `Finished(method)` node carrying `status`;
+/// otherwise fall through — `invalid_step_node` when replaying without the
+/// auto-prover, else `run_proof_search` (HS `checkProof` marks the stale
+/// step an annotated sorry which `replaceSorryProver` then reproves).
+///
+/// `method` is emitted verbatim and may differ from what `matches_expected`
+/// accepts: `by contradiction` matches any `Contradictory(_)` but emits
+/// `Contradictory(None)` so the reprinted method carries no reason.
+fn finished_leaf(
+    ctx: &ProofContext,
+    sys: System,
+    node: &ParsedProofTree,
+    matches_expected: impl Fn(&MethodResult) -> bool,
+    method: MethodResult,
+    status: NodeStatus,
+    auto_prove: bool,
+    max_steps: usize,
+) -> ProofNode {
+    match is_finished(ctx, &sys) {
+        Some(ref r) if matches_expected(r) => ProofNode {
+            method: ProofMethod::Finished(method),
+            sys,
+            children: BTreeMap::new(),
+            status,
+            annotated: true,
+        },
+        _ => {
+            if !auto_prove {
+                invalid_step_node(node, sys)
+            } else {
+                run_proof_search(ctx, sys, max_steps)
+            }
+        }
+    }
+}
+
 /// Replay one node of the skeleton against `sys`.  When `auto_prove` is
 /// false, fall-throughs that would otherwise invoke the auto-prover emit
 /// unannotated `Sorry` leaves instead (HS check-and-extend semantics).
@@ -241,30 +280,22 @@ fn replay_node(
     // annotated sorry (Prover.hs:185 → TheoryLoader.hs:606), exactly the
     // `run_proof_search` fall-through below.
     if matches!(node.method, ParsedMethod::Contradiction) && node.cases.is_empty() {
-        if let Some(MethodResult::Contradictory(_)) = is_finished(ctx, &sys) {
-            // HS replay (checkProof, Proof.hs) preserves the
-            // skeleton's STORED method verbatim — the parser builds
-            // `Finished (Contradictory Nothing)` for `by contradiction`
-            // (Proof.hs:81), so the reprinted method carries no reason
-            // (`prettyProofMethod` → plain `by contradiction`).  Emit
-            // `Contradictory(None)`, NOT a freshly-recomputed reason
-            // (which would print a spurious `/* from formulas */`).
-            return ProofNode {
-                method: ProofMethod::Finished(MethodResult::Contradictory(None)),
-                sys,
-                children: BTreeMap::new(),
-                status: NodeStatus::Contradictory,
-                annotated: true,
-            };
-        }
-        // Runtime doesn't immediately agree with the skeleton's
-        // `by contradiction` claim.  HS `checkProof` (Proof.hs):
+        // HS replay (checkProof, Proof.hs) preserves the skeleton's STORED
+        // method verbatim — the parser builds `Finished (Contradictory
+        // Nothing)` for `by contradiction` (Proof.hs:81), so the reprinted
+        // method carries no reason (`prettyProofMethod` → plain `by
+        // contradiction`).  Emit `Contradictory(None)`, NOT a freshly-
+        // recomputed reason (which would print a spurious `/* from
+        // formulas */`).  On disagreement HS `checkProof` (Proof.hs) emits
         //   `sorryNode (Just "invalid proof step encountered") (M.singleton "" prf)`
         // where `prf` is the current leaf, `noSystemPrf`'d → unannotated.
-        if !auto_prove {
-            return invalid_step_node(node, sys);
-        }
-        return run_proof_search(ctx, sys, max_steps);
+        return finished_leaf(
+            ctx, sys, node,
+            |r| matches!(r, MethodResult::Contradictory(_)),
+            MethodResult::Contradictory(None),
+            NodeStatus::Contradictory,
+            auto_prove, max_steps,
+        );
     }
 
     // `SOLVED` leaf (HS Proof.hs:102-103).  If runtime is_finished
@@ -278,37 +309,25 @@ fn replay_node(
     // TheoryLoader.hs:606).  Skeleton's SOLVED is HS's claim; RS verifies
     // via its own solver.
     if matches!(node.method, ParsedMethod::SolvedLeaf) && node.cases.is_empty() {
-        if let Some(MethodResult::Solved) = is_finished(ctx, &sys) {
-            return ProofNode {
-                method: ProofMethod::Finished(MethodResult::Solved),
-                sys,
-                children: BTreeMap::new(),
-                status: NodeStatus::Solved,
-                annotated: true,
-            };
-        }
-        if !auto_prove {
-            return invalid_step_node(node, sys);
-        }
-        return run_proof_search(ctx, sys, max_steps);
+        return finished_leaf(
+            ctx, sys, node,
+            |r| matches!(r, MethodResult::Solved),
+            MethodResult::Solved,
+            NodeStatus::Solved,
+            auto_prove, max_steps,
+        );
     }
 
     // `UNFINISHABLE` leaf — emit Finished(Unfinishable) if runtime
     // agrees, else fall back to auto-prover.
     if matches!(node.method, ParsedMethod::Unfinishable) && node.cases.is_empty() {
-        if let Some(MethodResult::Unfinishable) = is_finished(ctx, &sys) {
-            return ProofNode {
-                method: ProofMethod::Finished(MethodResult::Unfinishable),
-                sys,
-                children: BTreeMap::new(),
-                status: NodeStatus::Unfinishable,
-                annotated: true,
-            };
-        }
-        if !auto_prove {
-            return invalid_step_node(node, sys);
-        }
-        return run_proof_search(ctx, sys, max_steps);
+        return finished_leaf(
+            ctx, sys, node,
+            |r| matches!(r, MethodResult::Unfinishable),
+            MethodResult::Unfinishable,
+            NodeStatus::Unfinishable,
+            auto_prove, max_steps,
+        );
     }
 
     // ---- Non-leaf nodes: pick a method, exec it, recurse. ----
@@ -419,9 +438,8 @@ fn replay_node(
                 // The auto-prover never runs on it (no system attached), so
                 // this is independent of `auto_prove` — both the target
                 // lemma (extend sorries) and check-only replay keep drifted
-                // cases verbatim.  (Previously the `auto_prove` path emitted
-                // a synthetic `skeleton case not produced` sorry, which
-                // diverged from HS on stale stored proofs, e.g. KCL07.)
+                // cases verbatim.  (KCL07 is a stale-stored-proof theory
+                // that exercises this drifted-case path.)
                 let placeholder = parsed_to_unannotated(sub_tree, sys.clone());
                 children.insert(skel_name.clone(), placeholder);
                 any_sorry = true;
@@ -1348,9 +1366,9 @@ mod tests {
             cases: Vec::new(),
         };
         let result = replace_sorry_prove(&ctx, sys, &skel, 50);
-        // No goals, no contradictions → auto-prover recognises Solved.
-        // The earlier behaviour emitted Sorry; the current contract
-        // is "fall back to auto-prover, never fabricate Contradictory".
+        // No goals, no contradictions → auto-prover recognises Solved. The
+        // contract is "fall back to auto-prover, never fabricate
+        // Contradictory".
         assert_ne!(result.status, NodeStatus::Contradictory,
             "walker must NOT fabricate Contradictory when runtime disagrees");
         assert_eq!(result.status, NodeStatus::Solved);
@@ -1681,8 +1699,7 @@ mod tests {
     /// `noSystemPrf` over the WHOLE subtree → every node `Nothing` →
     /// `/* unannotated */`.  `parsed_to_unannotated` must therefore set
     /// `annotated == false` on EVERY node of the converted subtree, not
-    /// just the root.  (Regression guard for fix B: the rightOnly path
-    /// previously emitted a single `annotated == true` sorry leaf.)
+    /// just the root.
     #[test]
     fn parsed_to_unannotated_marks_whole_subtree() {
         // Skeleton:  simplify → case "a" (by sorry), case "b" (by sorry)

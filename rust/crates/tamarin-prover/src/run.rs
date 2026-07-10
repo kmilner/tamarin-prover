@@ -227,9 +227,8 @@ fn run_variants(args: &Args) -> Result<i32, RunError> {
     // HS `Main.Mode.Intruder.run` (Intruder.hs:48-53) generates BOTH the DH
     // and the bilinear-pairing variants and emits `dhS ++ bpS`:
     //   - DH: `dhIntruderRules False` (runtime, via Maude).  RS's runtime
-    //     generator is now byte-faithful (exactly 51 rules) after the
-    //     `remove_renamings` fix in `variants_intruder` — previously it
-    //     over-produced 53 (an extra identity-variant `d_inv` and `d_exp`).
+    //     generator is byte-faithful (exactly 51 rules); `variants_intruder`
+    //     applies `remove_renamings` to drop redundant identity-variants.
     //   - BP: `bpIntruderRules False` (runtime).  Like HS
     //     (Intruder.hs:50), we start a SECOND Maude handle on
     //     `bp_maude_sig()` and generate the 75 BP rules at runtime via
@@ -308,8 +307,7 @@ fn run_interactive(args: &Args) -> Result<i32, RunError> {
         cfg.max_steps = b as usize;
     }
     // `-d/--derivcheck-timeout` — same default expression as the batch
-    // path's derivation-check block; previously parsed but ignored on the
-    // web path (theory_io hardcoded 5).
+    // path's derivation-check block (default 5).
     cfg.derivcheck_timeout = args.derivcheck_timeout.unwrap_or(5) as u32;
 
     // Positional args are theory files (Haskell uses a working
@@ -323,21 +321,10 @@ fn run_interactive(args: &Args) -> Result<i32, RunError> {
         // maude block (Console.hs:150-155) and `ensureGraphVizDot` the
         // GraphViz block (Environment.hs:72-87), both on stderr.
         {
-            let raw_path = args.maude_path.clone().unwrap_or_else(default_maude_path);
-            let disp = if args.maude_path.is_some() {
-                raw_path.clone()
-            } else {
-                std::path::Path::new(&raw_path)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&raw_path)
-                    .to_string()
-            };
-            eprintln!("maude tool: '{}'", disp);
-            if let Some(v) = crate::cli::detect_maude_version_pub() {
-                eprintln!(" checking version: {}. OK.", v);
-                eprintln!(" checking installation: OK.");
-            }
+            print_maude_banner(
+                &maude_display_name(args),
+                crate::cli::detect_maude_version_pub().as_deref(),
+            );
             eprintln!("GraphViz tool: 'dot'");
             // HS lowercases `dot -V`'s stderr banner, strips the trailing
             // newline, and appends ". OK." (Environment.hs:81-87); PNG
@@ -442,6 +429,65 @@ fn guess_frontend_dist(data_dir: &std::path::Path) -> Option<std::path::PathBuf>
     None
 }
 
+/// Clone the parser theory and expand its macros in place, mirroring HS
+/// `thyProtoRules`'s `applyMacroInRule (theoryMacros thy)`.  Used for the
+/// WF re-checks that must see macro-expanded rules.
+fn macro_expanded_clone(parsed: &tamarin_parser::ast::Theory) -> tamarin_parser::ast::Theory {
+    let mut t = parsed.clone();
+    tamarin_theory::macro_expand::expand_theory_macros(&mut t);
+    t
+}
+
+/// Splice `new` WF errors into `wf_report` just before the first existing
+/// entry whose topic is in `later_topics` (the HS check-order position), or
+/// at the end if none match.  Extracted from the four ordered-splice call
+/// sites (checkTerms / checkGuarded / SAPIC lhs-rhs / ruleVariants); each
+/// passes its own `later_topics` slice.  No-op when `new` is empty.
+fn insert_report_before(
+    wf_report: &mut Vec<tamarin_parser::wf::WfError>,
+    new: Vec<tamarin_parser::wf::WfError>,
+    later_topics: &[&str],
+) {
+    if new.is_empty() {
+        return;
+    }
+    let insert_before = wf_report
+        .iter()
+        .position(|e| later_topics.contains(&e.topic.as_str()))
+        .unwrap_or(wf_report.len());
+    let tail = wf_report.split_off(insert_before);
+    wf_report.extend(new);
+    wf_report.extend(tail);
+}
+
+/// HS shows the maude tool's basename when the user didn't pass
+/// `--maude-path`, and the full path when they did (Console.hs:150).  We
+/// can't re-introspect the flag downstream, so we key off `args.maude_path`
+/// being `None` (the default) vs `Some` (user-supplied).
+fn maude_display_name(args: &Args) -> String {
+    let raw_path = args.maude_path.clone().unwrap_or_else(default_maude_path);
+    if args.maude_path.is_some() {
+        raw_path
+    } else {
+        std::path::Path::new(&raw_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&raw_path)
+            .to_string()
+    }
+}
+
+/// Emit the `maude tool:` + version + installation banner to stderr (HS
+/// `ensureMaudeAndGetVersion`, Console.hs:150-155).  `disp` is the tool name
+/// to show; when `ver` is present the two ` checking …: OK.` lines follow.
+fn print_maude_banner(disp: &str, ver: Option<&str>) {
+    eprintln!("maude tool: '{}'", disp);
+    if let Some(v) = ver {
+        eprintln!(" checking version: {}. OK.", v);
+        eprintln!(" checking installation: OK.");
+    }
+}
+
 fn run_batch(args: &Args) -> Result<i32, RunError> {
     // HS-faithful internal parallelism via rayon.  Mirrors the four
     // `using parList`/`parTraversable`/`parMap` sites HS uses (see
@@ -511,7 +557,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
     // The Maude version is constant for the whole run, but detecting it
     // spawns a `maude --version` subprocess.  Detect it ONCE here and
     // reuse the cached value for both the banner and every file's
-    // `BuildInfo` (previously re-detected per file → N+1 subprocesses).
+    // `BuildInfo`, avoiding one `maude --version` subprocess per file.
     let maude_version: Option<String> = crate::cli::detect_maude_version_pub();
 
     // HS prints the maude tool + version banner ONCE at the top of the
@@ -520,26 +566,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
     // installation: OK.` before the first theory is loaded.  Suppressed
     // by `--quiet`.
     if !args.quiet && !args.parse_only {
-        let raw_path = args.maude_path.clone().unwrap_or_else(default_maude_path);
-        // HS prints just the basename when the user didn't pass --maude-path,
-        // and the full path when they did.  We can't tell which here without
-        // re-introspecting Args, but matching HS's default-banner shape is
-        // achieved by showing the basename when the user-supplied value is
-        // None.  Args' `maude_path` is already None when not provided.
-        let disp = if args.maude_path.is_some() {
-            raw_path.clone()
-        } else {
-            std::path::Path::new(&raw_path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&raw_path)
-                .to_string()
-        };
-        eprintln!("maude tool: '{}'", disp);
-        if let Some(v) = &maude_version {
-            eprintln!(" checking version: {}. OK.", v);
-            eprintln!(" checking installation: OK.");
-        }
+        print_maude_banner(&maude_display_name(args), maude_version.as_deref());
     }
 
     for in_file in &args.in_files {
@@ -593,11 +620,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // BEFORE the checks run — so `Fr(test())` where `test() = ~x`
         // becomes `Fr(~x)` and passes.  We mirror by cloning `parsed`
         // and expanding macros before handing it to `check_theory`.
-        let parsed_for_wf = {
-            let mut tmp = parsed.clone();
-            tamarin_theory::macro_expand::expand_theory_macros(&mut tmp);
-            tmp
-        };
+        let parsed_for_wf = macro_expanded_clone(&parsed);
         let mut wf_report = tamarin_parser::wf::check_theory(&parsed_for_wf);
         // Strip the static "Message Derivation Checks" entry — the
         // dynamic check below replaces it with the prover-based result.
@@ -680,18 +703,12 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         {
             let term_errors = tamarin_theory::check_terms::check_terms_wf(
                 &parsed_for_wf, &maude_sig);
-            if !term_errors.is_empty() {
-                let insert_before = wf_report.iter().position(|e| {
-                    matches!(e.topic.as_str(),
-                        " Formula guardedness"
-                        | "Lemma annotations" | "Multiplication restriction of rules"
-                        | "Nat Sorts" | "Subterm Convergence Warning"
-                        | "Message Derivation Checks" | "Derivation Checks")
-                }).unwrap_or(wf_report.len());
-                let tail = wf_report.split_off(insert_before);
-                wf_report.extend(term_errors);
-                wf_report.extend(tail);
-            }
+            insert_report_before(&mut wf_report, term_errors, &[
+                " Formula guardedness",
+                "Lemma annotations", "Multiplication restriction of rules",
+                "Nat Sorts", "Subterm Convergence Warning",
+                "Message Derivation Checks", "Derivation Checks",
+            ]);
         }
 
         // Port of HS `formulaReports.checkGuarded` (Wellformedness.hs:988-1004):
@@ -716,22 +733,16 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // before `lemma_attribute_report` (9) — matches HS order.
         {
             let guard_errors = tamarin_theory::elaborate::check_guarded_wf(&parsed);
-            if !guard_errors.is_empty() {
-                // Insert BEFORE the "Lemma annotations" entries that
-                // `check_theory` already put in `wf_report`, so the order
-                // matches HS: Formula guardedness (8c) before Lemma
-                // annotations (9).  Find the first index of a topic that
-                // comes after position 8 in HS's check order.
-                let insert_before = wf_report.iter().position(|e| {
-                    matches!(e.topic.as_str(),
-                        "Lemma annotations" | "Multiplication restriction of rules"
-                        | "Nat Sorts" | "Subterm Convergence Warning"
-                        | "Message Derivation Checks" | "Derivation Checks")
-                }).unwrap_or(wf_report.len());
-                let tail = wf_report.split_off(insert_before);
-                wf_report.extend(guard_errors);
-                wf_report.extend(tail);
-            }
+            // Insert BEFORE the "Lemma annotations" entries that
+            // `check_theory` already put in `wf_report`, so the order
+            // matches HS: Formula guardedness (8c) before Lemma
+            // annotations (9).  Find the first index of a topic that
+            // comes after position 8 in HS's check order.
+            insert_report_before(&mut wf_report, guard_errors, &[
+                "Lemma annotations", "Multiplication restriction of rules",
+                "Nat Sorts", "Subterm Convergence Warning",
+                "Message Derivation Checks", "Derivation Checks",
+            ]);
         }
 
         // SAPIC `process:` translation (HS `typeTheory` → `translate`,
@@ -785,28 +796,18 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // `out` — are surfaced, byte-identically to HS.  For non-SAPIC theories
         // this is a no-op (the pre- and post-translation rule sets are equal).
         if elaborated.is_sapic {
-            let post_thy = {
-                let mut tmp = parsed.clone();
-                tamarin_theory::macro_expand::expand_theory_macros(&mut tmp);
-                tmp
-            };
+            let post_thy = macro_expanded_clone(&parsed);
             let topic = "Facts occur in the left-hand-side but not in any right-hand-side ";
             wf_report.retain(|e| e.topic != topic);
             let lhs_rhs = tamarin_parser::wf::fact_lhs_occur_no_rhs(&post_thy);
-            if !lhs_rhs.is_empty() {
-                // Insert at the factReports position (after fact_usage, before
-                // formulaReports), matching HS check order.
-                let insert_before = wf_report.iter().position(|e| {
-                    matches!(e.topic.as_str(),
-                        "Formula terms" | " Formula guardedness"
-                        | "Lemma annotations" | "Multiplication restriction of rules"
-                        | "Nat Sorts" | "Subterm Convergence Warning"
-                        | "Message Derivation Checks" | "Derivation Checks")
-                }).unwrap_or(wf_report.len());
-                let tail = wf_report.split_off(insert_before);
-                wf_report.extend(lhs_rhs);
-                wf_report.extend(tail);
-            }
+            // Insert at the factReports position (after fact_usage, before
+            // formulaReports), matching HS check order.
+            insert_report_before(&mut wf_report, lhs_rhs, &[
+                "Formula terms", " Formula guardedness",
+                "Lemma annotations", "Multiplication restriction of rules",
+                "Nat Sorts", "Subterm Convergence Warning",
+                "Message Derivation Checks", "Derivation Checks",
+            ]);
         }
 
         // Spawn a single Maude handle for this file.  Used by:
@@ -987,25 +988,19 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 }
             }
 
-            if !variants_errors.is_empty() {
-                // HS position 6: ruleVariantsReport comes BEFORE factReports
-                // (position 7).  Insert before factReports items.
-                let insert_before = wf_report.iter().position(|e| {
-                    matches!(e.topic.as_str(),
-                        "Reserved names" | "Special facts"
-                        | "Fr facts must only use a fresh- or a msg-variable"
-                        | "Fact arity issues" | "Fact multiplicity issues"
-                        | "Fact capitalization issues"
-                        | "Facts occur in the left-hand-side but not in any right-hand-side "
-                        | "Unbound variables" | "Formula terms" | " Formula guardedness"
-                        | "Lemma annotations" | "Multiplication restriction of rules"
-                        | "Nat Sorts" | "Subterm Convergence Warning"
-                        | "Message Derivation Checks" | "Derivation Checks")
-                }).unwrap_or(wf_report.len());
-                let tail = wf_report.split_off(insert_before);
-                wf_report.extend(variants_errors);
-                wf_report.extend(tail);
-            }
+            // HS position 6: ruleVariantsReport comes BEFORE factReports
+            // (position 7).  Insert before factReports items.
+            insert_report_before(&mut wf_report, variants_errors, &[
+                "Reserved names", "Special facts",
+                "Fr facts must only use a fresh- or a msg-variable",
+                "Fact arity issues", "Fact multiplicity issues",
+                "Fact capitalization issues",
+                "Facts occur in the left-hand-side but not in any right-hand-side ",
+                "Unbound variables", "Formula terms", " Formula guardedness",
+                "Lemma annotations", "Multiplication restriction of rules",
+                "Nat Sorts", "Subterm Convergence Warning",
+                "Message Derivation Checks", "Derivation Checks",
+            ]);
 
             // HS closeProtoRule (Rule.hs:97-98): `ClosedProtoRule ruE <$>
             // maybeToList (variantsProtoRule hnd ruE)` — a rule with NO
@@ -1100,10 +1095,10 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             for l in elaborated.lemmas() {
                 results.push(LemmaResult {
                     name: l.name.clone(),
-                    verdict: if lemma_filter.is_empty() {
-                        LemmaVerdict::Skipped
-                    } else if lemma_matches(lemma_filter, &l.name) {
-                        // Selected but no prove flag — still skipped.
+                    verdict: if lemma_filter.is_empty()
+                        || lemma_matches(lemma_filter, &l.name)
+                    {
+                        // Empty filter, or selected but no prove flag — skipped.
                         LemmaVerdict::Skipped
                     } else {
                         LemmaVerdict::Filtered
@@ -1449,12 +1444,11 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 /// CLI flag.  Idempotent across files in a batch — `build_global`
 /// silently errors on the second call, which is what we want.
 ///
-/// Default: `available_parallelism()` (full machine).  Previously
-/// capped at 4 to avoid the Maude IPC mutex serialising every worker
-/// on a single subprocess; with `MaudePool` (`--maude-processes=M`)
-/// the contention is gone and users can productively scale to every
-/// core.  Memory budget is mediated by `--maude-processes`, which
-/// defaults to `processors` (1:1).
+/// Default: `available_parallelism()` (full machine).  `MaudePool`
+/// (`--maude-processes=M`) removes the Maude IPC mutex contention that
+/// would otherwise serialise every worker on a single subprocess, so
+/// users can productively scale to every core.  Memory budget is
+/// mediated by `--maude-processes`, which defaults to `processors` (1:1).
 fn init_rayon_pool(args: &Args) {
     let n = args.effective_processors();
     // `build_global` is idempotent-error: the SECOND call returns Err
@@ -1686,8 +1680,8 @@ mod tests {
 
     // Pins the per-lemma summary strings to HS `showProofStatus`
     // (Theory/Proof.hs:1105-1112) + the `(N steps)` suffix
-    // (ClosedTheory.hs:487-489).  The Undetermined/Invalidated arms used to
-    // collapse into "analysis incomplete"; HS renders them distinctly.
+    // (ClosedTheory.hs:487-489).  Undetermined/Invalidated render distinct
+    // strings, not "analysis incomplete".
     #[test]
     fn lemma_summary_distinguishes_undetermined_and_invalidated() {
         // showProofStatus _ UndeterminedProof = "analysis undetermined"

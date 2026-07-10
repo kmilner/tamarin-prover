@@ -12,7 +12,7 @@ use axum::{
 use std::collections::HashMap;
 use serde_json::Value;
 
-use crate::handlers::{json_resp, path_parse, theory_html};
+use crate::handlers::{html_response, json_resp, path_parse, text_response, theory_html};
 use crate::state::AppState;
 
 use tamarin_theory::constraint::solver::search::NodeStatus;
@@ -20,18 +20,6 @@ use tamarin_theory::constraint::solver::search::NodeStatus;
 // ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
-
-fn html_response(html: String) -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
-    (StatusCode::OK, headers, html).into_response()
-}
-
-fn text_response(s: String) -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, "text/plain; charset=utf-8".parse().unwrap());
-    (StatusCode::OK, headers, s).into_response()
-}
 
 /// Haskell's `notFound` returns a 404 HTML page.  We mirror that so the
 /// frontend's `server.handleResponseError` triggers the right branch.
@@ -244,10 +232,7 @@ fn apply_method_and_redirect(
     let mut url = format!(
         "/thy/trace/{}/overview/proof/{}",
         new_idx, path_parse::url_path_escape(&target_lemma));
-    for seg in &target_sub {
-        url.push('/');
-        url.push_str(&path_parse::url_path_escape(&path_parse::prefix_with_underscore(seg)));
-    }
+    url.push_str(&path_parse::encode_sub_path(&target_sub));
     json_resp::redirect(url)
 }
 
@@ -651,11 +636,7 @@ pub async fn autoprove(
                     let mut u = format!(
                         "/thy/trace/{}/overview/proof/{}",
                         new_idx, path_parse::url_path_escape(&tl));
-                    for seg in &ts {
-                        u.push('/');
-                        u.push_str(&path_parse::url_path_escape(
-                            &path_parse::prefix_with_underscore(seg)));
-                    }
+                    u.push_str(&path_parse::encode_sub_path(&ts));
                     u
                 }
                 None => format!(
@@ -828,11 +809,7 @@ pub async fn autoprove_all(
             let mut u = format!(
                 "/thy/trace/{}/overview/proof/{}",
                 new_idx, path_parse::url_path_escape(&tl));
-            for seg in &ts {
-                u.push('/');
-                u.push_str(&path_parse::url_path_escape(
-                    &path_parse::prefix_with_underscore(seg)));
-            }
+            u.push_str(&path_parse::encode_sub_path(&ts));
             u
         }
         // No lemmas at all: nothing to prove or point at.
@@ -887,11 +864,7 @@ pub async fn verify(
             let mut url = format!(
                 "/thy/trace/{}/overview/proof/{}",
                 idx, path_parse::url_path_escape(&lemma));
-            for seg in sub {
-                url.push('/');
-                url.push_str(&path_parse::url_path_escape(
-                    &path_parse::prefix_with_underscore(&seg)));
-            }
+            url.push_str(&path_parse::encode_sub_path(&sub));
             json_resp::redirect(url).into_response()
         }
         // Help-pane fallback: Haskell falls through to
@@ -1591,11 +1564,7 @@ pub async fn delete_step(
             let mut url = format!(
                 "/thy/trace/{}/overview/proof/{}",
                 new_idx, path_parse::url_path_escape(lemma));
-            for seg in sub {
-                url.push('/');
-                url.push_str(&path_parse::url_path_escape(
-                    &path_parse::prefix_with_underscore(seg)));
-            }
+            url.push_str(&path_parse::encode_sub_path(sub));
             json_resp::redirect(url).into_response()
         }
         _ => json_resp::alert("Can't delete the given theory path!")

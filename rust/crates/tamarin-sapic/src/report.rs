@@ -101,15 +101,7 @@ pub fn report_init(
 
 /// `LVar` → parser-AST `Term::Var` (message-sorted predicate argument).
 fn lvar_to_parser(v: &LVar) -> tamarin_parser::ast::Term {
-    use tamarin_parser::ast as p;
-    let sort = match v.sort {
-        LSort::Fresh => p::SortHint::Fresh,
-        LSort::Pub => p::SortHint::Pub,
-        LSort::Node => p::SortHint::Node,
-        LSort::Nat => p::SortHint::Nat,
-        LSort::Msg => p::SortHint::Msg,
-    };
-    p::Term::Var(p::VarSpec { name: v.name.to_string(), idx: v.idx, sort, typ: None })
+    tamarin_parser::ast::Term::Var(crate::convert::lvar_to_varspec(v))
 }
 
 // =============================================================================

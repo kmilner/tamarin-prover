@@ -209,6 +209,25 @@ enum Matched {
     Fact { fact: LNFact, outs: Vec<(usize, LNFact)> },
 }
 
+/// Build the `(AUTO_IN_*, AUTO_OUT_*)` fact-name pair for a matched input,
+/// selecting `print_position` (Term) vs `print_fact_position` (Fact) by the
+/// `Matched` variant.  Shared by the addFormula and addLabels loops so the
+/// four AUTO_* name templates live in exactly one place.
+fn auto_names(m: &Matched, pos: &ExtendedPosition, rin_name: &str) -> (String, String) {
+    match m {
+        Matched::Term { .. } => {
+            let p = print_position(pos);
+            (format!("AUTO_IN_TERM_{}_{}", p, rin_name),
+             format!("AUTO_OUT_TERM_{}_{}", p, rin_name))
+        }
+        Matched::Fact { .. } => {
+            let p = print_fact_position(pos);
+            (format!("AUTO_IN_FACT_{}_{}", p, rin_name),
+             format!("AUTO_OUT_FACT_{}_{}", p, rin_name))
+        }
+    }
+}
+
 /// Port of `addAutoSourcesLemma`'s body (OpenTheory.hs:144-538) without the
 /// theory-item plumbing: given the protocol rules and the open-chain cases,
 /// compute the rule AUTO annotations and the source-lemma formula.
@@ -333,21 +352,19 @@ pub fn add_auto_sources_lemma(
             let rin_name = rules[*ri].name();
             let part = match m {
                 Matched::Term { outs, .. } => {
-                    let in_name = format!("AUTO_IN_TERM_{}_{}", print_position(pos), rin_name);
+                    let (in_name, out_name) = auto_names(m, pos, rin_name);
                     if outs.is_empty() {
                         term_input_form_no_outputs(&in_name)
                     } else {
-                        let out_name = format!("AUTO_OUT_TERM_{}_{}", print_position(pos), rin_name);
                         term_input_form_with_outputs(&in_name, &out_name)
                     }
                 }
                 Matched::Fact { fact, outs } => {
-                    let in_name = format!("AUTO_IN_FACT_{}_{}", print_fact_position(pos), rin_name);
+                    let (in_name, out_name) = auto_names(m, pos, rin_name);
                     let in_arity = fact.terms.len();
                     if outs.is_empty() {
                         fact_input_form_no_outputs(&in_name, in_arity)
                     } else {
-                        let out_name = format!("AUTO_OUT_FACT_{}_{}", print_fact_position(pos), rin_name);
                         let out_arity = outs[0].1.terms.len();
                         fact_input_form_with_outputs(&in_name, &out_name, in_arity, out_arity)
                     }
@@ -362,17 +379,15 @@ pub fn add_auto_sources_lemma(
             let rin_name = rules[*ri].name().to_string();
             match m {
                 Matched::Term { protterm, vin, outs } => {
-                    let in_name = format!("AUTO_IN_TERM_{}_{}", print_position(pos), rin_name);
+                    let (in_name, out_name) = auto_names(m, pos, &rin_name);
                     grp.push((rin_name.clone(), ln_proto(&in_name, vec![protterm.clone(), vin.clone()])));
-                    let out_name = format!("AUTO_OUT_TERM_{}_{}", print_position(pos), rin_name);
                     for (rout_i, tout) in outs {
                         grp.push((rules[*rout_i].name().to_string(), ln_proto(&out_name, vec![tout.clone()])));
                     }
                 }
                 Matched::Fact { fact, outs } => {
-                    let in_name = format!("AUTO_IN_FACT_{}_{}", print_fact_position(pos), rin_name);
+                    let (in_name, out_name) = auto_names(m, pos, &rin_name);
                     grp.push((rin_name.clone(), ln_proto(&in_name, fact.terms.clone())));
-                    let out_name = format!("AUTO_OUT_FACT_{}_{}", print_fact_position(pos), rin_name);
                     for (rout_i, fout) in outs {
                         grp.push((rules[*rout_i].name().to_string(), ln_proto(&out_name, fout.terms.clone())));
                     }

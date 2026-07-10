@@ -33,12 +33,7 @@ async fn test_autoprove_returns_redirect_envelope() {
     let res = s.client.get(&url).send().await.expect("send autoprove");
     assert_eq!(res.status(), 200, "autoprove should return 200");
 
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(
         ct.starts_with("application/json"),
         "autoprove must reply JSON, got {}",
@@ -138,12 +133,7 @@ async fn test_autoprove_with_missing_idx_returns_404_html() {
     let url = s.url("/thy/trace/99/autoprove/idfs/0/False/proof/debug");
     let res = s.client.get(&url).send().await.expect("send");
     assert_eq!(res.status(), 404);
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(
         ct.starts_with("text/html"),
         "missing-idx 404 must be text/html (matches Haskell); got {}",
@@ -183,12 +173,12 @@ async fn test_autoprove_proof_view_retains_systems() {
     tamarin_theory::constraint::solver::search::set_keep_sys(true);
     let s = start_server_with_theory("Tutorial.spthy").await;
     let v: serde_json::Value = s.client
-        .get(&s.url("/thy/trace/1/autoprove/idfs/0/False/proof/Client_auth"))
+        .get(s.url("/thy/trace/1/autoprove/idfs/0/False/proof/Client_auth"))
         .send().await.expect("send").json().await.expect("decode");
     let redir = v.get("redirect").and_then(|x| x.as_str()).expect("redirect");
     let idx: usize = redir.split('/').nth(3).and_then(|x| x.parse().ok()).expect("idx");
     let pv: serde_json::Value = s.client
-        .get(&s.url(&format!("/thy/trace/{}/main/proof/Client_auth", idx)))
+        .get(s.url(&format!("/thy/trace/{}/main/proof/Client_auth", idx)))
         .send().await.expect("send").json().await.expect("decode");
     let html = pv.get("html").and_then(|x| x.as_str()).unwrap_or("");
     assert!(html.contains("Applicable Proof Methods"),

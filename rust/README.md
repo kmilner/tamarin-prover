@@ -115,45 +115,45 @@ TIMEOUT, DERIV, HS_PATH, RS_PATH env vars (see the scripts/bench.sh header).
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 2.3 s | 0.8 s (-65%) | 63 MB | 18 MB (-71%) |
-| `Joux` | 18.3 s | 8.0 s (-56%) | 233 MB | 41 MB (-82%) |
-| `stateverif_left_right` | 28.8 s | 7.2 s (-75%) | 867 MB | 48 MB (-94%) |
-| `Yubikey` | 37.4 s | 8.3 s (-78%) | 281 MB | 46 MB (-84%) |
-| `gcm` | 94.9 s | 30.4 s (-68%) | 1233 MB | 99 MB (-92%) |
-| `wireguard` | 99.6 s | 16.8 s (-83%) | 1211 MB | 46 MB (-96%) |
-| `CCITT_X509_3` | 372.6 s | 100.3 s (-73%) | 2499 MB | 299 MB (-88%) |
+| `NSPK3` | 2.3 s | 0.6 s (-74%) | 61 MB | 17 MB (-72%) |
+| `Joux` | 18.5 s | 7.5 s (-59%) | 232 MB | 44 MB (-81%) |
+| `stateverif_left_right` | 28.7 s | 6.3 s (-78%) | 865 MB | 48 MB (-94%) |
+| `Yubikey` | 37.4 s | 7.3 s (-80%) | 288 MB | 46 MB (-84%) |
+| `gcm` | 93.0 s | 23.6 s (-75%) | 1245 MB | 96 MB (-92%) |
+| `wireguard` | 98.1 s | 11.1 s (-89%) | 1240 MB | 46 MB (-96%) |
+| `CCITT_X509_3` | 363.9 s | 43.9 s (-88%) | 2509 MB | 301 MB (-88%) |
 
 **4 cores**
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 1.2 s | 0.5 s (-58%) | 84 MB | 28 MB (-67%) |
-| `Joux` | 15.4 s | 7.7 s (-50%) | 275 MB | 46 MB (-83%) |
-| `stateverif_left_right` | 17.3 s | 4.3 s (-75%) | 840 MB | 86 MB (-90%) |
-| `Yubikey` | 24.2 s | 6.0 s (-75%) | 294 MB | 78 MB (-73%) |
-| `gcm` | 70.3 s | 12.6 s (-82%) | 1302 MB | 212 MB (-84%) |
-| `wireguard` | 61.4 s | 8.6 s (-86%) | 1262 MB | 82 MB (-94%) |
-| `CCITT_X509_3` | 153.5 s | 26.3 s (-83%) | 4538 MB | 532 MB (-88%) |
+| `NSPK3` | 1.2 s | 0.4 s (-67%) | 85 MB | 27 MB (-68%) |
+| `Joux` | 15.7 s | 7.3 s (-54%) | 267 MB | 46 MB (-83%) |
+| `stateverif_left_right` | 17.2 s | 3.9 s (-77%) | 827 MB | 80 MB (-90%) |
+| `Yubikey` | 24.2 s | 5.7 s (-76%) | 298 MB | 77 MB (-74%) |
+| `gcm` | 67.8 s | 10.8 s (-84%) | 1266 MB | 181 MB (-86%) |
+| `wireguard` | 61.0 s | 5.9 s (-90%) | 1212 MB | 82 MB (-93%) |
+| `CCITT_X509_3` | 147.6 s | 12.0 s (-92%) | 4772 MB | 570 MB (-88%) |
 
 **16 cores**
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 1.2 s | 0.8 s (-33%) | 131 MB | 39 MB (-70%) |
-| `Joux` | 16.3 s | 8.2 s (-50%) | 325 MB | 57 MB (-82%) |
-| `stateverif_left_right` | 17.4 s | 4.4 s (-75%) | 833 MB | 119 MB (-86%) |
-| `Yubikey` | 24.2 s | 5.6 s (-77%) | 374 MB | 162 MB (-57%) |
-| `gcm` | 59.1 s | 9.1 s (-85%) | 1284 MB | 379 MB (-70%) |
-| `wireguard` | 49.0 s | 7.9 s (-84%) | 1333 MB | 133 MB (-90%) |
-| `CCITT_X509_3` | 142.9 s | 8.7 s (-94%) | 6041 MB | 741 MB (-88%) |
+| `NSPK3` | 1.2 s | 0.8 s (-33%) | 135 MB | 37 MB (-73%) |
+| `Joux` | 16.0 s | 7.6 s (-52%) | 321 MB | 56 MB (-83%) |
+| `stateverif_left_right` | 17.0 s | 3.9 s (-77%) | 917 MB | 110 MB (-88%) |
+| `Yubikey` | 23.3 s | 4.7 s (-80%) | 365 MB | 155 MB (-58%) |
+| `gcm` | 69.8 s | 7.6 s (-89%) | 1369 MB | 312 MB (-77%) |
+| `wireguard` | 48.5 s | 5.6 s (-88%) | 1254 MB | 132 MB (-89%) |
+| `CCITT_X509_3` | 137.2 s | 4.4 s (-97%) | 5877 MB | 771 MB (-87%) |
 
 <!-- BENCH:END -->
 
 Memory is the maximum resident set of the prover process; Maude runs as a
 separate subprocess on both sides and is excluded. Across all theories and core
-counts the Rust port is faster, and uses several-fold less memory — from ≈4–26×
-at one core down to ≈2–10× at sixteen, where lemma-level parallelism keeps
-several constraint systems live at once.
+counts the Rust port is 2–30× faster, and uses several-fold less memory — from
+≈4–27× at one core down to ≈2–10× at sixteen, where lemma-level parallelism
+keeps several constraint systems live at once.
 
 The port parallelises at two levels, both via rayon. Independent lemmas of a
 theory are proved concurrently; within a lemma, the proof-search fan-out and

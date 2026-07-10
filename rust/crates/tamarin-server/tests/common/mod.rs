@@ -118,17 +118,46 @@ pub async fn start_server_with_theory(fixture_name: &str) -> TestServer {
     }
 }
 
+/// Extract a response header as an owned `String`, or `""` if absent
+/// or non-UTF-8.  Used by the header-assertion tests.
+#[allow(dead_code)]
+pub fn header(res: &reqwest::Response, name: reqwest::header::HeaderName) -> String {
+    res.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Convenience wrapper for the most-checked header.
+#[allow(dead_code)]
+pub fn content_type(res: &reqwest::Response) -> String {
+    header(res, reqwest::header::CONTENT_TYPE)
+}
+
+/// Absolute Maude locations probed by the test harness, in priority order.
+const MAUDE_CANDIDATES: [&str; 3] = [
+    "/usr/local/bin/maude",
+    "/opt/homebrew/bin/maude",
+    "/usr/bin/maude",
+];
+
 fn detect_maude() -> String {
-    for c in [
-        "/usr/local/bin/maude",
-        "/opt/homebrew/bin/maude",
-        "/usr/bin/maude",
-    ] {
+    for c in MAUDE_CANDIDATES {
         if std::path::Path::new(c).exists() {
             return c.into();
         }
     }
     "maude".into()
+}
+
+/// True when a Maude binary exists at one of [`MAUDE_CANDIDATES`].  Tests
+/// that boot a real `ProofContext` use this as a skip-guard.
+#[allow(dead_code)]
+pub fn maude_available() -> bool {
+    MAUDE_CANDIDATES
+        .iter()
+        .any(|c| std::path::Path::new(c).exists())
 }
 
 /// Read a captured Haskell response from `tests/fixtures/haskell-responses/`.

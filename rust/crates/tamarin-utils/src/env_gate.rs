@@ -1,9 +1,7 @@
 //! `env_gate!(NAME)` — a cached presence test for a diagnostic env var.
 //!
 //! Expands to a per-call-site `OnceLock<bool>` that is initialised on first
-//! use from `std::env::var(NAME).is_ok()`.  Every converted call site
-//! previously read the variable on each hit via `std::env::var(NAME).is_ok()`
-//! (or `std::env::var_os(NAME).is_some()`).  These gates are all diagnostic
+//! use from `std::env::var(NAME).is_ok()`.  These gates are all diagnostic
 //! switches that are set once at process start and never change during a run,
 //! so reading them exactly once and caching the boolean is behaviour-
 //! preserving — it only removes the repeated per-hit syscall/allocation from

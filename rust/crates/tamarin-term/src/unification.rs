@@ -85,9 +85,46 @@ pub fn unifiable_lnterms_no_ac(
     unify_lnterm_no_ac(vec![Equal::new(a, b)]).is_ok()
 }
 
-fn unify_raw<C, F>(
+/// AC/C/nat delay decision, the sole point where `unify_raw` and
+/// `unify_raw_factored` diverge.  With a `delayed` sink present (the
+/// factored path) HS does `tell [Equal l r]`, so we push the residual
+/// equation and succeed; without one (the no-AC path) HS's
+/// `unifyLTermFactoredNoAC` (Unification.hs:160-164) hits
+/// `error "No AC unification, but AC symbol found."`, surfaced as `NeedsAC`.
+fn delay_or_needs_ac<C: Clone>(
+    delayed: Option<&mut Vec<Equal<LTerm<C>>>>,
+    l: &LTerm<C>,
+    r: &LTerm<C>,
+) -> Result<(), UnifyError> {
+    match delayed {
+        Some(d) => {
+            d.push(Equal { lhs: l.clone(), rhs: r.clone() });
+            Ok(())
+        }
+        None => Err(UnifyError::NeedsAC),
+    }
+}
+
+/// Shared body of `unify_raw` (no-AC) and `unify_raw_factored` (AC via a
+/// delayed writer).  Mirrors Haskell's `unifyRaw` (Unification.hs:230-280).
+/// Every non-AC arm is identical between the two callers; the only
+/// behavioural fork is at the three AC/C/nat delay points, gated on
+/// whether `delayed` is `Some` (push the residual, cf. HS `tell`) or `None`
+/// (return `NeedsAC`).
+///
+/// Var-var orientation is Haskell-faithful (Unification.hs:240-246):
+///   same-sort   → if vl < vr then elim vr l else elim vl r  (LARGER-idx
+///                 becomes KEY, smaller-idx the value)
+///   vl ⊇ vr     → elim vl r   (broader becomes KEY)
+///   otherwise   → elim vr l   (broader becomes KEY)
+/// This is the orientation `restrict stableVars` (Sources.hs:123) and
+/// `applySource` (Sources.hs:336) depend on: stable pattern vars (small
+/// idx) stay on the value side so they never become keys and are dropped by
+/// the post-saturate key-filter.
+fn unify_raw_impl<C, F>(
     sort_of_const: &F,
     acc: &mut BTreeMap<LVar, LTerm<C>>,
+    mut delayed: Option<&mut Vec<Equal<LTerm<C>>>>,
     lhs: LTerm<C>,
     rhs: LTerm<C>,
 ) -> Result<(), UnifyError>
@@ -103,16 +140,6 @@ where
     match (&l, &r) {
         (Term::Lit(Lit::Var(vl)), Term::Lit(Lit::Var(vr))) if vl == vr => Ok(()),
         (Term::Lit(Lit::Var(vl)), Term::Lit(Lit::Var(vr))) => {
-            // Haskell-faithful var-var orientation (Unification.hs:240-246):
-            //   same-sort   → if vl < vr then elim vr l else elim vl r
-            //   vl ⊇ vr     → elim vl r   (broader becomes KEY)
-            //   otherwise   → elim vr l   (broader becomes KEY)
-            //
-            // For same-sort, LARGER-idx becomes KEY; smaller-idx
-            // becomes value.  This is the orientation that makes
-            // `restrict stableVars` (Sources.hs:123) and `applySource`
-            // (Sources.hs:336) work — stable pattern vars (small idx)
-            // stay on the value side and get dropped by the key-filter.
             use std::cmp::Ordering;
             match sort_compare(vl.sort, vr.sort) {
                 Some(Ordering::Equal) => {
@@ -148,25 +175,25 @@ where
             if lf == rf && la.len() == ra.len() =>
         {
             for (a, b) in la.iter().cloned().zip(ra.iter().cloned()) {
-                unify_raw(sort_of_const, acc, a, b)?;
+                unify_raw_impl(sort_of_const, acc, delayed.as_deref_mut(), a, b)?;
             }
             Ok(())
         }
         (Term::App(FunSym::List, la), Term::App(FunSym::List, ra)) if la.len() == ra.len() => {
             for (a, b) in la.iter().cloned().zip(ra.iter().cloned()) {
-                unify_raw(sort_of_const, acc, a, b)?;
+                unify_raw_impl(sort_of_const, acc, delayed.as_deref_mut(), a, b)?;
             }
             Ok(())
         }
         // Special cases for builtin naturals (Unification.hs:251-256):
         // a nullary NoEq vs a NatPlus sum unifies only when the nullary
         // symbol is `natOne`; otherwise no unifier.  When it is natOne,
-        // Haskell `tell`s the equation for Maude (here: NeedsAC).
+        // Haskell `tell`s the equation for Maude (delay-or-NeedsAC).
         (Term::App(FunSym::NoEq(lf), la), Term::App(FunSym::Ac(crate::function_symbols::AcSym::NatPlus), _))
             if la.is_empty() =>
         {
             if *lf == crate::function_symbols::nat_one_sym() {
-                Err(UnifyError::NeedsAC)
+                delay_or_needs_ac(delayed.as_deref_mut(), &l, &r)
             } else {
                 Err(UnifyError::NoUnifier)
             }
@@ -175,45 +202,54 @@ where
             if ra.is_empty() =>
         {
             if *rf == crate::function_symbols::nat_one_sym() {
-                Err(UnifyError::NeedsAC)
+                delay_or_needs_ac(delayed.as_deref_mut(), &l, &r)
             } else {
                 Err(UnifyError::NoUnifier)
             }
         }
         // Haskell `unifyRaw` (Unification.hs:265-270): the AC/C arms fire ONLY
         // when BOTH sides are AC (resp. C) apps and the symbols (and, for C,
-        // the arity) match — at which point HS does `tell [Equal l r]`.  In
-        // the no-AC caller (`unifyLTermFactoredNoAC`, Unification.hs:160-164)
-        // that delayed equation makes `solve (Just _)` hit
-        // `error "No AC unification, but AC symbol found."`; we surface that as
-        // `NeedsAC`.  A symbol/arity mismatch fails the `guard` (→ `Nothing`,
-        // i.e. `[]`/no unifier), and any AC-vs-non-AC (or C-vs-non-C) pairing
-        // falls through to HS `_ -> mzero` (line 273); both map to `NoUnifier`.
+        // the arity) match — at which point HS does `tell [Equal l r]`.  A
+        // symbol/arity mismatch fails the `guard` (→ `Nothing`, i.e. no
+        // unifier), and any AC-vs-non-AC (or C-vs-non-C) pairing falls through
+        // to HS `_ -> mzero` (line 273); both map to `NoUnifier`.
         (Term::App(FunSym::Ac(la), _), Term::App(FunSym::Ac(ra), _)) => {
-            if la == ra { Err(UnifyError::NeedsAC) } else { Err(UnifyError::NoUnifier) }
-        }
-        (Term::App(FunSym::C(ls), largs), Term::App(FunSym::C(rs), rargs)) => {
-            if ls == rs && largs.len() == rargs.len() {
-                Err(UnifyError::NeedsAC)
+            if la == ra {
+                delay_or_needs_ac(delayed.as_deref_mut(), &l, &r)
             } else {
                 Err(UnifyError::NoUnifier)
             }
         }
+        // C arm (Unification.hs:268-270): both sides C, same symbol AND arity.
+        (Term::App(FunSym::C(ls), largs), Term::App(FunSym::C(rs), rargs)) => {
+            if ls == rs && largs.len() == rargs.len() {
+                delay_or_needs_ac(delayed, &l, &r)
+            } else {
+                Err(UnifyError::NoUnifier)
+            }
+        }
+        // Everything else (incl. AC-vs-non-AC, C-vs-non-C) → HS `_ -> mzero`.
         _ => Err(UnifyError::NoUnifier),
     }
+}
+
+fn unify_raw<C, F>(
+    sort_of_const: &F,
+    acc: &mut BTreeMap<LVar, LTerm<C>>,
+    lhs: LTerm<C>,
+    rhs: LTerm<C>,
+) -> Result<(), UnifyError>
+where
+    C: Ord + Clone,
+    F: Fn(&C) -> LSort,
+{
+    unify_raw_impl(sort_of_const, acc, None, lhs, rhs)
 }
 
 /// Haskell-faithful factored unification: same as `unify_raw` but
 /// **pushes AC/C equations to a delayed list** instead of returning
 /// `NeedsAC`.  Mirrors Haskell's `unifyRaw` (Unification.hs:230-280)
 /// which uses `tell [Equal l r]` from a writer monad to delay AC.
-///
-/// Also uses Haskell's same-sort var-var orientation: when `vl < vr`
-/// (under idx-first Ord), `elim vr l` — i.e., **larger-idx becomes
-/// the KEY**, smaller-idx the value.  This is the orientation Haskell's
-/// `restrict stableVars` (Sources.hs:123) and `applySource` (Sources.hs:336)
-/// depend on: stable pattern vars (small idx) stay on the value side so
-/// they're never keys and never survive the post-saturate key-filter.
 fn unify_raw_factored<C, F>(
     sort_of_const: &F,
     acc: &mut BTreeMap<LVar, LTerm<C>>,
@@ -225,112 +261,7 @@ where
     C: Ord + Clone,
     F: Fn(&C) -> LSort,
 {
-    // Apply the accumulator by borrowing it directly — avoids cloning
-    // the whole map into a `Subst` on every recursion (hot path).
-    let l = apply_vterm_map(&*acc, lhs);
-    let r = apply_vterm_map(&*acc, rhs);
-
-    match (&l, &r) {
-        (Term::Lit(Lit::Var(vl)), Term::Lit(Lit::Var(vr))) if vl == vr => Ok(()),
-        (Term::Lit(Lit::Var(vl)), Term::Lit(Lit::Var(vr))) => {
-            use std::cmp::Ordering;
-            match sort_compare(vl.sort, vr.sort) {
-                Some(Ordering::Equal) => {
-                    // Haskell: `if vl < vr then elim vr l else elim vl r`
-                    // (Unification.hs:241).  Under idx-first Ord LVar
-                    // (LTerm.hs:521-523), `vl < vr` iff `vl.idx < vr.idx`
-                    // (modulo same sort/name).  `elim vr l` makes `vr`
-                    // the KEY mapped to `l` (which is the LVar form of
-                    // `vl`).  So **larger-idx becomes KEY**, smaller-idx
-                    // becomes value.
-                    let (key, val) = if vl < vr {
-                        (vr.clone(), Term::Lit(Lit::Var(vl.clone())))
-                    } else {
-                        (vl.clone(), Term::Lit(Lit::Var(vr.clone())))
-                    };
-                    eliminate(sort_of_const, acc, key, val)
-                }
-                Some(Ordering::Greater) => {
-                    // vl > vr in sort (vl is broader) → bind vl to vr.
-                    eliminate(sort_of_const, acc,
-                        vl.clone(), Term::Lit(Lit::Var(vr.clone())))
-                }
-                Some(Ordering::Less) => {
-                    // vl < vr in sort (vr is broader) → bind vr to vl.
-                    eliminate(sort_of_const, acc,
-                        vr.clone(), Term::Lit(Lit::Var(vl.clone())))
-                }
-                None => Err(UnifyError::NoUnifier),
-            }
-        }
-        (Term::Lit(Lit::Var(vl)), _) => eliminate(sort_of_const, acc, vl.clone(), r.clone()),
-        (_, Term::Lit(Lit::Var(vr))) => eliminate(sort_of_const, acc, vr.clone(), l.clone()),
-        (Term::Lit(Lit::Con(cl)), Term::Lit(Lit::Con(cr))) => {
-            if cl == cr { Ok(()) } else { Err(UnifyError::NoUnifier) }
-        }
-        (Term::App(FunSym::NoEq(lf), la), Term::App(FunSym::NoEq(rf), ra))
-            if lf == rf && la.len() == ra.len() =>
-        {
-            for (a, b) in la.iter().cloned().zip(ra.iter().cloned()) {
-                unify_raw_factored(sort_of_const, acc, delayed, a, b)?;
-            }
-            Ok(())
-        }
-        (Term::App(FunSym::List, la), Term::App(FunSym::List, ra)) if la.len() == ra.len() => {
-            for (a, b) in la.iter().cloned().zip(ra.iter().cloned()) {
-                unify_raw_factored(sort_of_const, acc, delayed, a, b)?;
-            }
-            Ok(())
-        }
-        // Special cases for builtin naturals (Unification.hs:251-256):
-        // a nullary NoEq vs a NatPlus sum unifies only when the nullary
-        // symbol is `natOne`; otherwise no unifier.  When it is natOne,
-        // Haskell `tell`s the equation, i.e. delays it for Maude.
-        (Term::App(FunSym::NoEq(lf), la), Term::App(FunSym::Ac(crate::function_symbols::AcSym::NatPlus), _))
-            if la.is_empty() =>
-        {
-            if *lf == crate::function_symbols::nat_one_sym() {
-                delayed.push(Equal { lhs: l.clone(), rhs: r.clone() });
-                Ok(())
-            } else {
-                Err(UnifyError::NoUnifier)
-            }
-        }
-        (Term::App(FunSym::Ac(crate::function_symbols::AcSym::NatPlus), _), Term::App(FunSym::NoEq(rf), ra))
-            if ra.is_empty() =>
-        {
-            if *rf == crate::function_symbols::nat_one_sym() {
-                delayed.push(Equal { lhs: l.clone(), rhs: r.clone() });
-                Ok(())
-            } else {
-                Err(UnifyError::NoUnifier)
-            }
-        }
-        // Haskell `unifyRaw` (Unification.hs:265-270): the AC arm fires ONLY
-        // when BOTH sides are AC apps, and `guard (lacsym == racsym)` delays
-        // for Maude only on matching symbols; a symbol mismatch (or any
-        // AC-vs-non-AC pairing falling through to `_ -> mzero`, line 273)
-        // means no unifier.
-        (Term::App(FunSym::Ac(la), _), Term::App(FunSym::Ac(ra), _)) => {
-            if la == ra {
-                delayed.push(Equal { lhs: l.clone(), rhs: r.clone() });
-                Ok(())
-            } else {
-                Err(UnifyError::NoUnifier)
-            }
-        }
-        // C arm (Unification.hs:268-270): both sides C, same symbol AND arity.
-        (Term::App(FunSym::C(ls), largs), Term::App(FunSym::C(rs), rargs)) => {
-            if ls == rs && largs.len() == rargs.len() {
-                delayed.push(Equal { lhs: l.clone(), rhs: r.clone() });
-                Ok(())
-            } else {
-                Err(UnifyError::NoUnifier)
-            }
-        }
-        // Everything else (incl. AC-vs-non-AC, C-vs-non-C) → HS `_ -> mzero`.
-        _ => Err(UnifyError::NoUnifier),
-    }
+    unify_raw_impl(sort_of_const, acc, Some(delayed), lhs, rhs)
 }
 
 /// `unifyLTermFactored` port (Unification.hs:107-120).  Returns the
@@ -555,10 +486,10 @@ where
         // subject `t` AND the pattern `p` are AC-/C-headed.  An AC-/C-headed
         // PATTERN facing a variable / constant / NoEq / List / differently-
         // headed subject is NOT an AC problem — HS falls to the final
-        // `_ -> throwError NoMatcher` arm (Unification.hs:337).  (The
-        // earlier code raised NeedsAC purely on the pattern's head, which —
-        // once `solve_match_lterm` started routing NeedsAC to Maude — would
-        // have shipped non-AC structural mismatches to Maude.)
+        // `_ -> throwError NoMatcher` arm (Unification.hs:337).  (An
+        // AC-/C-headed PATTERN alone is not enough — the subject must be
+        // AC-/C-headed too, otherwise this would ship non-AC structural
+        // mismatches to Maude.)
         // NB: HS does NOT require the AC (resp. C) symbols to match here —
         // `Mult`-vs-`Union` is still `ACProblem` (Maude then resolves it,
         // typically to no match).  So the guard is purely "both AC" / "both

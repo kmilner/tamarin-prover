@@ -73,8 +73,7 @@ pub struct ServerConfig {
     pub max_steps: usize,
     /// `--derivcheck-timeout` for the dynamic message-derivation checks
     /// run at theory load (HS interactive default 5s; 0 disables).  Set
-    /// from the CLI flag by `interactive` setup — previously the web load
-    /// path hardcoded 5 and ignored the parsed flag (task #20).
+    /// from the CLI flag by `interactive` setup.
     pub derivcheck_timeout: u32,
 }
 

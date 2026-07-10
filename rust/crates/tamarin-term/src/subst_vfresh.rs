@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::lterm::{LVar, Name};
 use crate::vterm::{Lit, VTerm};
-use crate::term::Term;
+use crate::term::{Term, TermSize};
 
 // `PartialOrd` / `Ord` derived to mirror Haskell's `deriving (Ord, ..)` on
 // `SubstVFresh c v` (SubstVFresh.hs:79-80).  Haskell's `S.toList` in `performSplit`
@@ -241,10 +241,7 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         let shift: i128 = fresh_start as i128 - vs_min as i128;
         let new_entries: Vec<(LVar, VTerm<C, LVar>)> = vs_new.iter()
             .map(|v| {
-                let new_idx_signed: i128 = v.idx as i128 + shift;
-                let new_idx: u64 = if new_idx_signed < 0 { 0 }
-                    else if new_idx_signed > u64::MAX as i128 { u64::MAX }
-                    else { new_idx_signed as u64 };
+                let new_idx = shifted_idx(v.idx, shift);
                 let v_new = LVar {
                     name: v.name,
                     sort: v.sort,
@@ -300,10 +297,7 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         let shift: i128 = fresh_start as i128 - min_idx as i128;
         let mut rename: BTreeMap<LVar, LVar> = BTreeMap::new();
         for old in &range_vars {
-            let new_idx_signed: i128 = old.idx as i128 + shift;
-            let new_idx: u64 = if new_idx_signed < 0 { 0 }
-                else if new_idx_signed > u64::MAX as i128 { u64::MAX }
-                else { new_idx_signed as u64 };
+            let new_idx = shifted_idx(old.idx, shift);
             let new = LVar {
                 name: old.name,
                 sort: old.sort,
@@ -400,9 +394,10 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         // equivalence into the free subst.
 
         // Step 0: sort entries by size of image (smaller first).
-        // HS's `sortOn (size . snd)` — stable sort by size.
+        // HS's `sortOn (size . snd)` — stable sort by size, via the
+        // `TermSize` trait (term.rs) which encodes HS's `Term.size`.
         let mut slist: Vec<(LVar, VTerm<C, LVar>)> = self.to_list();
-        slist.sort_by_key(|(_, t)| term_size(t));
+        slist.sort_by_key(|(_, t)| t.size());
 
         // Step 1: cache binding map (range var → new var), built
         // incrementally as we walk substs in sorted order.
@@ -423,13 +418,15 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
     }
 }
 
-/// Compute the "size" of a VTerm — number of leaves + interior App
-/// nodes.  HS's `Term.size` for sorting `freshToFree`'s input list.
-fn term_size<C, V>(t: &VTerm<C, V>) -> usize {
-    match t {
-        Term::Lit(_) => 1,
-        Term::App(_, args) => 1 + args.iter().map(term_size).sum::<usize>(),
-    }
+/// Apply HS's `rename` shift to a single var index: `old + shift` in
+/// signed (HS Integer) math, saturating-clamped back into `u64`.  Shared
+/// by `extend_with_renaming` and `fresh_to_free_uniform_shift` so the
+/// load-bearing clamp can't drift between the two call sites.
+fn shifted_idx(idx: u64, shift: i128) -> u64 {
+    let new_idx_signed: i128 = idx as i128 + shift;
+    if new_idx_signed < 0 { 0 }
+    else if new_idx_signed > u64::MAX as i128 { u64::MAX }
+    else { new_idx_signed as u64 }
 }
 
 /// Walk a VTerm, renaming each var via the rename map.  If a var
@@ -546,15 +543,14 @@ where
     // `frees s1_0` (s1_0 :: LNSubstVFresh) uses `foldFrees (SubstVFresh n
     // LVar) = foldFrees f . M.keys` (SubstVFresh.hs:197) — i.e. ONLY the
     // DOMAIN KEYS, NOT the range (witnesses).  Including s1_0's range here
-    // (as the old code did) over-counted the avoid set, so the re-based
-    // witnesses came out inflated (Responder_secrecy: the Setup_Key `~k`
-    // variant witnesses at ~k.30/42 vs HS's ~k.11/12/15, rotating the
-    // 3-way split via `Ord LNSubstVFresh`).
+    // would over-count the avoid set and inflate the re-based witnesses
+    // (Responder_secrecy: the Setup_Key `~k` variant witnesses at ~k.30/42
+    // vs HS's ~k.11/12/15, rotating the 3-way split via `Ord LNSubstVFresh`).
     // `freshToFreeAvoidingFast` only consults the avoid set for its max idx
     // (`succ . maxIdx`), so fold that max directly over the same three sources
     // instead of materialising a BTreeSet + Vec.  Dedup/order are irrelevant
-    // to a max, so the resulting `fresh_start` is byte-identical to the old
-    // `avoid.iter().map(|v| v.idx).max().map(|m| m + 1).unwrap_or(0)`.
+    // to a max, so the resulting `fresh_start` matches the same-value
+    // computation via a max fold, without materialising a set/list.
     let mut max_idx: Option<u64> = None;
     let mut bump = |idx: u64| { max_idx = Some(max_idx.map_or(idx, |m| m.max(idx))); };
     // s2's domain

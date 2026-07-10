@@ -89,12 +89,8 @@ pub fn fun_sym_decode(s: &[u8]) -> (Vec<u8>, Privacy, Constructability) {
     (ident, priv_, constr)
 }
 
-/// Replace `_` with `-` (Maude doesn't allow `_` in identifiers).
-pub fn replace_underscore(s: &[u8]) -> Vec<u8> {
-    s.iter().map(|c| if *c == b'_' { b'-' } else { *c }).collect()
-}
-
-/// Replace `-` with `_` (inverse of `replace_underscore`).
+/// Replace `-` with `_` (inverse of the identifier `_` -> `-` mapping
+/// applied when emitting Maude names).
 pub fn replace_minus(s: &[u8]) -> Vec<u8> {
     s.iter().map(|c| if *c == b'-' { b'_' } else { *c }).collect()
 }
@@ -118,26 +114,12 @@ fn pp_maude_ac_sym_into(o: AcSym, buf: &mut Vec<u8>) {
     buf.extend_from_slice(s);
 }
 
-/// Free symbol's Maude name.
-pub fn pp_maude_no_eq_sym(sym: &NoEqSym) -> Vec<u8> {
-    let mut v = Vec::new();
-    pp_maude_no_eq_sym_into(sym, &mut v);
-    v
-}
-
 /// Append a free symbol's Maude name directly into `buf`.
 fn pp_maude_no_eq_sym_into(sym: &NoEqSym, buf: &mut Vec<u8>) {
     buf.extend_from_slice(FUN_SYM_PREFIX.as_bytes());
     buf.extend_from_slice(fun_sym_encode_attr(sym.privacy, sym.constructability).as_bytes());
     // `replaceUnderscore`: map `_` -> `-`, pushed straight into `buf`.
     buf.extend(sym.name.iter().map(|c| if *c == b'_' { b'-' } else { *c }));
-}
-
-/// C-symbol's Maude name (only `EMap`).
-pub fn pp_maude_c_sym(c: CSym) -> Vec<u8> {
-    let mut v = Vec::new();
-    pp_maude_c_sym_into(c, &mut v);
-    v
 }
 
 /// Append a C-symbol's Maude name directly into `buf`.

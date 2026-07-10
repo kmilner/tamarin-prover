@@ -1173,10 +1173,11 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
         // When `driving_guards` is empty, Haskell still emits one
         // implied formula under the empty substitution — i.e.
         // `unskolemizeLNGuarded $ applySkGuarded emptySubst succedent'`
-        // = `gall [] otherAtoms succedent`.  Previously we skipped this
-        // case; fall through to `try_match_all_guards` which (with
-        // empty guards) terminates immediately at `guard_idx == 0`
-        // and emits the implied body with `acc = emptySubst`.
+        // = `gall [] otherAtoms succedent`.  `try_match_all_guards`
+        // still emits one implied formula under the empty
+        // substitution: with empty `driving_guards` it terminates
+        // immediately at `guard_idx == 0` and emits the implied body
+        // with `acc = emptySubst`.
         try_match_all_guards(
             &maude, vars, &driving_guards, &sys_actions, body,
             &red.sys.formulas, &existing_formulas_canon,
@@ -1250,7 +1251,7 @@ fn implied_apply_canon(f: &crate::guarded::Guarded) -> crate::guarded::Guarded {
     // normalises derived instances before the membership pre-check) — a
     // raw duplicate-carrying candidate must match its normalised stored
     // twin, or the pass re-fires it every simplifier iteration.
-    crate::guarded::normalise_stored_formula(&f2)
+    crate::guarded::normalise_stored_formula_owned(f2)
 }
 
 /// Try every assignment of system actions to the universal's action
@@ -1266,10 +1267,9 @@ fn try_match_all_guards(
     // Canon keys of `existing_formulas` / `existing_solved`, precomputed ONCE by
     // the caller (`insert_implied_formulas_pass`) and shared across every
     // universal — they depend only on `red.sys.formulas`/`solved_formulas`,
-    // which the per-universal loop never mutates.  Previously recomputed inside
-    // this fn, i.e. once per universal: O(universals · |formulas|) deep
-    // canonicalisations (the profiled `GTerm/Guarded::clone` cost on
-    // stateverif/gcm).  Now O(|formulas|) per pass.
+    // which the per-universal loop never mutates.  Shared across every
+    // universal so canonicalisation runs O(|formulas|) times per pass, not
+    // O(universals · |formulas|).
     existing_formulas_canon: &[crate::guarded::Guarded],
     existing_solved: &[crate::guarded::Guarded],
     existing_solved_canon: &[crate::guarded::Guarded],
@@ -1313,12 +1313,11 @@ fn try_match_all_guards(
             // handled in a SEPARATE simplifier pass — `evalFormulaAtoms`
             // — which mirrors Haskell's pass ordering exactly.
             //
-            // Previous version filtered out `Some(true)` guards and
-            // aborted on `Some(false)`.  That is structurally different
-            // from Haskell: e.g. an emitted `gall [] [false_atom] body`
-            // here lets `evalFormulaAtoms` short-circuit to `gtrue` in
-            // its own pass, exposing trivially-true implications to
-            // the dedup logic in a Haskell-consistent way.
+            // Emitting `gall [] [false_atom] body` unconditionally lets
+            // `evalFormulaAtoms` short-circuit it to `gtrue` in its own
+            // pass, exposing trivially-true implications to the dedup
+            // logic — matching Haskell's separation of atom valuation
+            // into its own pass.
             let surviving_atoms: Vec<tamarin_parser::ast::Atom> = other_guards.iter()
                 .map(|g| subst_atom(g, acc))
                 .collect();
@@ -1380,14 +1379,12 @@ fn try_match_all_guards(
             // fresh witnesses per call, breaking structural Eq.  HS's
             // matchAction is pure matching (no witnesses).
             //
-            // Previously this also applied `eq_store.subst` to both sides
-            // before comparing.  That step OVER-COLLAPSED legit-distinct
-            // firings: at NSLPK3 line-105's parent path, eq_store contains
-            // bindings (e.g. ni→s) that unify two structurally-distinct
-            // firings to the same canonical form, hiding both from each
-            // other's dedup check.  HS does NOT do this — its bare
-            // structural Eq keeps them apart, and 4 distinct Disjs survive.
-            // Reverted to witness+bound normalisation only.
+            // Do NOT apply `eq_store.subst` before comparing: that would
+            // over-collapse structurally-distinct firings (eq-store
+            // bindings can unify two distinct firings to the same
+            // canonical form), whereas HS's bare structural `Eq` keeps
+            // them apart — dedup here uses witness+bound normalisation
+            // only.
             let apply_canon = |f: &crate::guarded::Guarded| {
                 // Lock-step with `implied_apply_canon`: `normalize_bound_lvars`
                 // is an identity clone, so skip it (saves a `Guarded` deep clone
@@ -1415,7 +1412,7 @@ fn try_match_all_guards(
                 let f2 = crate::guarded::canonicalize_ac_in_guarded_cow(&f1).unwrap_or(f1);
                 // Lock-step with `implied_apply_canon`: compare in stored
                 // normal form (HS 150f5eba pre-check normalisation).
-                crate::guarded::normalise_stored_formula(&f2)
+                crate::guarded::normalise_stored_formula_owned(f2)
             };
             let canon = apply_canon(&implied);
             // TAM_RS_TRACE_FORM=1 also emits an `Impl-candidate` event
@@ -1510,17 +1507,12 @@ fn try_match_all_guards(
                     // structurally-fixed terms, returning the EMPTY subst
                     // on syntactic equality and failing otherwise.
                     //
-                    // Previous implementation called `sys_maude.unify_at`
-                    // here, which under the HS-faithful flattenUnif fix
-                    // (maude_proc.rs::unify's AC-free fast
-                    // path) returns narrowing-witness pairs
-                    // `K → ~Vw, V → ~Vw`.  Those witness pairs were
-                    // encoded as extra Eq atoms appended to other_guards,
-                    // which then became guards in the next
-                    // `insert_implied_formulas_pass` round — accumulating
-                    // 2 witness atoms per round, causing unbounded
-                    // recursion + heap growth on Minimal_HashChain
-                    // lemmas.
+                    // Compare at the LNTerm level (not raw parser AST) so
+                    // structurally-equal terms with different parser
+                    // shapes still match — avoids feeding
+                    // narrowing-witness Eq atoms back into `other_guards`,
+                    // which would otherwise accumulate unboundedly across
+                    // `insert_implied_formulas_pass` rounds.
                     (false, false) => {
                         // HS-faithful: compare at the LNTerm level, not on
                         // raw parser AST.  Two parser-AST shapes can denote
@@ -1733,13 +1725,12 @@ fn atom_has_unbound_pattern_var(
 /// var to the whole subject without inspecting its AC shape.  Likewise a
 /// function-app PATTERN facing a plain-variable SUBJECT is a `NoMatcher`
 /// (HS falls to the `_ -> throwError NoMatcher` arm), NOT an AC problem —
-/// because the AC arm requires BOTH sides AC-headed.  The previous
-/// bool-returning matcher collapsed `NoMatcher`/`NeedsAc` into `false`,
-/// and the caller then used an `any_ac_op` heuristic (does ANY AC symbol
-/// appear anywhere) to decide on a Maude round-trip — over-triggering
-/// massively (LAK06: 28 879 Maude `match`es where HS issues 0; Scott:
-/// 10 748 vs 598) whenever a structurally-failing match merely *mentioned*
-/// an AC operator.
+/// because the AC arm requires BOTH sides AC-headed.  A coarse "any AC
+/// symbol appears anywhere" proxy over-triggers Maude on
+/// structurally-failing matches that merely mention an AC operator
+/// (LAK06: 28,879 Maude matches where HS issues 0; Scott: 10,748 vs 598)
+/// — which is why only `NeedsAc` (both sides AC-/C-headed) reaches Maude
+/// while `NoMatcher` fails natively.
 #[derive(Debug, PartialEq, Eq)]
 enum StructMatch {
     Matched,
@@ -1912,15 +1903,13 @@ fn match_atom_via_maude(
     //       has already replaced `b` with the concrete system node it
     //       was bound to.  In HS that node is a `SkConst`/ground term on
     //       the PATTERN side, so it matches the subject's time ONLY when
-    //       it is the SAME node.  Mirror that: require `g_t == i`.
-    //       Previously we rejected ANY non-universal-var time outright —
-    //       so every action guard after the first NEVER matched, leaving
-    //       the negated-conclusion universal unfired and its `gfalse`
-    //       (`from formulas`) contradiction never produced.  RS then
-    //       drove the c_PeqPVote branch to a spurious SOLVED leaf where
-    //       HS reports `by contradiction /* from formulas */`
-    //       (alethea Universal_VerProofV/Y_v1..v8: RS falsified, HS
-    //       verified).
+    //       it is the SAME node.  Require `g_t == i`: once the first
+    //       guard binds the shared time var to a concrete node, later
+    //       guards sharing it must match that same node (HS: constant-
+    //       vs-constant after skolemization).  Not requiring it leaves
+    //       multi-guard negated-conclusion universals unfired —
+    //       regression witness: alethea Universal_VerProofV/Y_v1..v8
+    //       falsify under RS where HS verifies.
     let ATerm::Var(g_t) = g_time else { return Vec::new() };
     if vars.iter().any(|v| v.name == g_t.name && v.idx == g_t.idx) {
         let i_term = tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
@@ -2027,8 +2016,6 @@ fn match_atom_via_maude(
         // `splitEqs(1)` `case split`), verifying in fewer steps than HS.
         // With shared skolemization those positions are constant-vs-
         // constant and the match correctly fails there — matching HS.
-        // (eadeb1c4 got the match COMMAND direction right but left this
-        // pattern-skolemization gap; the OLD swapped command masked it.)
         //
         // HS-faithful: Maude's AC `match` can return MULTIPLE matchers
         // for a single pattern/subject pair (e.g. `match Union(a,x) <=?
@@ -2037,19 +2024,12 @@ fn match_atom_via_maude(
         // the list monad:
         //   subst' <- (`runReader` hnd) $ matchAction sysAct ...
         //   candidateSubsts (compose subst' subst) as
-        // — each match becomes its OWN candidate substitution that
-        // propagates into the next guard's matching call.  Previously
-        // Rust took `matches.remove(0)` (the first match only), which
-        // would silently under-fire whenever Maude returned >1 matcher.
-        // NOTE: the previous `any_ac_op(&eqs)` "does any AC symbol appear
-        // anywhere" fast-path is GONE — it was a coarse proxy that over-
-        // triggered Maude whenever a structurally-failing match merely
-        // mentioned an AC operator (e.g. a `Xor`-headed PATTERN facing a
-        // plain-variable SUBJECT, or an AC subterm under a SkConst
-        // pattern).  `structural_match` now returns the precise
-        // `NeedsAc`/`NoMatcher` distinction, so we only reach here when an
-        // AC-/C-vs-AC-/C pair was genuinely encountered — exactly HS's
-        // `Left ACProblem` branch.
+        // Iterate all Maude matchers — a pattern/subject pair can have
+        // multiple AC unifiers, and each becomes its own candidate
+        // substitution propagated into the next guard's matching call;
+        // `structural_match` returns the precise `NeedsAc`/`NoMatcher`
+        // distinction so Maude is only invoked for genuine AC-/C-vs-AC-/C
+        // pairs.
         let maude_res = maude.match_eqs_skolemize_both(&eqs, &pattern_vars);
         let Ok(matches) = maude_res else { return Vec::new() };
         if matches.is_empty() { return Vec::new(); }
@@ -2062,8 +2042,8 @@ fn match_atom_via_maude(
     // vars on the pattern side are SkConst-equivalent (per Haskell's
     // `skolemizeGuarded` upstream of `matchAction`) and cannot be
     // bound during matching.  Threading free-var bindings into `acc`
-    // (the old behaviour) causes spurious propagation when later
-    // guards re-encounter those names.
+    // would cause spurious propagation when later guards re-encounter
+    // those names.
     let mut out: Vec<VarSubst> = Vec::with_capacity(ms.len());
     for m in ms {
         let mut subst = base_subst.clone();
@@ -2142,15 +2122,11 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     // Haskell-faithful (`Simplify.hs:220-230`): group by the raw
     // `RuleACInst` — two Fresh-rule instances merge only if their
     // full rule representations are syntactically identical.
-    // Previous implementation bucketed by `apply_vterm(eq_store, m)`
-    // which was strictly more aggressive than Haskell's
-    // `groupSortOn fst` on `ru :: RuleACInst`.  The post-subst key
-    // grouped Fresh-rules whose conclusions had been eq-store-equated
-    // even if their raw representations differed; Haskell waits for
-    // `substSystem` to propagate the eq-store INTO the rules first,
-    // so syntactic equality only catches genuinely-identical
-    // instances.  RuleACInst doesn't derive Ord/Hash, so we group
-    // with a linear scan (Fresh-rule count is small in practice).
+    // This matches Haskell's `groupSortOn fst` on `ru :: RuleACInst`:
+    // Haskell waits for `substSystem` to propagate the eq-store into
+    // the rules first, so syntactic equality only catches genuinely-
+    // identical instances.  RuleACInst doesn't derive Ord/Hash, so we
+    // group with a linear scan (Fresh-rule count is small in practice).
     let mut buckets: Vec<(crate::rule::RuleACInst,
         Vec<crate::constraint::constraints::NodeId>)> = Vec::new();
     for (id, rule) in red.sys.nodes.iter() {
@@ -2265,9 +2241,8 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     // that `groupSortOn fst` keeps a goal's NodeId as `iKeep` and
     // emits `solveTermEqs [iKeep = rule_node_id]` — meaning the
     // rule node is renamed onto the goal's id, NOT vice versa.
-    // The previous order (nodes first) made the goal id collapse
-    // onto a fresh `vk.X`, which then dedup-merged with a grafted
-    // goal whose solved=true status carried over.  See
+    // Nodes-first would instead collapse the goal id onto a fresh
+    // `vk.X` that dedup-merges with a grafted solved goal.  See
     // Simplify.hs (`kuActions se = (\(i,fa,m) -> (m,(fa,i)))
     // <$> allKUActions se`).
     let mut acts: Vec<(NodeId, LNFact, LNTerm)> = Vec::new();
@@ -2394,69 +2369,14 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
 /// case-fork per unique action across the entire proof.
 fn solve_unique_actions_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::constraint::constraints::Goal;
-    use crate::fact::{FactTag, LNFact};
 
-    // Bail before building the (static) count map when there are no
-    // unsolved Action goals to test — the full `ctx.rules`/`ctx.intruder_rules`
-    // scan (with a `FactTag` clone per action) otherwise runs every simplify
-    // pass even on systems with zero action goals.  This early return is
-    // output-equivalent: with no candidates the pass already returns
-    // `Unchanged` below.
-    if !red.sys.goals.iter().any(|(g, st)|
-        matches!(g, Goal::Action(_, _)) && !st.solved)
-    {
-        return ChangeIndicator::Unchanged;
-    }
-
-    // Count `(tag, arity)` occurrences across all non-silent rules
-    // — both protocol rules and intruder rules.  Cached per call;
-    // Haskell notes this is a static computation per theory but
-    // doesn't cache it either.
-    let mut counts: std::collections::BTreeMap<(FactTag, usize), usize>
-        = std::collections::BTreeMap::new();
-    for r in &red.ctx.rules {
-        for fa in &r.rule.actions {
-            *counts.entry((fa.tag.clone(), fa.terms.len())).or_insert(0) += 1;
-        }
-    }
-    for r in &red.ctx.intruder_rules {
-        for fa in &r.actions {
-            *counts.entry((fa.tag.clone(), fa.terms.len())).or_insert(0) += 1;
-        }
-    }
-    let is_unique = |fa: &LNFact| -> bool {
-        // Skip FUnion-headed terms — multiset unions can produce
-        // multiple unifiers (Haskell's `null [ () | t <- ts, FUnion _ <- viewTerm2 t]`).
-        for t in &fa.terms {
-            if has_funion_head(t) { return false; }
-        }
-        counts.get(&(fa.tag.clone(), fa.terms.len())).copied() == Some(1)
-    };
-
-    // Snapshot the unsolved Action goals up-front; calling
-    // solve_action_goal mutates the goal list.
-    //
-    // Haskell-faithful: `unsolvedActionAtoms` returns `M.toList sGoals`
-    // which iterates the Map in `Goal`-Ord order — ActionG sorted by
-    // (NodeId, LNFact).  Our `sys.goals` is a Vec preserving insertion
-    // order; sort the candidates by (NodeId, LNFact) to match Haskell.
-    //
-    // Critical for goal-ranking: solveUniqueActions creates Premise
-    // goals as a side-effect of solving each Action.  The order in
-    // which those Premises are created determines their goalNr, which
-    // determines execProofMethod's pick.  Stop_unique (Minimal_Loop)
-    // hits a spurious Cyclic if Action(j) is solved before Action(i)
-    // because the InjectiveFacts + reuse-lemma constraints cycle on
-    // a one-Loop state.
-    let mut candidates: Vec<(crate::constraint::constraints::NodeId, LNFact)> =
-        red.sys.goals.iter()
-            .filter_map(|(g, st)| match g {
-                Goal::Action(i, fa) if !st.solved && is_unique(fa) =>
-                    Some((i.clone(), fa.clone())),
-                _ => None,
-            })
-            .collect();
-    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    // Snapshot the unsolved unique Action goals up-front (sorted in
+    // Haskell `Goal`-Ord); calling solve_action_goal mutates the goal
+    // list.  Stop_unique (Minimal_Loop) hits a spurious Cyclic if
+    // Action(j) is solved before Action(i) because the InjectiveFacts +
+    // reuse-lemma constraints cycle on a one-Loop state — see
+    // `collect_unique_action_candidates` for the full ordering rationale.
+    let candidates = collect_unique_action_candidates(red);
     if candidates.is_empty() { return ChangeIndicator::Unchanged; }
     let mut changed = ChangeIndicator::Unchanged;
     for (i, fa) in candidates {
@@ -2465,25 +2385,19 @@ fn solve_unique_actions_pass(red: &mut Reduction) -> ChangeIndicator {
         // `isUnique` action atom — there is no goal-status re-check.
         // `solveAction` branches on NODE existence, not goal status, so a
         // previous iteration's eq-store substitution that renamed the live
-        // goal must NOT cause this captured atom to be skipped (the
-        // `still_present` exact-(i,fa) guard removed here did exactly that,
-        // suppressing node creation and flipping the witness-trace pick —
-        // see the matching rationale in `solve_unique_actions_pass_fan_out`
-        // below).  An already-solved atom whose node exists with `fa` among
-        // its actions is a harmless no-op in `solve_action_goal`.
+        // goal must NOT cause this captured atom to be skipped (skipping
+        // this captured atom would suppress node creation and flip the
+        // witness-trace pick — see the matching rationale in
+        // `solve_unique_actions_pass_fan_out` below).  An already-solved
+        // atom whose node exists with `fa` among its actions is a harmless
+        // no-op in `solve_action_goal`.
         // Haskell's `solveUniqueActions` uses monadic `>>` which
         // propagates Contradictory upstream.  In our pass form, we
         // surface the Contradictory by injecting gfalse so the next
         // contradictions check picks it up (`FormulasFalse`).
         let outcome = red.solve_action_goal(&i, &fa);
         if tamarin_utils::env_gate!("TAM_RS_DBG_SUA") {
-            use crate::constraint::solver::reduction::GoalCases;
-            let oc = match &outcome {
-                GoalCases::Contradictory => "Contradictory".to_string(),
-                GoalCases::Linear => "Linear".to_string(),
-                GoalCases::LinearNamed(n) => format!("LinearNamed({})", n),
-                GoalCases::Cases(cs) => format!("Cases({})", cs.len()),
-            };
+            let oc = goal_cases_dbg(&outcome);
             let now_solved = red.sys.goals.iter().any(|(g, st)|
                 matches!(g, Goal::Action(gi, gfa) if gi == &i && gfa == &fa)
                 && st.solved);
@@ -2523,47 +2437,9 @@ fn solve_unique_actions_pass(red: &mut Reduction) -> ChangeIndicator {
 fn solve_unique_actions_pass_fan_out(
     red: &mut Reduction,
 ) -> std::result::Result<ChangeIndicator, Vec<(crate::constraint::system::System, u64)>> {
-    use crate::constraint::constraints::Goal;
-    use crate::fact::{FactTag, LNFact};
+    use crate::fact::LNFact;
 
-    // Bail before building the (static) count map when there are no unsolved
-    // Action goals — output-equivalent to the `candidates.is_empty()` return
-    // below, but skips the full rule scan (and per-action `FactTag` clones)
-    // that otherwise runs every simplify pass even with zero action goals.
-    if !red.sys.goals.iter().any(|(g, st)|
-        matches!(g, Goal::Action(_, _)) && !st.solved)
-    {
-        return Ok(ChangeIndicator::Unchanged);
-    }
-
-    let mut counts: std::collections::BTreeMap<(FactTag, usize), usize>
-        = std::collections::BTreeMap::new();
-    for r in &red.ctx.rules {
-        for fa in &r.rule.actions {
-            *counts.entry((fa.tag.clone(), fa.terms.len())).or_insert(0) += 1;
-        }
-    }
-    for r in &red.ctx.intruder_rules {
-        for fa in &r.actions {
-            *counts.entry((fa.tag.clone(), fa.terms.len())).or_insert(0) += 1;
-        }
-    }
-    let is_unique = move |fa: &LNFact| -> bool {
-        for t in &fa.terms {
-            if has_funion_head(t) { return false; }
-        }
-        counts.get(&(fa.tag.clone(), fa.terms.len())).copied() == Some(1)
-    };
-
-    let mut candidates: Vec<(crate::constraint::constraints::NodeId, LNFact)> =
-        red.sys.goals.iter()
-            .filter_map(|(g, st)| match g {
-                Goal::Action(i, fa) if !st.solved && is_unique(fa) =>
-                    Some((i.clone(), fa.clone())),
-                _ => None,
-            })
-            .collect();
-    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let candidates = collect_unique_action_candidates(red);
     if candidates.is_empty() { return Ok(ChangeIndicator::Unchanged); }
     let mut changed = ChangeIndicator::Unchanged;
     let mut iter = candidates.into_iter();
@@ -2596,12 +2472,7 @@ fn solve_unique_actions_pass_fan_out(
         let outcome = red.solve_action_goal(&i, &fa);
         use crate::constraint::solver::reduction::GoalCases;
         if tamarin_utils::env_gate!("TAM_RS_DBG_SUA") {
-            let oc = match &outcome {
-                GoalCases::Contradictory => "Contradictory".to_string(),
-                GoalCases::Linear => "Linear".to_string(),
-                GoalCases::LinearNamed(n) => format!("LinearNamed({})", n),
-                GoalCases::Cases(cs) => format!("Cases({})", cs.len()),
-            };
+            let oc = goal_cases_dbg(&outcome);
             eprintln!("[SUA/fo] i={}.{} tag={:?} outcome={}", i.name, i.idx, fa.tag, oc);
         }
         match outcome {
@@ -2715,12 +2586,7 @@ fn drain_remaining_actions(
         if goal_solved { continue; }
         let outcome = red.solve_action_goal(i, fa);
         if tamarin_utils::env_gate!("TAM_RS_DBG_SUA") {
-            let oc = match &outcome {
-                GoalCases::Contradictory => "Contradictory".to_string(),
-                GoalCases::Linear => "Linear".to_string(),
-                GoalCases::LinearNamed(n) => format!("LinearNamed({})", n),
-                GoalCases::Cases(cs) => format!("Cases({})", cs.len()),
-            };
+            let oc = goal_cases_dbg(&outcome);
             eprintln!("[SUA/drain] i={}.{} tag={:?} outcome={}", i.name, i.idx, fa.tag, oc);
         }
         match outcome {
@@ -2753,6 +2619,97 @@ fn drain_remaining_actions(
     vec![(std::mem::replace(&mut red.sys, crate::constraint::system::System::empty()), final_counter)]
 }
 
+/// Render a `GoalCases` outcome into the short debug string shared by
+/// the three `TAM_RS_DBG_SUA` eprintln sites (`solve_unique_actions_pass`,
+/// `solve_unique_actions_pass_fan_out`, `drain_remaining_actions`).
+/// Debug-only: the string is only ever consumed inside `env_gate!`-guarded
+/// `eprintln!` bodies and never touches proof state or output.
+fn goal_cases_dbg(oc: &crate::constraint::solver::reduction::GoalCases) -> String {
+    use crate::constraint::solver::reduction::GoalCases;
+    match oc {
+        GoalCases::Contradictory => "Contradictory".to_string(),
+        GoalCases::Linear => "Linear".to_string(),
+        GoalCases::LinearNamed(n) => format!("LinearNamed({})", n),
+        GoalCases::Cases(cs) => format!("Cases({})", cs.len()),
+    }
+}
+
+/// Collect the unsolved unique Action-goal candidates in Haskell
+/// `Goal`-Ord order, shared by `solve_unique_actions_pass` and
+/// `solve_unique_actions_pass_fan_out`.
+///
+/// "Unique" = the fact's `(tag, arity)` occurs exactly once across all
+/// protocol + intruder rule actions, and no term is a top-level AC-Union
+/// (a multiset union splits into multiple unifiers — Haskell's
+/// `null [ () | t <- ts, FUnion _ <- viewTerm2 t]`).
+///
+/// Returns the candidates sorted by `(NodeId, LNFact)`.  Haskell-faithful:
+/// `unsolvedActionAtoms` returns `M.toList sGoals` which iterates the Map
+/// in `Goal`-Ord order — ActionG sorted by (NodeId, LNFact).  Our
+/// `sys.goals` is a Vec preserving insertion order; sort the candidates
+/// by (NodeId, LNFact) to match Haskell.  This ordering is byte-critical
+/// for goal-ranking: solveUniqueActions creates Premise goals as a
+/// side-effect of solving each Action, and the order in which those
+/// Premises are created determines their goalNr, which determines
+/// execProofMethod's pick.
+///
+/// Returns an empty Vec when there are no unsolved Action goals — the
+/// count-map build over `ctx.rules`/`ctx.intruder_rules` (with a
+/// `FactTag` clone per action) is skipped in that case, output-equivalent
+/// to the callers' prior early return.
+fn collect_unique_action_candidates(
+    red: &Reduction,
+) -> Vec<(crate::constraint::constraints::NodeId, crate::fact::LNFact)> {
+    use crate::constraint::constraints::Goal;
+    use crate::fact::{FactTag, LNFact};
+
+    // Bail before building the (static) count map when there are no
+    // unsolved Action goals to test — the full `ctx.rules`/`ctx.intruder_rules`
+    // scan otherwise runs every simplify pass even on systems with zero
+    // action goals.
+    if !red.sys.goals.iter().any(|(g, st)|
+        matches!(g, Goal::Action(_, _)) && !st.solved)
+    {
+        return Vec::new();
+    }
+
+    // Count `(tag, arity)` occurrences across all non-silent rules
+    // — both protocol rules and intruder rules.  Cached per call;
+    // Haskell notes this is a static computation per theory but
+    // doesn't cache it either.
+    let mut counts: std::collections::BTreeMap<(FactTag, usize), usize>
+        = std::collections::BTreeMap::new();
+    for r in &red.ctx.rules {
+        for fa in &r.rule.actions {
+            *counts.entry((fa.tag.clone(), fa.terms.len())).or_insert(0) += 1;
+        }
+    }
+    for r in &red.ctx.intruder_rules {
+        for fa in &r.actions {
+            *counts.entry((fa.tag.clone(), fa.terms.len())).or_insert(0) += 1;
+        }
+    }
+    let is_unique = |fa: &LNFact| -> bool {
+        // Skip FUnion-headed terms — multiset unions can produce
+        // multiple unifiers (Haskell's `null [ () | t <- ts, FUnion _ <- viewTerm2 t]`).
+        for t in &fa.terms {
+            if has_funion_head(t) { return false; }
+        }
+        counts.get(&(fa.tag.clone(), fa.terms.len())).copied() == Some(1)
+    };
+
+    let mut candidates: Vec<(crate::constraint::constraints::NodeId, LNFact)> =
+        red.sys.goals.iter()
+            .filter_map(|(g, st)| match g {
+                Goal::Action(i, fa) if !st.solved && is_unique(fa) =>
+                    Some((i.clone(), fa.clone())),
+                _ => None,
+            })
+            .collect();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    candidates
+}
+
 /// True if the term's TOP-LEVEL symbol is the AC `Union` head —
 /// i.e. it is itself a multiset union (HS `viewTerm2 t == FUnion _`).
 fn has_funion_head(t: &tamarin_term::lterm::LNTerm) -> bool {
@@ -2768,14 +2725,6 @@ fn has_funion_head(t: &tamarin_term::lterm::LNTerm) -> bool {
     // unification of the wrapped multiset against the rule's instance
     // is what fans the simplify step into the per-partition cases, as
     // on alethea `Universal_VerProof*`).
-    //
-    // A previous recursive version returned true for any term
-    // CONTAINING a union anywhere, over-excluding pair-wrapped
-    // multiset actions (`Learn_A_YSGs($S,$A,<'ySG',y1++y2>)`,
-    // `Learn_A_Cs($S,$A,<'codes',c1++c2>)`) — so RS deferred the
-    // multiset AC fan-out to deep runtime solving (verdict-correct but
-    // ~3.5x longer proofs) instead of producing HS's shallow simplify
-    // case split.
     use tamarin_term::function_symbols::{AcSym, FunSym};
     use tamarin_term::term::Term;
     matches!(t, Term::App(FunSym::Ac(AcSym::Union), _))
@@ -2985,12 +2934,10 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
 
     // Precompute, ONCE, the set of nodes whose rule has exactly one, LINEAR
     // conclusion — the only rule property `plain_route` (`getRoute`/`plainRoute`,
-    // Simplify.hs) actually reads.  The previous `lookup_rule` closure did a
-    // linear `find` over every node AND deep-cloned the whole `RuleACInst`
-    // (every premise/conclusion/action fact-term `Vec`) on EVERY recursive
-    // `plain_route` step — the dominant `slice::to_vec` cost on SAPiC theories
-    // (Yubikey).  Membership is identical, so the routed chains are byte-
-    // identical (and lookup is now O(log n), not an O(nodes) scan + deep clone).
+    // Simplify.hs) actually reads.  Membership (not the rule's contents) is
+    // all `plain_route` reads, so a precomputed set gives O(log n) lookup per
+    // recursive step instead of an O(nodes) scan; the routed chains are
+    // byte-identical either way.
     let single_linear_conc: std::collections::BTreeSet<
         crate::constraint::constraints::NodeId> = nodes_snapshot.iter()
         .filter(|(_, r)| r.conclusions.len() == 1 && r.conclusions[0].is_linear())
@@ -3017,8 +2964,8 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
         // Defensive depth bound — proto chains rarely exceed 16 in
         // practice; this stops on cyclic edges (shouldn't happen
         // in a well-formed system, but defensive).  A node continues the route
-        // iff it has a single linear conclusion (precomputed) — equivalent to
-        // the old `lookup_rule(nid).conclusions.len()==1 && [0].is_linear()`.
+        // iff it has a single linear conclusion (precomputed) — i.e. `nid`'s
+        // rule has exactly one, linear conclusion.
         if depth > 32 || !single_linear_conc.contains(nid) {
             return vec![nid.clone()];
         }
@@ -3038,52 +2985,70 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut new_lesses: Vec<(
         crate::constraint::constraints::NodeId,
         crate::constraint::constraints::NodeId)> = Vec::new();
+
+    // HS-faithful: the walk below uses `elemNotBelowReducible reducible ~x t'`
+    // rather than a raw free-var walk.  Haskell's `connectNodeToFreshes`
+    // (Simplify.hs) computes `containing` = the floodFill of (~x, ~x) over the
+    // subterm graph, then checks whether any t in `containing` satisfies
+    // `t `elemNotBelowReducible` t'` for some t' in the consumer's
+    // `rPrems ++ rActs` terms (Simplify.hs).
+    //
+    // We approximate the floodFill by starting with `containing = [~x]` (no
+    // transitive ⊏-subterm expansion — see the "KNOWN GAP" comment above), but
+    // we MUST still respect the `elemNotBelowReducible` filter: ~x appearing
+    // under a reducible function symbol (e.g. `exp` in DH) does NOT count as
+    // "contained", because the equational theory could rewrite the enclosing
+    // term and eliminate ~x.
+    //
+    // Without this filter, Rust adds spurious `vr.X < vf.Y` Fresh less-atoms
+    // when the fresh appears under `exp` (the DH-protocol case), creating cycles
+    // HS doesn't detect.  Root cause of the
+    // STS_MAC_fix1::KI_Perfect_Forward_Secrecy_R divergence at the `case Resp_1`
+    // step where two Resp_1 instances' freshs are each consumed by the other's
+    // input ⇒ HS sees no cycle (freshs are under `exp`), Rust sees a 4-edge
+    // cycle ⇒ premature `by contradiction /* cyclic */`.
+    //
+    // LOOP INVERSION: the per-supplier inner walk was
+    // `elem_not_below_reducible(reducible, fresh_term, t)` where `fresh_term` is
+    // ALWAYS `Lit(Var(fresh_var))` with `fresh_var.sort == Fresh`.  For a Var
+    // `inner`, `elem_not_below_reducible`'s `inner == outer` base case can only
+    // fire at a Var leaf, so the predicate is exactly "`fresh_var` occurs in `t`
+    // on a root-to-leaf path never crossing a reducible-headed App" — a
+    // condition on `t` alone, INDEPENDENT of which fresh var is queried.  So,
+    // ONCE per pass, collect each node's qualifying Fresh-var set (union over
+    // its `rPrems ++ rActs` terms — conclusions excluded, mirroring the walk's
+    // fact selection EXACTLY), parallel to `nodes_snapshot`, and the inner test
+    // becomes an O(1) hash membership.  This is byte-identical: insertion never
+    // depended on WHICH fact/term matched, only on the any-term boolean, which
+    // set membership reproduces — so the inserted less-atoms and their insertion
+    // order are unchanged.
+    let reducible = &maude.maude_sig().reducible_fun_syms_fast;
+    let node_fresh_vars: Vec<tamarin_utils::FastSet<LVar>> = nodes_snapshot
+        .iter()
+        .map(|(_, rule)| {
+            let mut out = tamarin_utils::FastSet::default();
+            for f in rule.premises.iter().chain(rule.actions.iter()) {
+                for t in &f.terms {
+                    crate::tools::subterm_store::collect_fresh_vars_not_below_reducible(
+                        reducible, t, &mut out);
+                }
+            }
+            out
+        })
+        .collect();
+
     for (sup_id, fresh_var) in &suppliers {
         let sup_rule = match nodes_snapshot.iter().find(|(id, _)| id == sup_id) {
             Some((_, r)) => r, None => continue,
         };
-        // HS-faithful: use `elemNotBelowReducible reducible ~x t'` rather
-        // than a raw free-var walk.  Haskell's `connectNodeToFreshes`
-        // (Simplify.hs) computes `containing` = the floodFill of
-        // (~x, ~x) over the subterm graph, then checks whether any t in
-        // `containing` satisfies `t `elemNotBelowReducible` t'` for some
-        // t' in the consumer's `rPrems ++ rActs` terms (Simplify.hs).
-        //
-        // We approximate the floodFill by starting with `containing =
-        // [~x]` (no transitive ⊏-subterm expansion — see the "KNOWN GAP"
-        // comment above), but we MUST still respect the
-        // `elemNotBelowReducible` filter: ~x appearing under a reducible
-        // function symbol (e.g. `exp` in DH) does NOT count as
-        // "contained", because the equational theory could rewrite the
-        // enclosing term and eliminate ~x.
-        //
-        // Without this filter, Rust adds spurious `vr.X < vf.Y` Fresh
-        // less-atoms when the fresh appears under `exp` (the DH-protocol
-        // case), creating cycles HS doesn't detect.  Root cause of the
-        // STS_MAC_fix1::KI_Perfect_Forward_Secrecy_R divergence at the
-        // `case Resp_1` step where two Resp_1 instances' freshs are
-        // each consumed by the other's input ⇒ HS sees no cycle (freshs
-        // are under `exp`), Rust sees a 4-edge cycle ⇒ premature
-        // `by contradiction /* cyclic */`.
-        let reducible = &maude.maude_sig().reducible_fun_syms_fast;
-        let fresh_term: tamarin_term::lterm::LNTerm =
-            tamarin_term::term::Term::Lit(
-                tamarin_term::vterm::Lit::Var(fresh_var.clone()));
-        for (other_id, other_rule) in nodes_snapshot.iter() {
+        for (idx, (other_id, other_rule)) in nodes_snapshot.iter().enumerate() {
             if other_id == sup_id { continue; }
-            let mut found = false;
-            for f in other_rule.premises.iter().chain(other_rule.actions.iter()) {
-                for t in &f.terms {
-                    if crate::tools::subterm_store::elem_not_below_reducible(
-                        reducible, &fresh_term, t)
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-                if found { break; }
-            }
-            if !found { continue; }
+            // Loop-inversion membership test (see the `node_fresh_vars`
+            // precompute above): true iff `fresh_var` occurs in one of this
+            // node's `rPrems ++ rActs` terms not below a reducible head — the
+            // exact any-term result of the former inner
+            // `elem_not_below_reducible` walk, now an O(1) hash lookup.
+            if !node_fresh_vars[idx].contains(fresh_var) { continue; }
             match crate::rule::unifiable_rule_ac_insts(&maude, sup_rule, other_rule) {
                 Ok(true) => continue,
                 Ok(false) => {}
@@ -3686,11 +3651,11 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     //   mapM_ (\(x,y) -> insertLess (LessAtom x y InjectiveFacts)) newLesses
     // Formulas FIRST (cases 1, 2, 4), then less-atoms (cases 3, 5).
     // `insertFormula` for an `EqE` atom routes through `insertAtom`→
-    // `solveTermEqs SplitNow`, which carries the same contradiction
-    // checks the old eager `solve_term_eqs`/`solve_node_id_eqs` path
-    // had (Contradictory → `mark_contradictory`; AC-multi-unifier →
-    // `pending_eq_arms` DisjT fork, drained by the outer simplify
-    // fan-out loop).  The node merge for case (2) is realised by the
+    // `solveTermEqs SplitNow`, which performs the same contradiction
+    // checks as `solve_term_eqs`/`solve_node_id_eqs` (Contradictory →
+    // `mark_contradictory`; AC-multi-unifier → `pending_eq_arms` DisjT
+    // fork, drained by the outer simplify fan-out loop).  The node
+    // merge for case (2) is realised by the
     // next iteration's `substSystem` once the `i := j` binding lands
     // in the eq-store — so NO eager node-id rename is needed here.
     for f in new_formulas {
@@ -4469,7 +4434,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     for f in new_formulas {
         // Stored-state boundary (150f5eba): normalise before the dedup
         // check and the push, so the comparison is normal-to-normal.
-        let f = crate::guarded::normalise_stored_formula(&f);
+        let f = crate::guarded::normalise_stored_formula_owned(f);
         if !red.sys.formulas.contains(&f) && !red.sys.solved_formulas.contains(&f) {
             red.sys.invalidate_max_var_idx_cache();
             red.sys.formulas.push(f);
@@ -5084,9 +5049,9 @@ mod tests {
         //   isLast sys n             = False (no last_atom)
         //   any isInTrace (nodesAfter n) = isInTrace m = False
         //   case sLastAtom of Nothing -> Nothing
-        // The pre-fix RS code's blanket "less_atom with smaller=n →
-        // Some(false)" would have returned Some(false) here, diverging
-        // from HS.
+        // This test pins that a less-atom with `smaller == n` alone must
+        // NOT collapse `Last(n)` to `Some(false)` unless the successor
+        // also satisfies `is_in_trace`.
         let mut sys = System::empty();
         let n = mkvar_l("n", 0);
         let m = mkvar_l("m", 0);
@@ -5345,9 +5310,7 @@ mod tests {
     /// produce the `ACNewVarD` existential leaf, which `simpSplitNegSt`
     /// turns into the `acFormula`:
     ///   ∀ newVar. (a++a) ++ newVar = (b++c) ⇒ ⊥
-    /// (HS SubtermStore.hs:194,289-296).  Before the AC-recurse arm was
-    /// ported, `step_split` returned `None` for the AC big-side and no
-    /// such formula was emitted.
+    /// (HS SubtermStore.hs:194,289-296).
     ///
     /// Authenticity: HS's `tamarin-prover --prove` verifies the
     /// corresponding lemma `not(a++a ⊏ b++c)` (4 steps) — the proof

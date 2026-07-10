@@ -419,24 +419,12 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                 "parse-only" => args.parse_only = true,
                 "precompute-only" => args.precompute_only = true,
                 "processors" => {
-                    let v = take_val(&mut i, raw, val_inline, "processors")?;
-                    let n: usize = parse_int(&v, "processors")?;
-                    if n == 0 {
-                        return Err(CliError::Msg(
-                            "--processors must be >= 1".to_string(),
-                        ));
-                    }
-                    args.processors = Some(n);
+                    args.processors =
+                        Some(parse_positive_usize(&mut i, raw, val_inline, "processors")?);
                 }
                 "maude-processes" => {
-                    let v = take_val(&mut i, raw, val_inline, "maude-processes")?;
-                    let n: usize = parse_int(&v, "maude-processes")?;
-                    if n == 0 {
-                        return Err(CliError::Msg(
-                            "--maude-processes must be >= 1".to_string(),
-                        ));
-                    }
-                    args.maude_processes = Some(n);
+                    args.maude_processes =
+                        Some(parse_positive_usize(&mut i, raw, val_inline, "maude-processes")?);
                 }
                 // Output flags.  output / Output / output-module are flagOpt
                 // (Batch.hs:76-78): only `=VALUE` or a bare flag (records the
@@ -701,6 +689,23 @@ fn parse_int<T: std::str::FromStr>(s: &str, name: &str) -> Result<T, CliError> {
     s.parse::<T>().map_err(|_| {
         CliError::Msg(format!("{}: expected integer, got {:?}", name, s))
     })
+}
+
+/// Take a flag's value, parse it as a `usize`, and reject `0` with a
+/// `--<name> must be >= 1` error.  Shared by the `--processors` and
+/// `--maude-processes` arms, which are otherwise identical.
+fn parse_positive_usize(
+    i: &mut usize,
+    raw: &[String],
+    inline: Option<&str>,
+    name: &str,
+) -> Result<usize, CliError> {
+    let v = take_val(i, raw, inline, name)?;
+    let n: usize = parse_int(&v, name)?;
+    if n == 0 {
+        return Err(CliError::Msg(format!("--{} must be >= 1", name)));
+    }
+    Ok(n)
 }
 
 /// Does the lemma name match the user's `--prove`/`--lemma` filter?

@@ -137,6 +137,20 @@ pub fn apply_vterm<C: Ord + Clone, V: Ord + Clone>(
     apply_vterm_map(&s.map, t)
 }
 
+/// `applyVTerm` with change detection: returns `Some(new_term)` only when
+/// `s` actually changes `t`, and `None` when `t` is left structurally
+/// unchanged.  The borrowing, non-cloning counterpart of [`apply_vterm`] —
+/// callers reuse the original `t` on `None` instead of cloning it and
+/// deep-comparing against the applied result.  Thin single-term wrapper over
+/// [`apply_vterm_map_changed`], sharing its exact `None`-when-unchanged
+/// convention (empty/absent binding ⇒ `None`).
+pub fn apply_vterm_changed<C: Ord + Clone, V: Ord + Clone>(
+    s: &Subst<C, V>,
+    t: &VTerm<C, V>,
+) -> Option<VTerm<C, V>> {
+    apply_vterm_map_changed(&s.map, t)
+}
+
 /// `applyVTerm` against a raw substitution map — the borrowing
 /// counterpart of [`apply_vterm`], producing byte-identical output.
 ///

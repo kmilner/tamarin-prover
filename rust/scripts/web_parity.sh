@@ -99,8 +99,6 @@ one_file() {
     # A theory with no lemma declaration legitimately discovers 0 lemmas —
     # allow it; otherwise 0 discovered lemmas is a transient failure and
     # web_crawl.py exits 3 (→ SKIP_*_FAIL below, manifest never cached).
-    # Guards against the silent 9-URL stub manifests (15 poisoned entries
-    # found in the 2026-07-05 audit).
     local CRAWL_EXTRA_ARGS=""
     grep -qE '^[[:space:]]*(lemma|equivLemma|diffLemma)([[:space:]]|\[|:)' "$f" \
         || CRAWL_EXTRA_ARGS="--allow-no-lemmas"

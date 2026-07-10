@@ -60,6 +60,27 @@ pub fn parse_proof_tree(raw: &str) -> Result<ParsedProofTree, ProofTreeParseErro
     Ok(tree)
 }
 
+/// Read raw text between an already-consumed `(` and its matching `)`,
+/// accounting for nested parens.  Returns the inner text (excluding the final
+/// `)`, which is consumed), or `None` on EOF before the closing paren.
+fn read_balanced_paren(lx: &mut Lexer<'_>) -> Option<String> {
+    let mut s = String::new();
+    let mut depth: i32 = 1;
+    while depth > 0 {
+        match lx.peek() {
+            None => return None,
+            Some('(') => { s.push('('); lx.bump(); depth += 1; }
+            Some(')') => {
+                depth -= 1;
+                if depth == 0 { lx.bump(); break; }
+                s.push(')'); lx.bump();
+            }
+            Some(c) => { s.push(c); lx.bump(); }
+        }
+    }
+    Some(s)
+}
+
 struct TreeParser<'a> {
     lx: Lexer<'a>,
 }
@@ -220,23 +241,8 @@ impl<'a> TreeParser<'a> {
     /// `)`, accounting for nested parens.  Returns the inner text
     /// (excluding the final `)` which is consumed).
     fn read_balanced_paren(&mut self) -> Result<String, ProofTreeParseError> {
-        let mut s = String::new();
-        let mut depth: i32 = 1;
-        while depth > 0 {
-            match self.lx.peek() {
-                None => return Err(self.err("unterminated `(` in solve(...)")),
-                Some('(') => {
-                    s.push('('); self.lx.bump(); depth += 1;
-                }
-                Some(')') => {
-                    depth -= 1;
-                    if depth == 0 { self.lx.bump(); break; }
-                    s.push(')'); self.lx.bump();
-                }
-                Some(c) => { s.push(c); self.lx.bump(); }
-            }
-        }
-        Ok(s)
+        read_balanced_paren(&mut self.lx)
+            .ok_or_else(|| self.err("unterminated `(` in solve(...)"))
     }
 }
 
@@ -661,21 +667,7 @@ impl<'a> GoalParser<'a> {
     }
 
     fn read_balanced_paren(&mut self) -> Option<String> {
-        let mut s = String::new();
-        let mut depth: i32 = 1;
-        while depth > 0 {
-            match self.lx.peek() {
-                None => return None,
-                Some('(') => { s.push('('); self.lx.bump(); depth += 1; }
-                Some(')') => {
-                    depth -= 1;
-                    if depth == 0 { self.lx.bump(); break; }
-                    s.push(')'); self.lx.bump();
-                }
-                Some(c) => { s.push(c); self.lx.bump(); }
-            }
-        }
-        Some(s)
+        read_balanced_paren(&mut self.lx)
     }
 }
 

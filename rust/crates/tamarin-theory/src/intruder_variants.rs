@@ -487,19 +487,14 @@ mod tests {
         }
     }
 
-    /// Regression test for the `c_one` / `c_DH_neutral` soundness bug
-    /// (commit landing this fix): under `dh_maude_sig()`, the cached
-    /// rule `[ ] --[ !KU( one ) ]-> [ !KU( one ) ]` must produce an
-    /// action term whose ROOT is the 0-arity NoEq application
-    /// `oneSym{}`, NOT a Msg-sort variable named `one`.  HS reference:
-    /// Theory/Text/Parser/Term.hs:139-143 (`nullaryApp` against
-    /// `funSyms maudeSig`) and lib/term/src/Term/Term/FunctionSymbols.hs:163
+    /// Regression test for the `c_one` / `c_DH_neutral` soundness invariant:
+    /// under `dh_maude_sig()`, the rule `[ ] --[ !KU( one ) ]-> [ !KU( one ) ]`
+    /// must have ROOT = the 0-arity NoEq application `oneSym{}`, NOT a Msg-sort
+    /// var `one` (which would unify with every KU goal, falsely closing 8+ DH
+    /// corpus branches).  HS: Theory/Text/Parser/Term.hs:139-143 (`nullaryApp`
+    /// against `funSyms maudeSig`) and
+    /// lib/term/src/Term/Term/FunctionSymbols.hs:163
     /// (`oneSym = ("one",(0,Public,Constructor))`).
-    ///
-    /// Before the fix, the parser produced a free variable that
-    /// unified with every KU goal — this is the root cause of 8+
-    /// wrong-verdict (`SOLVED // trace found` in RS, `by contradiction`
-    /// in HS) corpus divergences across DH examples.
     #[test]
     fn dh_one_and_dh_neutral_parse_as_constants() {
         use tamarin_term::function_symbols::{

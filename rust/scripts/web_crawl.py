@@ -70,9 +70,8 @@ def http_get(base, path):
 
 def http_get_retry(base, path, attempts=3, backoff=2.0):
     """`http_get` with retries on transient failures (timeout / 5xx / conn
-    err).  Used for the step-1 lemma-discovery fetch: a single transient
-    failure there used to yield lemmas=[] and a silently-cached 9-URL stub
-    manifest (15 poisoned cache entries found in the 2026-07-05 audit)."""
+    err).  Used for the step-1 lemma-discovery fetch, where a transient
+    failure would otherwise cache an empty-lemma stub manifest."""
     status, ct, body = 0, "", ""
     for i in range(attempts):
         status, ct, body = http_get(base, path)

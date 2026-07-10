@@ -321,11 +321,7 @@ pub fn pretty_closed_theory(
     // `parseLemmaWithMacros`): the restriction/lemma renderers apply them to
     // get the expanded formula.  Computed here (not per item) so it is not
     // re-collected and cloned for every theory item.
-    let macros: Vec<p::Macro> = parsed.items.iter()
-        .filter_map(|i| if let p::TheoryItem::Macros(ms) = i { Some(ms.as_slice()) } else { None })
-        .flatten()
-        .cloned()
-        .collect();
+    let macros: Vec<p::Macro> = collect_macros(parsed);
     // Collect predicate declarations once.  HS `expandRestriction` /
     // `expandLemma` (TheoryObject.hs:430-446) predicate-expand BOTH the
     // main and original formulas of every restriction/lemma against the
@@ -333,11 +329,7 @@ pub fn pretty_closed_theory(
     // `(<)`), so the displayed formula is always the expanded one.  The
     // parse already succeeded, so every referenced predicate is defined;
     // using the full set for display-time expansion is safe.
-    let predicates: Vec<p::Predicate> = parsed.items.iter()
-        .filter_map(|i| if let p::TheoryItem::Predicates(ps) = i { Some(ps.as_slice()) } else { None })
-        .flatten()
-        .cloned()
-        .collect();
+    let predicates: Vec<p::Predicate> = collect_predicates(parsed);
     // Names of arity-1 NoEq function symbols.  Depends only on the
     // (immutable) elaborated signature, so compute it once here and thread
     // it through to every per-item renderer rather than recomputing (and
@@ -392,13 +384,6 @@ pub fn web_signature_block(sig: &tamarin_term::maude_sig::MaudeSig) -> String {
     render_signature(sig).trim_end_matches('\n').to_string()
 }
 
-/// HS `prettyGoal` (Constraints.hs:262-285) — reuses the byte-faithful
-/// `solve_goal_to_doc`, rendered at the active display width.  Used for the
-/// web source-case header/premise (`htmlSource`'s `prettyGoal th._cdGoal`).
-pub fn web_pretty_goal(g: &crate::constraint::constraints::Goal) -> String {
-    solve_goal_to_doc(g).render()
-}
-
 /// HS `ppPrem = nest 2 (doubleQuotes (prettyGoal th._cdGoal))`
 /// (Web/Theory.hs:830).  `doubleQuotes d = char '"' <> d <> char '"'` (the
 /// quotes entity-escape to `&quot;` under the active HtmlDoc guard); the
@@ -434,16 +419,25 @@ pub fn web_pretty_source_header(
     hpj::hsep(vec![left, right]).render()
 }
 
+/// Collect the theory's macro declarations in source order (mirrors HS
+/// `applyMacroInRestriction` / `parseLemmaWithMacros`).
+fn collect_macros(parsed: &p::Theory) -> Vec<p::Macro> {
+    parsed.items.iter()
+        .filter_map(|i| if let p::TheoryItem::Macros(ms) = i { Some(ms.as_slice()) } else { None })
+        .flatten().cloned().collect()
+}
+
+/// Collect the theory's predicate declarations in source order.
+fn collect_predicates(parsed: &p::Theory) -> Vec<p::Predicate> {
+    parsed.items.iter()
+        .filter_map(|i| if let p::TheoryItem::Predicates(ps) = i { Some(ps.as_slice()) } else { None })
+        .flatten().cloned().collect()
+}
+
 /// Collect the theory's macros + predicates the way `pretty_closed_theory`
 /// does, so the per-item renderers below see the same expansion inputs.
-fn web_collect_macros_predicates(parsed: &p::Theory) -> (Vec<p::Macro>, Vec<p::Predicate>) {
-    let macros: Vec<p::Macro> = parsed.items.iter()
-        .filter_map(|i| if let p::TheoryItem::Macros(ms) = i { Some(ms.as_slice()) } else { None })
-        .flatten().cloned().collect();
-    let predicates: Vec<p::Predicate> = parsed.items.iter()
-        .filter_map(|i| if let p::TheoryItem::Predicates(ps) = i { Some(ps.as_slice()) } else { None })
-        .flatten().cloned().collect();
-    (macros, predicates)
+fn collect_macros_predicates(parsed: &p::Theory) -> (Vec<p::Macro>, Vec<p::Predicate>) {
+    (collect_macros(parsed), collect_predicates(parsed))
 }
 
 /// HS `prettyClosedProtoRule` over `theoryRules thy` (Web/Theory.hs:894,898) —
@@ -451,7 +445,7 @@ fn web_collect_macros_predicates(parsed: &p::Theory) -> (Vec<p::Macro>, Vec<p::P
 /// `render_rule` (the `--prove` theory-body rule printer) with the same
 /// macro/arity1/manual-variant setup `pretty_closed_theory` uses.
 pub fn web_proto_rules(parsed: &p::Theory, elaborated: &Theory) -> Vec<String> {
-    let (macros, _preds) = web_collect_macros_predicates(parsed);
+    let (macros, _preds) = collect_macros_predicates(parsed);
     let arity1 = arity1_noeq_names(elaborated);
     let manual_variants = contains_manual_rule_variants(parsed, elaborated, false);
     parsed.items.iter().filter_map(|item| match item {
@@ -465,7 +459,7 @@ pub fn web_proto_rules(parsed: &p::Theory, elaborated: &Theory) -> Vec<String> {
 /// one rendered restriction string per restriction, in source order.  Reuses
 /// `render_parsed_restriction` (the `--prove` theory-body restriction printer).
 pub fn web_restrictions(parsed: &p::Theory, elaborated: &Theory) -> Vec<String> {
-    let (macros, predicates) = web_collect_macros_predicates(parsed);
+    let (macros, predicates) = collect_macros_predicates(parsed);
     let arity1 = arity1_noeq_names(elaborated);
     parsed.items.iter().filter_map(|item| match item {
         p::TheoryItem::Restriction(r) | p::TheoryItem::LegacyAxiom(r) =>
@@ -1171,11 +1165,7 @@ fn render_parsed_macros(macros: &[p::Macro]) -> String {
 /// else the same `prettyMacros` string the `--prove` theory body uses
 /// ([`render_parsed_macros`]); rendered at the caller's active display width.
 pub fn web_macros(parsed: &p::Theory) -> Option<String> {
-    let macros: Vec<p::Macro> = parsed.items.iter()
-        .filter_map(|i| if let p::TheoryItem::Macros(ms) = i { Some(ms.as_slice()) } else { None })
-        .flatten()
-        .cloned()
-        .collect();
+    let macros: Vec<p::Macro> = collect_macros(parsed);
     if macros.is_empty() {
         None
     } else {
@@ -1273,8 +1263,7 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1
     // Desugar `let x = t in ...` bindings before rendering — HS does
     // this via `applyMacroInProtoRule`/`expandRuleLetBlock` so the
     // emitted rule contains no bound names from the `let` block.
-    // Mirrors `apply_let_block` (`elaborate.rs:678`); same fix pattern
-    // as the deriv-check (commit 3b0202bb).  HS site:
+    // Mirrors `apply_let_block` (`elaborate.rs:678`).  HS site:
     // `lib/theory/src/TheoryObject.hs::prettyTheory` → `prettyRule` chain
     // which operates on the post-`applyMacroInProtoRule` rule.
     let desugared = crate::elaborate::apply_let_block(parsed_rule);
@@ -2349,8 +2338,8 @@ fn pp_proof(
             // prettyStep ps`), so a dropped `/* unannotated */` aligns at
             // `base + len("by ")` (= +3), not `base`.  `beside` still shifts
             // the method's own wrapped continuation columns by the prefix
-            // width and counts it toward the ribbon, so the method lines stay
-            // byte-identical to the old baked-in layout.
+            // width and counts it toward the ribbon, so the method lines
+            // stay byte-identical to HS.
             let doc = pp_step_doc(&node.method, "");
             out.push_str(&pf::step_line_with_unann(doc, base, annotated, "by "));
         }
@@ -2420,10 +2409,9 @@ pub fn pretty_proof_method_doc(
     pp_step_doc(m, "")
 }
 
-/// Build the proof-step method as a `pretty_hpj::Doc`, mirroring
-/// `pp_step_at` but yielding a Doc (so it can be combined with the
-/// `/* unannotated */` comment via `sep`, per HS
-/// `prettyIncrementalProof.ppStep`, ProofSkeleton.hs:80-84).
+/// Build the proof-step method as a `pretty_hpj::Doc` so it can be
+/// combined with the `/* unannotated */` comment via `sep`, per HS
+/// `prettyIncrementalProof.ppStep`, ProofSkeleton.hs:80-84.
 ///
 /// `prefix` is the leaf-step keyword (`"by "` for childless steps, `""`
 /// otherwise); it is laid out BESIDE the method as line content (NOT
@@ -2492,9 +2480,9 @@ fn pp_step_doc(
             }
         }
         // HS `prettyProofMethod` leaf keywords/comments (ProofMethod.hs:1488-1494).
-        // Built as all-`beside` chains (no `fsep`) so plain-mode layout is
-        // byte-identical to the previous flat `pp_step_at` string (the highlight
-        // combinators are the identity there); HtmlDoc mode adds `hl_*` spans.
+        // Built as all-`beside` chains (no `fsep`) so plain-mode layout
+        // matches HS exactly (the highlight combinators are the identity
+        // there); HtmlDoc mode adds `hl_*` spans.
         PM::Simplify => crate::pretty_hpj::keyword_("simplify"),
         PM::Induction => crate::pretty_hpj::keyword_("induction"),
         PM::Finished(MR::Solved) => crate::pretty_hpj::keyword_("SOLVED")
@@ -2505,9 +2493,9 @@ fn pp_step_doc(
             "proof may have been invalidated by editing a reuse lemma above. You should "),
         // HS `Sorry reason -> fsep [keyword_ "sorry", maybe emptyDoc
         // closedComment_ reason]` (ProofMethod.hs:1490-1491).  `keyword_` is
-        // identity in plain mode, so `sorry` / `sorry /* reason */` is
-        // byte-identical to the old flat `pp_step_at` string (verified against
-        // the `--prove` baseline); HtmlDoc mode adds the `hl_keyword`/`hl_comment`
+        // identity in plain mode, so `sorry` / `sorry /* reason */`
+        // matches HS exactly (verified against the `--prove` baseline); HtmlDoc
+        // mode adds the `hl_keyword`/`hl_comment`
         // spans the overview `#proof` index needs.  `fsep [x, emptyDoc] = x`.
         PM::Sorry(reason) => match reason {
             None => crate::pretty_hpj::keyword_("sorry"),
@@ -2640,9 +2628,9 @@ fn raw_goal_to_doc(raw: &str) -> crate::pretty_hpj::Doc {
         // node text; only the `~~>` arrow is an `hl_operator` span.  The stored
         // goal text is exactly `<conc> ~~> <prem>`, so split on the arrow.
         GoalSpec::Chain { .. } => match trimmed.split_once("~~>") {
-            Some((l, r)) => Doc::text(l.trim_end().to_string())
+            Some((l, r)) => Doc::text(l.trim_end())
                 .beside_sp(crate::pretty_hpj::operator_("~~>"))
-                .beside_sp(Doc::text(r.trim_start().to_string())),
+                .beside_sp(Doc::text(r.trim_start())),
             None => Doc::text(trimmed),
         },
         // Unrecognised goal shapes: a lone guarded formula goal (e.g. a

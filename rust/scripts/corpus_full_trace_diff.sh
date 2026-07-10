@@ -178,11 +178,9 @@ worker() {
     # The canon entry is derived data; the .full.gz is the source of truth so
     # that a future switch to direct (un-canonicalised) matching does not
     # require re-running HS over the whole corpus.
-    # Previously only the non-empty case was cached, so SKIP_NO_HS (~32 of
-    # 292 corpus lemmas) and SKIP_TIMEOUT (~20 of 292) re-ran HS every
-    # sweep — and the timeouts happen to be the heaviest jcs18 lemmas
-    # using GB of RAM each.  Caching the negative outcomes cuts warm-sweep
-    # CPU dramatically.
+    # Caching negative outcomes (SKIP_NO_HS / SKIP_TIMEOUT) avoids re-running HS
+    # for those lemmas every sweep — the timeout lemmas are the heaviest
+    # jcs18 cases, using GB of RAM each, so this keeps warm-sweep CPU low.
     local hs_canon="$tmp/hs.canon" hs_rc=0 hs_ms="-"
     local key="" key_empty="" key_timeout=""
     if [ -z "$NO_HS_CACHE" ]; then
@@ -272,8 +270,8 @@ worker() {
 export -f worker
 
 # --- File-content filter (mirror corpus_proof_skeleton_match_probe exactly).
-# Builtins (diffie-hellman/multiset/xor/bilinear-pairing) and macros are fully
-# supported now — the probe dropped those filters and so do we (2026-06-10).
+# Builtins (diffie-hellman/multiset/xor/bilinear-pairing) and macros are
+# supported and, like the probe, not filtered here.
 file_is_comparable() {
     local f="$1"
     grep -q 'diff('       "$f" 2>/dev/null && return 1
@@ -299,8 +297,7 @@ case "${1:-}" in
         done
         ;;
     "" )
-        # Whole examples/ tree (folder filter dropped 2026-06-10; previously a
-        # 17-dir allowlist at maxdepth 2). Content filters above still apply.
+        # Whole examples/ tree; content filters above still apply.
         while IFS= read -r cand; do
             case "$cand" in */testParser/include/*) continue;; esac
             files+=("$cand")

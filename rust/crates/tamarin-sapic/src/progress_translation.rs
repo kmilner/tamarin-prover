@@ -247,7 +247,7 @@ fn make_restriction(pos: &[i64], tos: &PosSet) -> p::Restriction {
     // `pvar = msgVarProgress pos` — the message-sort progress var (rendered
     // without the `~`), quantified universally.
     let pvar = msg_var_progress(&pos_v);
-    let pvar_spec = lvar_to_varspec(&pvar);
+    let pvar_spec = crate::convert::lvar_to_varspec(&pvar);
     let pvar_term = p::Term::Var(pvar_spec.clone());
 
     // `t1var = LVar "t" LSortNode 1`, `t2var = LVar "t" LSortNode 2`.
@@ -320,20 +320,3 @@ fn big_or(tos: &[&Pos], progress_to: &impl Fn(&[i64]) -> p::Formula) -> p::Formu
     }
 }
 
-/// `LVar` → parser `VarSpec`.
-fn lvar_to_varspec(v: &LVar) -> p::VarSpec {
-    use tamarin_term::lterm::LSort;
-    let sort = match v.sort {
-        LSort::Fresh => p::SortHint::Fresh,
-        LSort::Pub => p::SortHint::Pub,
-        LSort::Node => p::SortHint::Node,
-        LSort::Nat => p::SortHint::Nat,
-        LSort::Msg => p::SortHint::Msg,
-    };
-    p::VarSpec {
-        name: v.name.to_string(),
-        idx: v.idx,
-        sort,
-        typ: None,
-    }
-}

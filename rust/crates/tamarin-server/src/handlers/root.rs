@@ -5,10 +5,11 @@ use std::sync::Arc;
 use axum::{
     body::Bytes,
     extract::{Multipart, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{StatusCode, header},
     response::{IntoResponse, Redirect, Response},
 };
 
+use crate::handlers::html_response;
 use crate::state::{AppState, TheoryOrigin};
 use crate::theory_io;
 
@@ -173,12 +174,6 @@ fn render_index(state: &AppState) -> String {
         version = env!("CARGO_PKG_VERSION"),
         theories_content = theories_content,
     )
-}
-
-fn html_response(html: String) -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/html; charset=utf-8"));
-    (StatusCode::OK, headers, html).into_response()
 }
 
 pub fn html_escape(s: &str) -> String {

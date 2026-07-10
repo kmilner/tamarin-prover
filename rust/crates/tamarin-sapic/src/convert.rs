@@ -51,9 +51,208 @@ pub(crate) fn sort_of_hint(s: &p::SortHint) -> LSort {
     }
 }
 
+/// `LSort` → parser `SortHint` (the inverse of [`sort_of_hint`]; always maps to
+/// the plain, non-`Suffix` hint).
+pub(crate) fn lsort_to_sort_hint(s: LSort) -> p::SortHint {
+    match s {
+        LSort::Fresh => p::SortHint::Fresh,
+        LSort::Pub => p::SortHint::Pub,
+        LSort::Node => p::SortHint::Node,
+        LSort::Nat => p::SortHint::Nat,
+        LSort::Msg => p::SortHint::Msg,
+    }
+}
+
+/// `LVar` → parser `VarSpec` (name/idx/sort carried over, no SAPIC type).
+pub(crate) fn lvar_to_varspec(v: &LVar) -> p::VarSpec {
+    p::VarSpec { name: v.name.to_string(), idx: v.idx, sort: lsort_to_sort_hint(v.sort), typ: None }
+}
+
 /// `VarSpec` → `SapicLVar` (carrying the SAPIC `name:type` annotation).
 pub(crate) fn varspec_to_sapic(v: &p::VarSpec) -> SapicLVar {
     SapicLVar::new(LVar::new(v.name.clone(), sort_of_hint(&v.sort), v.idx), v.typ.clone())
+}
+
+/// Rebuild a parser-AST formula, mapping `f` over every FREE `Var` leaf.
+///
+/// Quantifier-bound names are tracked in a `bound` stack (respecting shadowing)
+/// and their occurrences are left untouched; for a free `Var`, `f(varspec,
+/// bound)` returns `Some(term)` to replace the leaf or `None` to keep it
+/// unchanged.  Shared traversal behind `let_destructors::subst_cond_formula`
+/// and `typing::rename_cond_formula`.
+pub(crate) fn map_free_terms(
+    formula: &p::Formula,
+    f: &mut dyn FnMut(&p::VarSpec, &[String]) -> Option<p::Term>,
+) -> p::Formula {
+    fn rt(
+        bound: &[String],
+        f: &mut dyn FnMut(&p::VarSpec, &[String]) -> Option<p::Term>,
+        t: &p::Term,
+    ) -> p::Term {
+        match t {
+            p::Term::Var(v) => {
+                if bound.iter().any(|n| n == &v.name) {
+                    return t.clone();
+                }
+                f(v, bound).unwrap_or_else(|| t.clone())
+            }
+            p::Term::App(n, args) => {
+                p::Term::App(n.clone(), args.iter().map(|a| rt(bound, f, a)).collect())
+            }
+            p::Term::Pair(items) => {
+                p::Term::Pair(items.iter().map(|a| rt(bound, f, a)).collect())
+            }
+            p::Term::AlgApp(n, a, b) => p::Term::AlgApp(
+                n.clone(),
+                Box::new(rt(bound, f, a)),
+                Box::new(rt(bound, f, b)),
+            ),
+            p::Term::Diff(a, b) => {
+                p::Term::Diff(Box::new(rt(bound, f, a)), Box::new(rt(bound, f, b)))
+            }
+            p::Term::BinOp(op, a, b) => {
+                p::Term::BinOp(*op, Box::new(rt(bound, f, a)), Box::new(rt(bound, f, b)))
+            }
+            p::Term::PatMatch(inner) => p::Term::PatMatch(Box::new(rt(bound, f, inner))),
+            other => other.clone(),
+        }
+    }
+    fn ra(
+        bound: &[String],
+        f: &mut dyn FnMut(&p::VarSpec, &[String]) -> Option<p::Term>,
+        a: &p::Atom,
+    ) -> p::Atom {
+        use p::Atom::*;
+        match a {
+            Eq(l, r) => Eq(rt(bound, f, l), rt(bound, f, r)),
+            Less(l, r) => Less(rt(bound, f, l), rt(bound, f, r)),
+            LessMset(l, r) => LessMset(rt(bound, f, l), rt(bound, f, r)),
+            Subterm(l, r) => Subterm(rt(bound, f, l), rt(bound, f, r)),
+            Action(fa, t) => Action(
+                p::Fact {
+                    persistent: fa.persistent,
+                    name: fa.name.clone(),
+                    args: fa.args.iter().map(|x| rt(bound, f, x)).collect(),
+                    annotations: fa.annotations.clone(),
+                },
+                rt(bound, f, t),
+            ),
+            Last(t) => Last(rt(bound, f, t)),
+            Pred(fa) => Pred(p::Fact {
+                persistent: fa.persistent,
+                name: fa.name.clone(),
+                args: fa.args.iter().map(|x| rt(bound, f, x)).collect(),
+                annotations: fa.annotations.clone(),
+            }),
+        }
+    }
+    fn rf(
+        bound: &mut Vec<String>,
+        f: &mut dyn FnMut(&p::VarSpec, &[String]) -> Option<p::Term>,
+        formula: &p::Formula,
+    ) -> p::Formula {
+        use p::Formula::*;
+        match formula {
+            True => True,
+            False => False,
+            Atom(a) => Atom(ra(bound, f, a)),
+            Not(g) => Not(Box::new(rf(bound, f, g))),
+            And(a, b) => And(Box::new(rf(bound, f, a)), Box::new(rf(bound, f, b))),
+            Or(a, b) => Or(Box::new(rf(bound, f, a)), Box::new(rf(bound, f, b))),
+            Implies(a, b) => Implies(Box::new(rf(bound, f, a)), Box::new(rf(bound, f, b))),
+            Iff(a, b) => Iff(Box::new(rf(bound, f, a)), Box::new(rf(bound, f, b))),
+            Forall(vs, body) => {
+                let saved = bound.len();
+                for v in vs {
+                    bound.push(v.name.clone());
+                }
+                let r = Forall(vs.clone(), Box::new(rf(bound, f, body)));
+                bound.truncate(saved);
+                r
+            }
+            Exists(vs, body) => {
+                let saved = bound.len();
+                for v in vs {
+                    bound.push(v.name.clone());
+                }
+                let r = Exists(vs.clone(), Box::new(rf(bound, f, body)));
+                bound.truncate(saved);
+                r
+            }
+        }
+    }
+    let mut bound = Vec::new();
+    rf(&mut bound, f, formula)
+}
+
+/// Visit every FREE `Var` leaf of a parser-AST formula, calling `f(varspec,
+/// bound)` for each (quantifier-bound occurrences are skipped, tracking
+/// shadowing via the `bound` stack).  The traversal order is the depth-first,
+/// left-to-right order shared by `base_translation::formula_free_lvars` and
+/// `typing::cond_formula_free_lvars`.
+pub(crate) fn fold_free_vars(
+    formula: &p::Formula,
+    f: &mut dyn FnMut(&p::VarSpec, &[String]),
+) {
+    fn ct(bound: &[String], f: &mut dyn FnMut(&p::VarSpec, &[String]), t: &p::Term) {
+        match t {
+            p::Term::Var(v) if !bound.iter().any(|n| n == &v.name) => f(v, bound),
+            p::Term::App(_, args) | p::Term::Pair(args) => {
+                for a in args {
+                    ct(bound, f, a);
+                }
+            }
+            p::Term::AlgApp(_, a, b) | p::Term::Diff(a, b) | p::Term::BinOp(_, a, b) => {
+                ct(bound, f, a);
+                ct(bound, f, b);
+            }
+            p::Term::PatMatch(inner) => ct(bound, f, inner),
+            _ => {}
+        }
+    }
+    fn ca(bound: &[String], f: &mut dyn FnMut(&p::VarSpec, &[String]), a: &p::Atom) {
+        use p::Atom::*;
+        match a {
+            Eq(l, r) | Less(l, r) | LessMset(l, r) | Subterm(l, r) => {
+                ct(bound, f, l);
+                ct(bound, f, r);
+            }
+            Action(fa, t) => {
+                for arg in &fa.args {
+                    ct(bound, f, arg);
+                }
+                ct(bound, f, t);
+            }
+            Last(t) => ct(bound, f, t),
+            Pred(fa) => {
+                for arg in &fa.args {
+                    ct(bound, f, arg);
+                }
+            }
+        }
+    }
+    fn cf(bound: &mut Vec<String>, f: &mut dyn FnMut(&p::VarSpec, &[String]), formula: &p::Formula) {
+        use p::Formula::*;
+        match formula {
+            True | False => {}
+            Atom(a) => ca(bound, f, a),
+            Not(g) => cf(bound, f, g),
+            And(a, b) | Or(a, b) | Implies(a, b) | Iff(a, b) => {
+                cf(bound, f, a);
+                cf(bound, f, b);
+            }
+            Forall(vs, body) | Exists(vs, body) => {
+                let saved = bound.len();
+                for v in vs {
+                    bound.push(v.name.clone());
+                }
+                cf(bound, f, body);
+                bound.truncate(saved);
+            }
+        }
+    }
+    let mut bound = Vec::new();
+    cf(&mut bound, f, formula);
 }
 
 fn term(t: &p::Term) -> Result<tamarin_theory::sapic::SapicTerm, ConvertError> {

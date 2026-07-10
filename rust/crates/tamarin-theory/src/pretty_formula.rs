@@ -750,7 +750,7 @@ fn allocate_formula_binders_refs(
         // 4th element = source_idx (predicate-fix `Bind`): carry the parsed
         // var's idx so `lookup_display` can resolve body-var occurrences by
         // full identity (name, idx, sort) — distinguishing fresh `x` vs `x.1`
-        // in `_restrict`/predicate rendering (b6fc7919).
+        // in `_restrict`/predicate rendering.
         out.push((v.name.clone(), v.sort, display, v.idx));
     }
     out
@@ -1372,50 +1372,23 @@ pub fn term_to_doc(t: &p::Term, scope: &[Bind]) -> crate::pretty_hpj::Doc {
 /// lead/finish/separator.  The AC-op symbol carries NO surrounding spaces
 /// (HS `punctuate (text sepa)` with `sepa = "++"`/`"*"`/`"⊕"`/`"%+"`).
 fn ac_op_doc(sym: &str, flat: &[&p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
-    use crate::pretty_hpj::{self as hpj, Doc};
-    let n = flat.len();
-    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
-    parts.push(Doc::text("("));
-    for (i, t) in flat.iter().enumerate() {
-        let mut d = term_to_doc(t, scope);
-        if i + 1 < n {
-            d = d.beside(Doc::text(sym));
-        }
-        parts.push(d.nest(1));
-    }
-    parts.push(Doc::text(")"));
-    hpj::fcat(parts)
+    crate::pretty_hpj::fcat_bracketed("(", sym, ")", flat, |t| term_to_doc(t, scope))
 }
 
 /// HS `ppTerms ", " 1 "<" ">" flat` (Term/Term.hs:288-290) — a fcat of
 /// `text "<"`, each element `nest 1`'d and comma-suffixed (except last),
 /// and `text ">"`.
 fn pair_doc(flat: &[&p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
-    use crate::pretty_hpj::{self as hpj, Doc};
-    let n = flat.len();
-    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
-    parts.push(Doc::text("<"));
-    for (i, t) in flat.iter().enumerate() {
-        // HS punctuates with `text ", "`, so all but the last get a
-        // trailing ", "; then each is `nest 1`.
-        let mut d = term_to_doc(t, scope);
-        if i + 1 < n {
-            d = d.beside(Doc::text(", "));
-        }
-        parts.push(d.nest(1));
-    }
-    parts.push(Doc::text(">"));
-    hpj::fcat(parts)
+    // HS punctuates with `text ", "`, so all but the last element get a
+    // trailing ", "; then each is `nest 1`.
+    crate::pretty_hpj::fcat_bracketed("<", ", ", ">", flat, |t| term_to_doc(t, scope))
 }
 
 /// HS `ppFun f ts = text (f ++ "(") <> fsep (punctuate comma (map ppTerm ts))
 /// <> text ")"` (Term/Term.hs:295-296), over a slice of `&Term` so callers
 /// (incl. the boxed-pair binary shapes) need not clone the subtrees.
 fn fun_doc_refs(name: &str, args: &[&p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
-    use crate::pretty_hpj::{self as hpj, Doc};
-    let arg_docs: Vec<Doc> = args.iter().map(|a| term_to_doc(a, scope)).collect();
-    let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
-    Doc::text(format!("{}(", name)).beside(body).beside(Doc::text(")"))
+    crate::pretty_hpj::fun_app_doc(name, args, |a| term_to_doc(a, scope))
 }
 
 /// As `fun_doc_refs`, for callers holding an owned `&[p::Term]`.
@@ -1563,19 +1536,7 @@ fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty
 
 /// HS `ppTerms ", " 1 "<" ">"` for `GTerm` (mirror of `pair_doc`).
 fn gpair_doc(flat: &[&crate::guarded::GTerm], scope: &[Vec<Bind>]) -> crate::pretty_hpj::Doc {
-    use crate::pretty_hpj::{self as hpj, Doc};
-    let n = flat.len();
-    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
-    parts.push(Doc::text("<"));
-    for (i, t) in flat.iter().enumerate() {
-        let mut d = gterm_to_doc(t, scope);
-        if i + 1 < n {
-            d = d.beside(Doc::text(", "));
-        }
-        parts.push(d.nest(1));
-    }
-    parts.push(Doc::text(">"));
-    hpj::fcat(parts)
+    crate::pretty_hpj::fcat_bracketed("<", ", ", ">", flat, |t| gterm_to_doc(t, scope))
 }
 
 /// HS `ppTerms (ppACOp o) 1 "(" ")"` for `GTerm` (mirror of `ac_op_doc`).
@@ -1584,19 +1545,7 @@ fn gac_op_doc(
     flat: &[&crate::guarded::GTerm],
     scope: &[Vec<Bind>],
 ) -> crate::pretty_hpj::Doc {
-    use crate::pretty_hpj::{self as hpj, Doc};
-    let n = flat.len();
-    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
-    parts.push(Doc::text("("));
-    for (i, t) in flat.iter().enumerate() {
-        let mut d = gterm_to_doc(t, scope);
-        if i + 1 < n {
-            d = d.beside(Doc::text(sym));
-        }
-        parts.push(d.nest(1));
-    }
-    parts.push(Doc::text(")"));
-    hpj::fcat(parts)
+    crate::pretty_hpj::fcat_bracketed("(", sym, ")", flat, |t| gterm_to_doc(t, scope))
 }
 
 /// HS `ppFun f ts` for `GTerm`, over a slice of `&GTerm` so callers (incl.
@@ -1606,10 +1555,7 @@ fn gfun_doc_refs(
     args: &[&crate::guarded::GTerm],
     scope: &[Vec<Bind>],
 ) -> crate::pretty_hpj::Doc {
-    use crate::pretty_hpj::{self as hpj, Doc};
-    let arg_docs: Vec<Doc> = args.iter().map(|a| gterm_to_doc(a, scope)).collect();
-    let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
-    Doc::text(format!("{}(", name)).beside(body).beside(Doc::text(")"))
+    crate::pretty_hpj::fun_app_doc(name, args, |a| gterm_to_doc(a, scope))
 }
 
 /// As `gfun_doc_refs`, for callers holding an owned `&[GTerm]`.

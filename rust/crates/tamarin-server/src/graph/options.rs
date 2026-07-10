@@ -139,10 +139,10 @@ mod tests {
 
     #[test]
     fn full_query_mirrors_getoptions() {
-        // Mirrors the test_suggestion. The UI sends numeric simplification=2,
-        // which HS derived `Read` for SimplificationLevel cannot parse (only
-        // SL0..SL3), so it falls back to SL2. The presence flags flip their
-        // respective options off (or on, for clustering).
+        // The UI sends numeric simplification=2, which HS derived `Read` for
+        // SimplificationLevel cannot parse (only SL0..SL3), so it falls back to
+        // SL2. The presence flags flip their respective options off (or on, for
+        // clustering).
         let o = graph_options_from_query(
             "simplification=2&clustering=true&uncompress=&unabbreviate=&no-auto-sources=",
         );

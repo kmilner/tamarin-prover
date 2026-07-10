@@ -38,10 +38,10 @@ pub fn norm(maude: &MaudeHandle, t: &LNTerm) -> Result<LNTerm, MaudeError> {
 /// — neither contains `one`, `DH_neutral`, nested products, or invalid
 /// patterns — even though Maude's `reduce` would canonicalise them to
 /// the same AC form.  Using `maude.reduce(t) == t` as the NF predicate
-/// (the previous Rust behaviour) wrongly flagged AC-reordered terms as
-/// "creates non-normal", over-filtering `simpMinimize` arms in
-/// `substCreatesNonNormalTerms` and causing wrong-verified outcomes on
-/// DH protocols (JKL_TS2_2004{,_KI_wPFS} key-secrecy lemmas).
+/// would wrongly flag AC-reordered terms as "creates non-normal",
+/// over-filtering `simpMinimize` arms in `substCreatesNonNormalTerms`
+/// and causing wrong-verified outcomes on DH key-secrecy lemmas
+/// (JKL_TS2_2004{,_KI_wPFS}).
 ///
 /// HS-faithful pattern set (`nfViaHaskell` lines 60-99):
 ///   - irreducible top: walk subterms
@@ -100,6 +100,22 @@ fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &FunSig) -> bool {
             //    no-AC matcher is sufficient.  See subterm_rule.rs and
             //    builtin.rs.
             for rule in &msig.st_rules {
+                // Head-symbol + arity precheck reproducing match_raw's first
+                // step for concrete-headed patterns (unification.rs `match_raw`,
+                // NoEq arm: `tf == pf && targs.len() == pargs.len()`).  When the
+                // LHS is an `App`, a mismatched head or arity means `match_raw`
+                // yields `NoUnifier` (for NoEq/List patterns) — a definitive
+                // no-match — so skip the full `rule_applies` call.  Ac/C-headed
+                // patterns are still safe to skip on head/arity mismatch: they
+                // raise `NeedsAc`, which `solve_match_lterm_no_ac` folds to
+                // `None`, so such rules never fire in `go_nf` regardless.  A
+                // non-`App` LHS (bare Var/Lit) is not pre-skipped — the `if let`
+                // simply falls through to `rule_applies`.
+                if let Term::App(lhs_head, lhs_args) = &rule.lhs {
+                    if lhs_head != sym || lhs_args.len() != args.len() {
+                        continue;
+                    }
+                }
                 if rule_applies(t, &rule.lhs, &rule.rhs) {
                     return false;
                 }

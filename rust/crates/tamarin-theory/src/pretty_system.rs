@@ -601,8 +601,7 @@ mod tests {
     // the web HtmlDoc width (100/67 with entity fill-widths).  Expected
     // bytes extracted verbatim from the cached HS response for
     // `examples/ake/dh/UM_three_pass.spthy` (`&nbsp;`→space, `<br/>`→\n,
-    // entities decoded, hl-spans stripped).  Before the pane rewrite RS
-    // rendered the whole term one-line (flat `pretty_lnterm` atom).
+    // entities decoded, hl-spans stripped).
     #[test]
     fn um3_subst_term_wraps_like_hs() {
         use tamarin_parser::ast as p;

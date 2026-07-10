@@ -36,8 +36,11 @@ use crate::guarded::{subst_guarded, VarSubst};
 /// Mirrors Haskell's `renamePrecise` over the `System` record.
 pub fn rename_precise_system(sys: &mut System) {
     // Rewrites every free LVar through a deterministic alpha-rename;
-    // the resulting max-var-idx is almost always smaller.  Invalidate.
+    // the resulting max-var-idx is almost always smaller.  Invalidate
+    // BOTH caches — the node rewrite below (`sys.nodes = ...`) alpha-
+    // renames node ids + rule vars, so the node component drops too.
     sys.invalidate_max_var_idx_cache();
+    sys.invalidate_node_max_cache();
     let mut state = RenameState::new();
 
     // ----------------------------------------------------------------------

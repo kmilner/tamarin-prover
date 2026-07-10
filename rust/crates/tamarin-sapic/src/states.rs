@@ -376,13 +376,11 @@ fn annotate_each_pure_states(
         }
         Process::Action(ac, an, body) => {
             match &ac {
-                // new StateChannel with isStateChannel cid: if the cell is
-                // pure, mark pure_state and add cid to pureStates for the body.
-                // Bind cid via `if let Some(..)` (dropping the `.unwrap()`);
-                // the `.clone()` is unavoidable since `an` is consumed by
-                // `..an` below.  A `New(_)` with no state channel takes the
-                // `else` (recurse into body), exactly as the prior
-                // `if an.is_state_channel.is_some()` guard + default arm did.
+                // new StateChannel (an.is_state_channel is Some): if the cell is
+                // pure, mark pure_state and add cid to pureStates for the body;
+                // otherwise HS does NOT recurse into the body.  The clone is needed
+                // because `an` is consumed by `..an` below.  A `New(_)` with no
+                // state channel recurses into the body unchanged (default `_ =>` arm).
                 SapicAction::New(_) => {
                     if let Some(cid) = &an.is_state_channel {
                         let cid = cid.clone();

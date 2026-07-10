@@ -278,13 +278,12 @@ impl LazyRight {
 // thunk.  Omitting the impl turns any stray direct deep-clone of a
 // `LazyRight` value into a compile error rather than a runtime panic.
 
-// NOTE (task #20): there is deliberately NO whole-`Doc` `force()` helper.
-// An earlier version forced every `LazyUnion`'s right branch at the head
-// of `sep1`/`fill1`/`get`/`get1` (`match force(d)`), which RAN the
-// deferred `aboveNest`/`fill` reconstructions even for layouts that never
-// break — O(n²) reduction on large docs.  Every consumer now has explicit
-// `LazyUnion`/`Deferred` arms that force the memoised thunk only on the
-// path that actually needs it, matching HS's call-by-need `best`.
+// There is deliberately no whole-`Doc` `force()` helper: forcing a
+// `LazyUnion`'s right branch eagerly runs the deferred `aboveNest`/`fill`
+// reconstruction even for layouts that never break, degenerating
+// reduction to O(n²) on large docs.  Every consumer must force the
+// memoised thunk only on the path that actually needs it, matching HS's
+// call-by-need `best`.
 
 /// Wrap a `get`/`get1` reduction step as a memoised `Deferred` node, so
 /// it is only run when `fits`/`lay` walks into it.
@@ -638,16 +637,6 @@ pub fn postprocess_html(s: &str) -> String {
     out
 }
 
-impl Doc {
-    /// HS `renderHtmlDoc = postprocessHtmlDoc . render . getHtmlDoc`
-    /// (`Html.hs:151-153`).  Must be called with an [`HtmlDocGuard`] active so
-    /// the doc was built with escaped content + zero-width markup; `render`
-    /// uses the process display width (100/67 on the web server).
-    pub fn render_html(self) -> String {
-        postprocess_html(&self.render())
-    }
-}
-
 // ============================================================================
 // Smart constructors (internal)
 // ============================================================================
@@ -879,6 +868,45 @@ pub fn fsep(ds: Vec<Doc>) -> Doc { fill(true, ds) }
 /// HS `fcat` — fill-style paragraph, no separator.
 pub fn fcat(ds: Vec<Doc>) -> Doc { fill(false, ds) }
 
+/// HS `ppTerms sepa n lead finish ts` (Term/Term.hs:288-290): an `fcat` of
+/// `text lead`, each element rendered and `nest(1)`'d (all but the last
+/// `sep`-suffixed), and `text finish`.  Shared by the pair (`<`/`, `/`>`)
+/// and AC-op (`(`/op/`)`) builders across the parser-AST, GTerm and SAPIC
+/// term renderers — they differ only in these three strings and the
+/// per-element `render` fn, so extracting the common Doc shape keeps every
+/// caller byte-identical while removing the copy-paste.
+pub fn fcat_bracketed<T>(
+    lead: &str,
+    sep: &str,
+    finish: &str,
+    items: &[&T],
+    render: impl Fn(&T) -> Doc,
+) -> Doc {
+    let n = items.len();
+    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+    parts.push(Doc::text(lead));
+    for (i, t) in items.iter().enumerate() {
+        let mut d = render(t);
+        if i + 1 < n {
+            d = d.beside(Doc::text(sep));
+        }
+        parts.push(d.nest(1));
+    }
+    parts.push(Doc::text(finish));
+    fcat(parts)
+}
+
+/// HS `ppFun f ts = text (f ++ "(") <> fsep (punctuate comma (map ppTerm ts))
+/// <> text ")"` (Term/Term.hs:295-296).  Shared by the parser-AST, GTerm and
+/// SAPIC function-application renderers — they differ only in the per-element
+/// `render` fn, so the common `text(name++"(") <> fsep(punctuate ',' …) <>
+/// text ")"` Doc shape lives here (HS `comma = char ','`).
+pub fn fun_app_doc<T>(name: &str, args: &[&T], render: impl Fn(&T) -> Doc) -> Doc {
+    let arg_docs: Vec<Doc> = args.iter().map(|a| render(a)).collect();
+    let body = fsep(punctuate(Doc::char(','), arg_docs));
+    Doc::text(format!("{}(", name)).beside(body).beside(Doc::text(")"))
+}
+
 /// HS `hsep = foldr (\p q -> Beside p True q) empty` then reduce
 /// (HughesPJ.hs:500).  RIGHT fold, no Empty-filtering — the `beside_`
 /// smart constructor handles Empty.  Using a LEFT fold (or pre-filtering
@@ -939,9 +967,9 @@ fn sep1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
                 above_nest((*q).clone(), false, k, reduce_doc(vcat(ys)))
             })
         }
-        // Keep the right branch a thunk: forcing it here (the old
-        // `force()`-at-head) ran its `aboveNest`/`beside` reconstruction
-        // even for layouts that never break — see `get`'s LazyUnion arm.
+        // Keep the right branch a thunk: forcing it eagerly here would run its
+        // `aboveNest`/`beside` reconstruction even for layouts that never break —
+        // see `get`'s LazyUnion arm.
         Doc::LazyUnion(p, rt) => {
             let left = sep1(g, (*p).clone(), k, ys.clone());
             lazy_union(left, move || {
@@ -1014,9 +1042,8 @@ fn fill1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
                 above_nest((*q).clone(), false, k, fill(g, ys))
             })
         }
-        // Keep the right branch a thunk (see `sep1`/`get`): the old
-        // `force()`-at-head ran it eagerly, degenerating fill reduction to
-        // O(n²) on large docs.
+        // Keep the right branch a thunk (see `sep1`/`get`): forcing it eagerly
+        // here degenerates fill reduction to O(n²) on large docs.
         Doc::LazyUnion(p, rt) => {
             let left = fill1(g, (*p).clone(), k, ys.clone());
             lazy_union(left, move || {
@@ -1503,10 +1530,8 @@ mod tests {
         // where each numbered item is `text i <> ". " <> vcat[prettyEq..]`
         // at nest 4.  The `". " <>` BESIDE onto the multi-line vcat measures
         // the inner fcat's ribbon from the OUTER (numbered) line start, so an
-        // 11-tuple `<x.16, …, x.26>` breaks BEFORE x.26 (gluing `>`).  The
-        // earlier RS code rendered each binding STANDALONE (entry.nest(7)),
-        // measuring ribbon from the var column, which packed x.26 and put `>`
-        // on its own line.  Confirms the engine reproduces the HS structure
+        // 11-tuple `<x.16, …, x.26>` breaks BEFORE x.26 (gluing `>`).
+        // Confirms the engine reproduces the HS structure
         // byte-for-byte (verified against Text.PrettyPrint.HughesPJ ll=110).
         // term_doc = pair_doc(11 elements) = fcat([ "<", e0", ", ... e10, ">" ]).
         // Elements x.16..x.26 are 4 chars each, nest(1)'d, comma-suffixed.

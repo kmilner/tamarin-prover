@@ -965,17 +965,74 @@ pub fn subst_free_guarded(g: &Guarded, s: &[(p::VarSpec, u32)]) -> Guarded {
 /// decomposed on insertion anyway); this requires `gconj` to be
 /// idempotent — see the note on `gconj`.  Mirrors HS 150f5eba + follow-up.
 pub fn normalise_guarded(g: &Guarded) -> Guarded {
+    // Route through the COW helper so borrow-callers get the same logic with
+    // no duplication; only cost vs the COW path is the top-level clone when
+    // nothing changed.
+    normalise_guarded_cow(g).unwrap_or_else(|| g.clone())
+}
+
+/// Copy-on-write variant of [`normalise_guarded`]: returns `None` when
+/// normalisation leaves `g` structurally unchanged (so an owning caller can
+/// reuse `g` by move with zero allocation), `Some(rebuilt)` otherwise.  The
+/// `Some` value is BYTE-IDENTICAL to `normalise_guarded(g)` — same
+/// flatten/dedup/order.  Mirrors the `subst_guarded_cow` /
+/// `cac_rec_guarded_cow` convention (recursion returns `None` when all
+/// children are unchanged).
+pub fn normalise_guarded_cow(g: &Guarded) -> Option<Guarded> {
     match g {
-        Guarded::Atom(_) => g.clone(),
-        Guarded::Disj(items) => Guarded::Disj(normalise_disj_list(items)),
-        Guarded::Conj(items) => gconj(items.iter().map(normalise_guarded).collect()),
-        Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
-            qua: qua.clone(),
-            vars: vars.clone(),
-            guards: guards.clone(),
-            body: Box::new(normalise_guarded(body)),
-        },
+        // `normalise_guarded`'s Atom arm is `g.clone()` → always unchanged.
+        Guarded::Atom(_) => None,
+        Guarded::Disj(items) => normalise_disj_list_cow(items).map(Guarded::Disj),
+        Guarded::Conj(items) => {
+            // Normalise children first (COW), then re-run the `gconj`
+            // smart-constructor step (flatten nested Conj / absorb gfalse /
+            // dedup / singleton-unwrap).  When no child changed AND `gconj`
+            // is a structural no-op on the (already-normalised) children, the
+            // whole node is unchanged.  Otherwise the rebuild is exactly
+            // `gconj(children)` — identical to the eager
+            // `gconj(items.iter().map(normalise_guarded).collect())`.
+            let mapped = cow_map_vec(items.as_slice(), normalise_guarded_cow);
+            let children: &[Guarded] = mapped.as_deref().unwrap_or(items.as_slice());
+            if mapped.is_none() && gconj_is_structural_noop(children) {
+                None
+            } else {
+                Some(gconj(children.to_vec()))
+            }
+        }
+        Guarded::GGuarded { qua, vars, guards, body } =>
+            // Only `body` can change; qua/vars/guards are cloned verbatim.
+            normalise_guarded_cow(body).map(|b| Guarded::GGuarded {
+                qua: qua.clone(),
+                vars: vars.clone(),
+                guards: guards.clone(),
+                body: Box::new(b),
+            }),
     }
+}
+
+/// `gconj(items) == Guarded::Conj(items)` — i.e. the `gconj` smart
+/// constructor is a structural no-op on this (already child-normalised)
+/// list.  True iff none of `gconj`'s transformations fire: no nested-`Conj`
+/// child to flatten (including an empty `Conj` = `gtrue`, which `gconj`
+/// drops), no `gfalse` (`Disj([])`) child to absorb, no duplicate to `nub`,
+/// and length != 1 (which would singleton-unwrap).  Keep in exact lock-step
+/// with `gconj`.
+fn gconj_is_structural_noop(items: &[Guarded]) -> bool {
+    if items.len() == 1 {
+        return false;
+    }
+    for (i, x) in items.iter().enumerate() {
+        if matches!(x, Guarded::Conj(_)) {
+            return false; // flatten (incl. empty Conj = gtrue drop)
+        }
+        if matches!(x, Guarded::Disj(v) if v.is_empty()) {
+            return false; // gfalse absorption
+        }
+        if items[..i].contains(x) {
+            return false; // nub drops a duplicate
+        }
+    }
+    true
 }
 
 /// Normalise the disjunct list of a stored disjunction WITHOUT changing
@@ -986,14 +1043,56 @@ pub fn normalise_guarded(g: &Guarded) -> Guarded {
 /// Port of HS `normaliseDisjList` (150f5eba); see that commit for why
 /// full `gdisj` here desynchronises the twin stores (gcm livelock).
 pub fn normalise_disj_list(items: &[Guarded]) -> Vec<Guarded> {
+    normalise_disj_list_cow(items).unwrap_or_else(|| items.to_vec())
+}
+
+/// Copy-on-write variant of [`normalise_disj_list`]: `None` when the
+/// constructor-preserving normalisation leaves the disjunct list unchanged
+/// (every disjunct normalises in place, none is a nested `Disj` to flatten,
+/// no duplicate to drop), `Some(rebuilt)` otherwise.  BYTE-IDENTICAL to
+/// `normalise_disj_list(items)` in the `Some` case.
+fn normalise_disj_list_cow(items: &[Guarded]) -> Option<Vec<Guarded>> {
+    // Normalise each disjunct (COW); `children` is the normalised list — the
+    // originals when `mapped` is `None` (all disjuncts unchanged).
+    let mapped = cow_map_vec(items, normalise_guarded_cow);
+    let children: &[Guarded] = mapped.as_deref().unwrap_or(items);
+    if mapped.is_none() && disj_flatten_is_structural_noop(children) {
+        None
+    } else {
+        Some(flatten_dedup_disj(children))
+    }
+}
+
+/// `flatten_dedup_disj(items) == items` — the constructor-preserving disjunct
+/// normalisation (one-level flatten of a nested `Disj`, then `nub`) is a
+/// no-op.  True iff no disjunct is itself a `Disj` (any `Disj` has its wrapper
+/// spliced away) and there is no duplicate.  Lock-step with
+/// `flatten_dedup_disj`.
+fn disj_flatten_is_structural_noop(items: &[Guarded]) -> bool {
+    for (i, x) in items.iter().enumerate() {
+        if matches!(x, Guarded::Disj(_)) {
+            return false; // one-level flatten removes the Disj wrapper
+        }
+        if items[..i].contains(x) {
+            return false; // nub drops a duplicate
+        }
+    }
+    true
+}
+
+/// One-level flatten of nested `Disj`s + duplicate drop over an
+/// already-normalised disjunct list.  This is the outer-loop body of
+/// `normalise_disj_list` factored out so it runs on the COW-normalised
+/// children; BYTE-IDENTICAL to that original loop (same push/dedup order).
+fn flatten_dedup_disj(children: &[Guarded]) -> Vec<Guarded> {
     fn push(g: Guarded, out: &mut Vec<Guarded>) {
         if !out.contains(&g) { out.push(g); }
     }
     let mut out: Vec<Guarded> = Vec::new();
-    for it in items {
-        match normalise_guarded(it) {
-            Guarded::Disj(ds) => for d in ds { push(d, &mut out); },
-            g => push(g, &mut out),
+    for it in children {
+        match it {
+            Guarded::Disj(ds) => for d in ds { push(d.clone(), &mut out); },
+            g => push(g.clone(), &mut out),
         }
     }
     out
@@ -1005,9 +1104,31 @@ pub fn normalise_disj_list(items: &[Guarded]) -> Vec<Guarded> {
 /// in lockstep with its `Goal::Disj` twin.  Port of HS
 /// `normaliseStoredFormula` (150f5eba).
 pub fn normalise_stored_formula(g: &Guarded) -> Guarded {
+    normalise_stored_formula_cow(g).unwrap_or_else(|| g.clone())
+}
+
+/// Copy-on-write variant of [`normalise_stored_formula`]: `None` when
+/// unchanged, `Some(rebuilt)` (BYTE-IDENTICAL to
+/// `normalise_stored_formula(g)`) otherwise.  Like `normalise_stored_formula`,
+/// a TOP-LEVEL `Disj` keeps its constructor (via the constructor-preserving
+/// `normalise_disj_list_cow`) so it stays in lockstep with its `Goal::Disj`
+/// twin.
+pub fn normalise_stored_formula_cow(g: &Guarded) -> Option<Guarded> {
     match g {
-        Guarded::Disj(items) => Guarded::Disj(normalise_disj_list(items)),
-        _ => normalise_guarded(g),
+        Guarded::Disj(items) => normalise_disj_list_cow(items).map(Guarded::Disj),
+        _ => normalise_guarded_cow(g),
+    }
+}
+
+/// Owned fast path for [`normalise_stored_formula`]: consumes `g`, returning
+/// it by MOVE (zero allocation) when normalisation is a no-op, else the
+/// rebuilt tree.  For callers that own their input and immediately reassign
+/// it.  The returned value is BYTE-IDENTICAL to
+/// `normalise_stored_formula(&g)`.
+pub fn normalise_stored_formula_owned(g: Guarded) -> Guarded {
+    match normalise_stored_formula_cow(&g) {
+        Some(n) => n,
+        None => g,
     }
 }
 
@@ -1982,48 +2103,60 @@ fn subst_gterm_slice(args: &std::sync::Arc<[GTerm]>, s: &VarSubst)
     cow_map_arc(args, |a| subst_gterm_cow(a, s))
 }
 
-/// Find the maximum variable idx used in a guarded formula. Used
-/// to allocate fresh indices without collisions.
-pub fn max_var_idx(g: &Guarded) -> u64 {
-    fn rec_term(t: &GTerm, m: &mut u64) {
+/// Read-only visitor over every `BVar::Free` leaf of a guarded formula,
+/// covering the identical leaf set that `map_lvars_in_guarded` remaps
+/// (walk Disj/Conj/GGuarded, hit each Free leaf in guards + body). The
+/// single free-var fold shared by [`max_var_idx`]/[`min_var_idx`] so the
+/// idx-bound walks stay in lockstep with the freshen/shift mapper without
+/// rebuilding the tree.
+pub fn for_each_free_var_in_guarded<F: FnMut(&p::VarSpec)>(g: &Guarded, f: &mut F) {
+    fn rec_term<F: FnMut(&p::VarSpec)>(t: &GTerm, f: &mut F) {
         match t {
-            GTerm::Var(BVar::Free(v)) if v.idx > *m => { *m = v.idx; }
+            GTerm::Var(BVar::Free(v)) => f(v),
             GTerm::Var(BVar::Bound(_)) => {}
             GTerm::App(_, args) | GTerm::Pair(args) => {
-                for a in args.iter() { rec_term(a, m); }
+                for a in args.iter() { rec_term(a, f); }
             }
             GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
-                rec_term(a, m); rec_term(b, m);
+                rec_term(a, f); rec_term(b, f);
             }
-            GTerm::PatMatch(t) => rec_term(t, m),
+            GTerm::PatMatch(t) => rec_term(t, f),
             _ => {}
         }
     }
-    fn rec_atom(a: &GAtom, m: &mut u64) {
+    fn rec_atom<F: FnMut(&p::VarSpec)>(a: &GAtom, f: &mut F) {
         match a {
             GAtom::Eq(x, y) | GAtom::Less(x, y) | GAtom::LessMset(x, y)
-            | GAtom::Subterm(x, y) => { rec_term(x, m); rec_term(y, m); }
-            GAtom::Action(f, t) => {
-                for arg in &f.args { rec_term(arg, m); }
-                rec_term(t, m);
+            | GAtom::Subterm(x, y) => { rec_term(x, f); rec_term(y, f); }
+            GAtom::Action(fa, t) => {
+                for arg in &fa.args { rec_term(arg, f); }
+                rec_term(t, f);
             }
-            GAtom::Last(t) => rec_term(t, m),
-            GAtom::Pred(f) => for a in &f.args { rec_term(a, m); },
+            GAtom::Last(t) => rec_term(t, f),
+            GAtom::Pred(fa) => for a in &fa.args { rec_term(a, f); },
         }
     }
-    fn rec(g: &Guarded, m: &mut u64) {
+    fn rec<F: FnMut(&p::VarSpec)>(g: &Guarded, f: &mut F) {
         match g {
-            Guarded::Atom(a) => rec_atom(a, m),
-            Guarded::Disj(xs) | Guarded::Conj(xs) => for x in xs { rec(x, m); },
+            Guarded::Atom(a) => rec_atom(a, f),
+            Guarded::Disj(xs) | Guarded::Conj(xs) => for x in xs { rec(x, f); },
             Guarded::GGuarded { guards, body, .. } => {
                 // Bindings carry no idx in the DeBruijn representation.
-                for a in guards { rec_atom(a, m); }
-                rec(body, m);
+                for a in guards { rec_atom(a, f); }
+                rec(body, f);
             }
         }
     }
+    rec(g, f);
+}
+
+/// Find the maximum variable idx used in a guarded formula. Used
+/// to allocate fresh indices without collisions.
+pub fn max_var_idx(g: &Guarded) -> u64 {
     let mut m = 0u64;
-    rec(g, &mut m);
+    for_each_free_var_in_guarded(g, &mut |v: &p::VarSpec| {
+        if v.idx > m { m = v.idx; }
+    });
     m
 }
 
@@ -2033,13 +2166,9 @@ pub fn max_var_idx(g: &Guarded) -> u64 {
 /// folds frees with `minMaxSingleton`), e.g. the `matchToGoal`
 /// whole-source `rename` rebase in `sources.rs`.
 pub fn min_var_idx(g: &Guarded) -> Option<u64> {
-    // Reuse `map_lvars_in_guarded`'s Free-leaf walk as a side-effect
-    // visitor so the leaf coverage stays in lockstep with the mapper
-    // used by the freshen/shift passes.
     let mut m: Option<u64> = None;
-    let _ = map_lvars_in_guarded(g, |v: &tamarin_parser::ast::VarSpec| {
+    for_each_free_var_in_guarded(g, &mut |v: &p::VarSpec| {
         m = Some(m.map_or(v.idx, |c| c.min(v.idx)));
-        v.clone()
     });
     m
 }
@@ -2538,11 +2667,10 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    /// Regression test for the binder-sort-mismatch bug found during the
-    /// DeBruijn migration: the parser produces `Ex #i. P @ i` with the
-    /// binder as `Node` and the body's `i` as `Untagged`.  `close_subst`
-    /// must match by `(name, idx)` only — full `VarSpec` equality would
-    /// leave the body's `i` Free, breaking `is_closed` / `ginduct`.
+    /// The parser produces `Ex #i. P @ i` with the binder as `Node` and
+    /// the body's `i` as `Untagged`.  `close_subst` must match by
+    /// `(name, idx)` only — full `VarSpec` equality would leave the body's
+    /// `i` Free, breaking `is_closed` / `ginduct`.
     #[test]
     fn injectivity_check_ginduct_succeeds() {
         let f = parse_formula_str("not (Ex id #i #j #k. Initiated(id) @ i & Removed(id) @ j & Copied(id) @ k & #i < #j & #j < #k)").expect("parse");
@@ -2958,8 +3086,8 @@ mod tests {
     }
 
     /// `gdisj` deduplicates syntactically-equal items.  Same as above,
-    /// for disjunction.  Bug from #194 (clusters): without this dedup,
-    /// `verify_checksign_test`-class SplitG variants doubled up.
+    /// for disjunction.  Without this dedup, `verify_checksign_test`-class
+    /// SplitG variants double up.
     #[test]
     fn gdisj_dedupes_syntactic_duplicates() {
         let a = g("Last(#i)").unwrap();
@@ -3006,12 +3134,10 @@ mod tests {
     }
 
     /// `gdisj` recursively flattens ARBITRARILY deeply nested `Disj`s.
-    /// Pinpoints commit 105d3f71's behaviour: the HS `gdisj` helper
-    /// `flatten (GDisj disj) = concatMap flatten $ getDisj disj`
-    /// (Guarded.hs:423-435) unwraps every level, not just one.  A prior
-    /// RS version unwrapped only ONE level — a 5-way `∨` parsed as a
-    /// binary-Or chain (`Disj(Disj(Disj(Disj(a, b), c), d), e)`) would
-    /// land as a 2-alt Disj goal instead of HS's 5-alt one.
+    /// Mirrors HS `gdisj`'s `flatten (GDisj disj) = concatMap flatten $
+    /// getDisj disj` (Guarded.hs:423-435), which unwraps every level, not
+    /// just one — a 5-way `∨` parsed as a binary-Or chain must flatten to a
+    /// single 5-alt Disj goal.
     #[test]
     fn gdisj_deeply_nested_disj_flattens_to_5_alts() {
         let a = g("Last(#a)").unwrap();
@@ -3072,10 +3198,9 @@ mod tests {
     //     gnot (GGuarded All ss as gf) = gex  ss as (gnot gf)
     //     gnot (GGuarded Ex  ss as gf) = gall ss as (gnot gf)
     //
-    // The All↔Ex swap under negation is critical.  Past bugs:
-    //   #48 (gnot_atom for Action/Last/Pred) — proto-fact actions need
-    //     a specific Haskell-faithful negation shape.
-    //   #170 (TESLA::authentic nondeterminism) had a downstream impact.
+    // The All↔Ex swap under negation is critical: proto-fact actions need
+    // a specific Haskell-faithful negation shape, and getting this wrong
+    // has downstream nondeterminism impact on trace search.
     // =========================================================================
 
     /// `gnot ∘ gnot = id` (involution) for ground formulas.

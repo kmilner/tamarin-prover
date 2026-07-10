@@ -142,15 +142,28 @@ impl TheoryStore {
     /// — that's a ~1s cost (Maude boot + source precompute) but
     /// preserves the version-fork semantics.
     pub fn clone_at_new_idx(&self, src_idx: usize) -> Option<usize> {
+        // Drop the shared proof state — clone gets its own (rebuilt
+        // lazily).  See doc comment above.
+        self.clone_at_new_idx_with(src_idx, |_| None)
+    }
+
+    /// Shared body of [`clone_at_new_idx`] and
+    /// [`clone_at_new_idx_forking_proof_state`]: lock, clone the source
+    /// entry, allocate a fresh idx, mark it non-primary, and re-derive its
+    /// `proof_state` via `fork_proof` (the only line that differs between
+    /// the two public methods).
+    fn clone_at_new_idx_with(
+        &self,
+        src_idx: usize,
+        fork_proof: impl FnOnce(&Option<Arc<ProofState>>) -> Option<Arc<ProofState>>,
+    ) -> Option<usize> {
         let mut inner = self.inner.lock();
         let mut clone = inner.by_idx.get(&src_idx).cloned()?;
         let new_idx = inner.by_idx.keys().last().copied().unwrap_or(0) + 1;
         clone.idx = new_idx;
         clone.primary = false;
         clone.loaded_at = Local::now();
-        // Drop the shared proof state — clone gets its own (rebuilt
-        // lazily).  See doc comment above.
-        clone.proof_state = None;
+        clone.proof_state = fork_proof(&clone.proof_state);
         inner.by_idx.insert(new_idx, clone);
         Some(new_idx)
     }
@@ -167,18 +180,10 @@ impl TheoryStore {
     /// `putTheory` puts the *modified* `ClosedTheory` (with its full
     /// `IncrementalProof`) at the new idx — not a fresh one.
     pub fn clone_at_new_idx_forking_proof_state(&self, src_idx: usize) -> Option<usize> {
-        let mut inner = self.inner.lock();
-        let mut clone = inner.by_idx.get(&src_idx).cloned()?;
-        let new_idx = inner.by_idx.keys().last().copied().unwrap_or(0) + 1;
-        clone.idx = new_idx;
-        clone.primary = false;
-        clone.loaded_at = Local::now();
         // Fork the proof state if present — preserves the source tree's
         // shape under a new Arc.  If the source never materialised a
         // proof state, the clone starts from scratch (`None`).
-        clone.proof_state = clone.proof_state.as_ref().map(|ps| Arc::new(ps.fork()));
-        inner.by_idx.insert(new_idx, clone);
-        Some(new_idx)
+        self.clone_at_new_idx_with(src_idx, |ps| ps.as_ref().map(|p| Arc::new(p.fork())))
     }
 
     /// Replace the entry at `idx` in place, keeping the idx the same.

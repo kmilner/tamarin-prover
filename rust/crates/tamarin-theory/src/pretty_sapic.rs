@@ -177,18 +177,7 @@ fn pair_doc(
     flat: &[&SapicTerm],
     match_vars: Option<&std::collections::BTreeSet<SapicLVar>>,
 ) -> Doc {
-    let n = flat.len();
-    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
-    parts.push(Doc::text("<"));
-    for (i, t) in flat.iter().enumerate() {
-        let mut d = sapic_term_to_doc(t, match_vars);
-        if i + 1 < n {
-            d = d.beside(Doc::text(", "));
-        }
-        parts.push(d.nest(1));
-    }
-    parts.push(Doc::text(">"));
-    hpj::fcat(parts)
+    hpj::fcat_bracketed("<", ", ", ">", flat, |t| sapic_term_to_doc(t, match_vars))
 }
 
 /// HS `ppTerms (ppACOp o) 1 "(" ")" ts` (Term/Term.hs:273,288-290): like
@@ -199,18 +188,7 @@ fn ac_op_doc(
     flat: &[&SapicTerm],
     match_vars: Option<&std::collections::BTreeSet<SapicLVar>>,
 ) -> Doc {
-    let n = flat.len();
-    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
-    parts.push(Doc::text("("));
-    for (i, t) in flat.iter().enumerate() {
-        let mut d = sapic_term_to_doc(t, match_vars);
-        if i + 1 < n {
-            d = d.beside(Doc::text(sym));
-        }
-        parts.push(d.nest(1));
-    }
-    parts.push(Doc::text(")"));
-    hpj::fcat(parts)
+    hpj::fcat_bracketed("(", sym, ")", flat, |t| sapic_term_to_doc(t, match_vars))
 }
 
 /// HS `ppFun f ts = text (f ++ "(") <> fsep (punctuate comma (map ppTerm ts))
@@ -221,14 +199,7 @@ fn fun_doc(
     args: &[&SapicTerm],
     match_vars: Option<&std::collections::BTreeSet<SapicLVar>>,
 ) -> Doc {
-    let arg_docs: Vec<Doc> = args
-        .iter()
-        .map(|a| sapic_term_to_doc(a, match_vars))
-        .collect();
-    let body = hpj::fsep(hpj::punctuate(Doc::char(','), arg_docs));
-    Doc::text(format!("{}(", name))
-        .beside(body)
-        .beside(Doc::text(")"))
+    hpj::fun_app_doc(name, args, |a| sapic_term_to_doc(a, match_vars))
 }
 
 /// `render (prettyPattern' vs t)` (Process.hs:443-444): render a `ChIn`/`let`
@@ -269,8 +240,8 @@ fn pretty_sapic_fact(f: &crate::sapic::SapicLNFact) -> String {
 /// HS `prettyFact prettySapicTerm` (Fact.hs:539-546): `ppFact (showFactTag
 /// tag) ts = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ map
 /// prettySapicTerm ts`.  (SAPIC event facts never carry annotations, so the
-/// `<> ppAnn` suffix — empty for `S.null ann` — is omitted, matching the prior
-/// flat renderer and the committed gate.)
+/// `<> ppAnn` suffix — empty for `S.null ann` — is omitted here, matching the
+/// committed gate.)
 fn sapic_fact_to_doc(f: &crate::sapic::SapicLNFact) -> Doc {
     let name = crate::fact::show_fact_tag(&f.tag);
     let lead = format!("{name}(");

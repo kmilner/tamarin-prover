@@ -11,18 +11,9 @@ mod common;
 
 use common::*;
 
-/// We need a Maude binary for this test (the proof-step path boots
-/// Maude for the per-theory `ProofContext`).  Skip if not available.
-fn maude_available() -> bool {
-    for c in [
-        "/usr/local/bin/maude",
-        "/opt/homebrew/bin/maude",
-        "/usr/bin/maude",
-    ] {
-        if std::path::Path::new(c).exists() { return true; }
-    }
-    false
-}
+// We need a Maude binary for these tests (the proof-step path boots
+// Maude for the per-theory `ProofContext`); `common::maude_available`
+// is the shared skip-guard.
 
 #[tokio::test]
 async fn proof_step_simplify_returns_html_envelope() {

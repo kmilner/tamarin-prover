@@ -877,20 +877,9 @@ impl MaudeHandle {
         // Maude-allocated witness idxs to small idxs above just the relevant
         // domain.  Without this composition step the witness numbering diverges.
         //
-        // Historical divergence (pre-factoring, LAK06::noninjectiveagreementTAG):
-        // when RS sent the FULL eqs to Maude and composed each arm with the
-        // EMPTY substitution, the raw Maude-allocated witness idxs leaked:
-        //   - HS apply_eq_store call producing 9 substs used witness idxs
-        //     ~x.10..~x.14 for first applyBound batch (6 unifiers) and
-        //     ~x.27..~x.31 for second batch (1 unifier with different eqs).
-        //   - RS produced the same 9 substs but with witnesses ~x.39..~x.43
-        //     uniformly — because the local Maude counter was ensure_above
-        //     to clear x.38 in the input eqs.
-        //   - The resulting BTreeSet sort order of these alpha-equivalent
-        //     substs DIFFERED, flipping the perform_split case order
-        //     downstream → different `case_xor` chosen at split_case_N.
-        // Factoring (send AC residuals only, compose with `factored_m`) fixes
-        // this; the section below documents the current behavior.
+        // Factoring (send AC residuals only, compose with `factored_m` below) keeps
+        // witness idxs aligned with HS so alpha-equivalent substs sort identically
+        // and `perform_split` picks the same case order.
         //
         // HS `flattenUnif (subst, substs) = map (`composeVFresh` subst) substs`
         // (Unification.hs:147) composes each Maude arm with `subst = m`, the
@@ -976,7 +965,7 @@ impl MaudeHandle {
     /// treats **B (SUBJECT, right)** as ground (empirically confirmed;
     /// see the `match_eqs_const_subject` fix in eadeb1c4 and the twin
     /// fix to this function). So pattern must go LEFT — which is why
-    /// `pp_list(&pats)` (= `t2s` = each `eq.rhs`) is emitted first.
+    /// `pp_mterm_list(&pats)` (= `t2s` = each `eq.rhs`) is emitted first.
     ///
     /// NOTE the opposite field order from `Equal` as used by callers
     /// that pass `Equal { lhs = pattern, rhs = subject }`: HS's `Equal`
@@ -1021,15 +1010,13 @@ impl MaudeHandle {
         // `match in MSG : list(pats) <=? list(subjs) .`
         // Mirrors HS `matchCmd` (`Process.hs:227-229`): PATTERN on the
         // left (vars bind), SUBJECT on the right (ground).
-        let pp_list = |items: &[MTerm]| -> Vec<u8> {
-            // Emit as `list( cons(t1, cons(t2, nil)) )` style, formatting
-            // the borrowed slice directly without a `Vec`+`Arc` round-trip.
-            pp_mterm_list(items)
-        };
+        // `pp_mterm_list` emits `list( cons(t1, cons(t2, nil)) )` style,
+        // formatting the borrowed slice directly without a `Vec`+`Arc`
+        // round-trip.
         let mut cmd = b"match in MSG : ".to_vec();
-        cmd.extend(pp_list(&pats));
+        cmd.extend(pp_mterm_list(&pats));
         cmd.extend_from_slice(b" <=? ");
-        cmd.extend(pp_list(&subjs));
+        cmd.extend(pp_mterm_list(&subjs));
         cmd.extend_from_slice(b" .\n");
         let reply = inner.execute(&cmd)?;
         inner.stats.match_count += 1;
@@ -1075,7 +1062,6 @@ impl MaudeHandle {
     ) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
         use crate::lterm::{LVar, Name};
-        use crate::vterm::Lit;
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
         }
@@ -1102,26 +1088,10 @@ impl MaudeHandle {
         let mut reverse: std::collections::BTreeMap<Name, LVar> =
             std::collections::BTreeMap::new();
         let mut counter: u64 = 0;
-        fn collect_subject_vars(
-            t: &LNTerm,
-            pattern_vars: &std::collections::BTreeSet<(String, u64)>,
-            out: &mut std::collections::BTreeSet<LVar>,
-        ) {
-            match t {
-                crate::term::Term::Lit(Lit::Var(lv))
-                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) => {
-                        out.insert(lv.clone());
-                    }
-                crate::term::Term::App(_, args) => {
-                    for a in args.iter() { collect_subject_vars(a, pattern_vars, out); }
-                }
-                _ => {}
-            }
-        }
         let mut subject_vars: std::collections::BTreeSet<LVar> =
             std::collections::BTreeSet::new();
         for eq in eqs {
-            collect_subject_vars(&eq.rhs, pattern_vars, &mut subject_vars);
+            collect_free_non_pattern_vars(&eq.rhs, pattern_vars, &mut subject_vars);
         }
         for lv in &subject_vars {
             let n = skolem_name(counter, lv);
@@ -1129,30 +1099,9 @@ impl MaudeHandle {
             skolem_map.insert(lv.clone(), n.clone());
             reverse.insert(n, lv.clone());
         }
-        fn rewrite_subject(
-            t: &LNTerm,
-            map: &std::collections::BTreeMap<LVar, Name>,
-        ) -> LNTerm {
-            match t {
-                crate::term::Term::Lit(Lit::Var(lv)) => {
-                    if let Some(n) = map.get(lv) {
-                        crate::term::Term::Lit(Lit::Con(n.clone()))
-                    } else {
-                        t.clone()
-                    }
-                }
-                crate::term::Term::App(sym, args) => {
-                    let new_args: Vec<LNTerm> = args.iter()
-                        .map(|a| rewrite_subject(a, map))
-                        .collect();
-                    crate::term::Term::App(sym.clone(), new_args.into())
-                }
-                _ => t.clone(),
-            }
-        }
         let rewritten_eqs: Vec<Equal<LNTerm>> = eqs.iter().map(|eq| Equal {
             lhs: eq.lhs.clone(),
-            rhs: rewrite_subject(&eq.rhs, &skolem_map),
+            rhs: rewrite_skolem(&eq.rhs, &skolem_map),
         }).collect();
 
         let mut inner = self.inner.lock().unwrap();
@@ -1163,9 +1112,6 @@ impl MaudeHandle {
             t1s.push(lterm_to_mterm_global(&eq.lhs, &mut ctx));
             t2s.push(lterm_to_mterm_global(&eq.rhs, &mut ctx));
         }
-        let pp_list = |items: &[MTerm]| -> Vec<u8> {
-            pp_mterm_list(items)
-        };
         // Maude's `match A <=? B` finds σ with `B == σ(A)`: A is the
         // PATTERN (whose vars get bound), B is the SUBJECT (treated as
         // ground).  Callers pass `Equal { lhs = pattern, rhs = subject }`
@@ -1190,9 +1136,9 @@ impl MaudeHandle {
         // (Term/Maude.hs matchCmd).  Sibling `match_eqs_skolemize_both`
         // uses the same order.
         let mut cmd = b"match in MSG : ".to_vec();
-        cmd.extend(pp_list(&t1s));
+        cmd.extend(pp_mterm_list(&t1s));
         cmd.extend_from_slice(b" <=? ");
-        cmd.extend(pp_list(&t2s));
+        cmd.extend(pp_mterm_list(&t2s));
         cmd.extend_from_slice(b" .\n");
         let reply = inner.execute(&cmd)?;
         inner.stats.match_count += 1;
@@ -1296,28 +1242,11 @@ impl MaudeHandle {
         let mut reverse: std::collections::BTreeMap<Name, LVar> =
             std::collections::BTreeMap::new();
         let mut counter: u64 = 0;
-        fn collect_free_non_pattern(
-            t: &LNTerm,
-            pattern_vars: &std::collections::BTreeSet<(String, u64)>,
-            out: &mut std::collections::BTreeSet<LVar>,
-        ) {
-            use crate::vterm::Lit;
-            match t {
-                crate::term::Term::Lit(Lit::Var(lv))
-                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) => {
-                        out.insert(lv.clone());
-                    }
-                crate::term::Term::App(_, args) => {
-                    for a in args.iter() { collect_free_non_pattern(a, pattern_vars, out); }
-                }
-                _ => {}
-            }
-        }
         let mut free_vars: std::collections::BTreeSet<LVar> =
             std::collections::BTreeSet::new();
         for eq in eqs {
-            collect_free_non_pattern(&eq.lhs, pattern_vars, &mut free_vars);
-            collect_free_non_pattern(&eq.rhs, pattern_vars, &mut free_vars);
+            collect_free_non_pattern_vars(&eq.lhs, pattern_vars, &mut free_vars);
+            collect_free_non_pattern_vars(&eq.rhs, pattern_vars, &mut free_vars);
         }
         for lv in &free_vars {
             let n = skolem_name(counter, lv);
@@ -1326,31 +1255,9 @@ impl MaudeHandle {
             reverse.insert(n, lv.clone());
         }
         // Step 2: rewrite BOTH sides via the shared skolem_map.
-        fn rewrite(
-            t: &LNTerm,
-            map: &std::collections::BTreeMap<LVar, Name>,
-        ) -> LNTerm {
-            use crate::vterm::Lit;
-            match t {
-                crate::term::Term::Lit(Lit::Var(lv)) => {
-                    if let Some(n) = map.get(lv) {
-                        crate::term::Term::Lit(Lit::Con(n.clone()))
-                    } else {
-                        t.clone()
-                    }
-                }
-                crate::term::Term::App(sym, args) => {
-                    let new_args: Vec<LNTerm> = args.iter()
-                        .map(|a| rewrite(a, map))
-                        .collect();
-                    crate::term::Term::App(sym.clone(), new_args.into())
-                }
-                _ => t.clone(),
-            }
-        }
         let rewritten_eqs: Vec<Equal<LNTerm>> = eqs.iter().map(|eq| Equal {
-            lhs: rewrite(&eq.lhs, &skolem_map),
-            rhs: rewrite(&eq.rhs, &skolem_map),
+            lhs: rewrite_skolem(&eq.lhs, &skolem_map),
+            rhs: rewrite_skolem(&eq.rhs, &skolem_map),
         }).collect();
 
         let mut inner = self.inner.lock().unwrap();
@@ -1361,16 +1268,13 @@ impl MaudeHandle {
             pats.push(lterm_to_mterm_global(&eq.lhs, &mut ctx));
             subjs.push(lterm_to_mterm_global(&eq.rhs, &mut ctx));
         }
-        let pp_list = |items: &[MTerm]| -> Vec<u8> {
-            pp_mterm_list(items)
-        };
         // Maude's `match A <=? B` syntax means: find σ such that B = σ(A).
         // So A is the PATTERN (left), B is the SUBJECT (right).
         // Callers of THIS routine pass `Equal { lhs = pattern, rhs =
         // subject }`, so the command is `match pattern(lhs) <=?
-        // subject(rhs)`.  CONVENTION WARNING: `match_eqs_const_subject`
-        // (post-eadeb1c4) ALSO uses `Equal { lhs = pattern, rhs =
-        // subject }` and emits `match pattern <=? subject` — same as
+        // subject(rhs)`.  CONVENTION: `match_eqs_const_subject` ALSO uses
+        // `Equal { lhs = pattern, rhs = subject }` and emits
+        // `match pattern <=? subject` — same as
         // here.  But the plain `match_eqs` uses the OPPOSITE `Equal`
         // field order (`lhs = subject, rhs = pattern`, faithful to HS's
         // `Equal a b = Equal subject pattern`); it still emits
@@ -1378,9 +1282,9 @@ impl MaudeHandle {
         // flipped fields.  So all three matchers emit pattern-on-the-left,
         // which is what Maude requires (vars bind in the left operand).
         let mut cmd = b"match in MSG : ".to_vec();
-        cmd.extend(pp_list(&pats));
+        cmd.extend(pp_mterm_list(&pats));
         cmd.extend_from_slice(b" <=? ");
-        cmd.extend(pp_list(&subjs));
+        cmd.extend(pp_mterm_list(&subjs));
         cmd.extend_from_slice(b" .\n");
         let reply = inner.execute(&cmd)?;
         inner.stats.match_count += 1;
@@ -1436,7 +1340,7 @@ impl MaudeHandle {
         // <> name puts `~x.N` AFTER same-idx `~na.N`/`~nb.N`).
         for ms in &msubsts {
             let mut variant_ctx = ctx.clone();
-            out.push(msubst_to_lnsubst_force_x(ms, &mut variant_ctx)?);
+            out.push(msubst_to_lnsubst(ms, &mut variant_ctx)?);
         }
         Ok(out)
     }
@@ -1519,6 +1423,54 @@ fn unskolemize(
         }
         crate::term::Term::App(sym, args) => {
             let new_args: Vec<LNTerm> = args.iter().map(|a| unskolemize(a, reverse)).collect();
+            crate::term::Term::App(sym.clone(), new_args.into())
+        }
+        _ => t.clone(),
+    }
+}
+
+/// Collect every free `LVar` in `t` whose `(name, idx)` is NOT in
+/// `pattern_vars`, appending into `out`.  Shared by the two skolemizing
+/// matchers (`match_eqs_const_subject` scans the subject side only;
+/// `match_eqs_skolemize_both` scans both sides).
+fn collect_free_non_pattern_vars(
+    t: &LNTerm,
+    pattern_vars: &std::collections::BTreeSet<(String, u64)>,
+    out: &mut std::collections::BTreeSet<crate::lterm::LVar>,
+) {
+    use crate::vterm::Lit;
+    match t {
+        crate::term::Term::Lit(Lit::Var(lv))
+            if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) => {
+                out.insert(lv.clone());
+            }
+        crate::term::Term::App(_, args) => {
+            for a in args.iter() { collect_free_non_pattern_vars(a, pattern_vars, out); }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite `t`, replacing each `LVar` bound in `map` with its synthetic
+/// skolem `Con` constant (leaving all other subterms untouched).  Shared
+/// by the two skolemizing matchers.
+fn rewrite_skolem(
+    t: &LNTerm,
+    map: &std::collections::BTreeMap<crate::lterm::LVar, crate::lterm::Name>,
+) -> LNTerm {
+    use crate::vterm::Lit;
+    match t {
+        crate::term::Term::Lit(Lit::Var(lv)) => {
+            if let Some(n) = map.get(lv) {
+                crate::term::Term::Lit(Lit::Con(n.clone()))
+            } else {
+                t.clone()
+            }
+        }
+        crate::term::Term::App(sym, args) => {
+            let new_args: Vec<LNTerm> = args.iter()
+                .map(|a| rewrite_skolem(a, map))
+                .collect();
             crate::term::Term::App(sym.clone(), new_args.into())
         }
         _ => t.clone(),
@@ -1625,51 +1577,6 @@ fn msubst_to_lnsubst_with_avoid(
     }
     Ok(out)
 }
-
-/// Variant of `msubst_to_lnsubst` that forces the Maude-witness name hint
-/// to `"x"` regardless of whether the value is a pure rename — matching
-/// HS's `msubstToLSubstVFresh` (Maude/Types.hs:138) which always passes
-/// `mTermToLNTerm "x" mt` for Maude-introduced witnesses.
-///
-/// The non-`_force_x` form preserves the domain LVar's name when the
-/// value is a pure `Lit FreshVar`; that was added for the `perform_split`
-/// ordering of the EquationStore's runtime-narrowing unifiers (see
-/// project-split-case-divergence-root memory).  The `variants()` path,
-/// however, feeds `composeVFresh` (RuleVariants.hs:74) which then routes
-/// to `pracVariants`'s pretty-printer — and HS's hint there is
-/// unconditionally `"x"`.  Using the domain name there makes:
-///   (a) variant `~k = ~k.5` (RS) vs `~k = ~x.5` (HS) trace divergence;
-///   (b) the Ord-on-SubstVFresh permutation that reorders the variant
-///       list (e.g. CRxor's `initiator2` swaps variants 1↔3).
-fn msubst_to_lnsubst_force_x(
-    ms: &MSubst,
-    ctx: &mut ConvCtx,
-) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
-    let mut out = Vec::with_capacity(ms.len());
-    let mut next: u64 = {
-        let mut n: u64 = 1;
-        for lit in ctx.bindings().values() {
-            if let crate::vterm::Lit::Var(lv) = lit {
-                if lv.name == "x" && lv.idx >= n {
-                    n = lv.idx + 1;
-                }
-            }
-        }
-        n
-    };
-    // HS-faithful: variants use `msubstToLSubstVFresh`, which converts in
-    // Maude's raw returned order (no domain sort; Maude/Types.hs:127-138).
-    for ((sort, idx), mt) in ms {
-        let lv = crate::maude_types::substitute_lookup_var(ctx, *sort, *idx)
-            .ok_or_else(|| MaudeError::Other(format!(
-                "no binding for Maude variable x{}:{:?}", idx, sort)))?;
-        // HS-faithful: always hint "x", matching Maude/Types.hs:138.
-        let t = mterm_to_lnterm(mt, ctx, "x", &mut next);
-        out.push((lv, t));
-    }
-    Ok(out)
-}
-
 
 // ---------------------------------------------------------------------------
 // MaudePool — a pool of independent Maude subprocesses.
@@ -1980,14 +1887,9 @@ mod tests {
         t.join().unwrap();
     }
 
-    // Regression (alethea `indivVerif` false-attack, fixed by emitting
-    // `match PATTERN <=? SUBJECT` in the right order):
-    // pattern multiset `codeOther ++ <a,b>` (codeOther is the only
-    // pattern var) must AC-match subject `code2 ++ x ++ <a,b>` by
-    // binding `codeOther -> code2 ++ x`.  HS's Maude matchAction does
-    // this; `match_eqs_const_subject` previously swapped pattern/subject
-    // and returned "No match", which left `insertImpliedFormulas` from
-    // deriving gfalse and FALSIFIED a true lemma.
+    // Pattern multiset `codeOther ++ <a,b>` (codeOther is the only pattern
+    // var) must AC-match subject `code2 ++ x ++ <a,b>` by binding
+    // `codeOther -> code2 ++ x`, matching HS's Maude matchAction.
     #[test]
     fn match_eqs_const_subject_mset_var_to_submultiset() {
         let path = match maude_path() { Some(p) => p, None => { eprintln!("skipping: no maude"); return; } };
@@ -2021,16 +1923,12 @@ mod tests {
             "expected codeOther to AC-match a 2-element sub-multiset");
     }
 
-    // Regression (DH key-exchange over-match, fixed by routing the
-    // `insertImpliedFormulas` Action-guard AC-fallback through
-    // `match_eqs_skolemize_both` instead of `match_eqs_const_subject`).
-    //
-    // HS's `impliedFormulas` runs `skolemizeGuarded` over the WHOLE
-    // clause (`System.hs:1122`): every FREE (non-universal) LVar of the
-    // guard pattern becomes a Maude *constant* (`MaudeConst`), only the
-    // universal-bound vars stay bindable Maude variables.  So a guard
-    // pattern position holding a free system var must match the system
-    // action's corresponding position as CONSTANT-vs-CONSTANT.
+    // HS's `impliedFormulas` runs `skolemizeGuarded` over the WHOLE clause
+    // (`System.hs:1122`): every FREE (non-universal) LVar of the guard
+    // pattern becomes a Maude *constant*; only universal-bound vars stay
+    // bindable. `match_eqs_const_subject` over-matches such guards (treats
+    // free vars as Maude variables); `match_eqs_skolemize_both` treats them
+    // as distinct constants, matching HS's `skolemizeGuarded`-then-match.
     //
     // Mirrors the real STS_MAC_fix2 `AcceptedR` guard match (sent as
     // per-argument equations, one for each fact position).  The guard
@@ -2100,12 +1998,9 @@ mod tests {
     ///   - check [] (_:_) = LT ⇒ `compareTermSubs(h(x),h(a)) = Just LT`
     ///     and symmetrically `compareTermSubs(h(a),h(x)) = Just GT`.
     ///
-    /// Before the fix, `compare_term_subs` constructed `Equal { lhs:
-    /// t2, rhs: t1 }` for arm A (mistaking RS's `Equal` for the
-    /// `pattern,subject` order used by the const_subject sibling),
-    /// which SWAPPED the result: it returned `Greater` for `(h(x),h(a))`
-    /// and `Less` for `(h(a),h(x))` — the inverse of HS. (Latent
-    /// because the sole consumer `eq_term_subs` tests only `Equal`.)
+    /// Pins the directionality: arm A (`t1` matchWith `t2`) uses `Equal { lhs:
+    /// t1, rhs: t2 }` (RS `Equal`'s HS-faithful subject,pattern order), not
+    /// the pattern,subject order used by the `const_subject` sibling.
     #[test]
     fn compare_term_subs_direction_matches_hs() {
         let path = match maude_path() { Some(p) => p, None => { eprintln!("skipping: no maude"); return; } };

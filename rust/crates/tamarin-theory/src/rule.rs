@@ -5,9 +5,9 @@
 //! conversions.  Two related pieces of `Rule.hs` live elsewhere in the
 //! crate rather than here:
 //! - `someRuleACInst*` (rule instantiation) — in
-//!   `constraint::solver::reduction` (`some_rule_ac_inst`).
-//! - Pretty-printing / dot rendering — `pretty_rule_inst` in
-//!   `pretty_system.rs` and `render_rule` in `pretty_theory.rs`.
+//!   `constraint::solver::reduction` (`canonical_rule_inst`).
+//! - Pretty-printing — `render_rule` in `pretty_theory.rs`; graph/dot
+//!   rendering of rule instances lives in `tamarin-server` (`handlers/dot.rs`).
 //!
 //! The Haskell version uses `fclabels` lenses heavily; we replace those
 //! with public fields plus accessor methods.

@@ -141,6 +141,18 @@ pub struct System {
     /// Wrapped in `Cell` so `bounds_max(&System)` can populate it
     /// without requiring `&mut System` at every call site.
     pub max_var_idx_cache: Cell<Option<u64>>,
+    /// Cached max free-var idx across the NODES component ONLY (the
+    /// `sNodes` map: node ids + their `RuleACInst` free vars).  Split
+    /// out of `max_var_idx_cache` because the node walk is the dominant
+    /// cost of `bounds_max` and the ~82 non-node mutation sites (which
+    /// clear the full cache) leave the node component untouched — so
+    /// this survives them and spares re-walking the (often large) node
+    /// map.  `None` means "invalid — recompute the node component on
+    /// next `bounds_max` miss".  Maintained by the node-mutation sites
+    /// (invalidate on removal/substitution/rename, bump on additive
+    /// push / uniform shift).  Excluded from `PartialEq`/`Clone`
+    /// semantics exactly like `max_var_idx_cache`.
+    pub node_max_cache: Cell<Option<u64>>,
 }
 
 // Manual `Clone` — copies the cache value (NOT invalidates).  System
@@ -165,6 +177,7 @@ impl Clone for System {
             used_sources: self.used_sources.clone(),
             sources_lemma_universals: self.sources_lemma_universals.clone(),
             max_var_idx_cache: Cell::new(self.max_var_idx_cache.get()),
+            node_max_cache: Cell::new(self.node_max_cache.get()),
         }
     }
 }
@@ -202,15 +215,23 @@ impl PartialEq for System {
 ///
 /// Identity for non-Disj goals (their var idxs are semantically
 /// significant — same NodeId means same node etc.).
-pub fn canonical_goal_for_dedup(g: &Goal) -> Goal {
+pub fn canonical_goal_for_dedup(g: &Goal) -> std::borrow::Cow<'_, Goal> {
+    // Currently the IDENTITY: `normalize_bound_lvars` (guarded.rs) is a pure
+    // `g.clone()` and `Disj::new` is a plain wrapper (no reorder/dedup), so
+    // the `Disj` arm would rebuild a goal that is `==` the original.  Under
+    // `Goal: PartialEq`, `canonical_goal_for_dedup(a) == canonical_goal_for_dedup(b)`
+    // is therefore exactly `a == b`.  Borrow in every arm to avoid a full
+    // `Goal` clone on the goal-insertion hot path; every caller uses the
+    // result only for an `==` comparison — the ORIGINAL goal is what gets
+    // stored/pushed.
+    //
+    // IF `normalize_bound_lvars` ever becomes non-identity: switch the `Disj`
+    // arm back to owned canonicalisation, i.e.
+    //     let canon_alts = d.0.iter().map(crate::guarded::normalize_bound_lvars).collect();
+    //     std::borrow::Cow::Owned(Goal::Disj(crate::constraint::constraints::Disj::new(canon_alts)))
     match g {
-        Goal::Disj(d) => {
-            let canon_alts: Vec<crate::guarded::Guarded> = d.0.iter()
-                .map(crate::guarded::normalize_bound_lvars)
-                .collect();
-            Goal::Disj(crate::constraint::constraints::Disj::new(canon_alts))
-        }
-        _ => g.clone(),
+        Goal::Disj(_) => std::borrow::Cow::Borrowed(g),
+        _ => std::borrow::Cow::Borrowed(g),
     }
 }
 
@@ -344,6 +365,54 @@ impl System {
         self.max_var_idx_cache.set(None);
     }
 
+    // ====== node_max_cache maintenance (nodes-only component) ======
+
+    /// Invalidate the cached node-component max.  Call on any mutation
+    /// of `sNodes` that could LOWER the node max (node removal / merge,
+    /// substitution applied to node terms, alpha-rename).  Independent
+    /// of the full-cache invalidation: the ~82 non-node sites clear only
+    /// the full cache and MUST leave this one intact.
+    #[inline]
+    pub fn invalidate_node_max_cache(&self) {
+        self.node_max_cache.set(None);
+    }
+
+    /// Bump the node-component cache for a newly-added node id.  No-op
+    /// if invalidated (mirrors `bump_cache_lvar`).
+    #[inline]
+    pub fn bump_node_max_lvar(&self, v: &tamarin_term::lterm::LVar) {
+        if let Some(cur) = self.node_max_cache.get() {
+            if v.idx > cur {
+                self.node_max_cache.set(Some(v.idx));
+            }
+        }
+    }
+
+    /// Bump the node-component cache by walking a newly-added node's
+    /// rule (mirrors `bump_cache_rule`).  No-op if invalidated.
+    #[inline]
+    pub fn bump_node_max_rule(&self, r: &crate::rule::RuleACInst) {
+        if let Some(cur) = self.node_max_cache.get() {
+            let mut m = cur;
+            crate::constraint::solver::reduction::bm_rule_pub(r, &mut m);
+            if m != cur { self.node_max_cache.set(Some(m)); }
+        }
+    }
+
+    /// Bump the node-component cache after a UNIFORM `idx += shift`
+    /// applied to every node var (monotone graft/freshen).  Since every
+    /// node var's idx rises by exactly `shift`, the max over them rises
+    /// by exactly `shift` too — PROVIDED at least one node var exists.
+    /// The caller MUST guard on non-empty nodes (an empty node map has
+    /// component 0 both before and after, so bumping it would be wrong).
+    /// No-op if invalidated.
+    #[inline]
+    pub fn bump_node_max_by_shift(&self, shift: u64) {
+        if let Some(cur) = self.node_max_cache.get() {
+            self.node_max_cache.set(Some(cur.saturating_add(shift)));
+        }
+    }
+
     /// Bump the cache for a newly-added LVar.  No-op if invalidated.
     #[inline]
     pub fn bump_cache_lvar(&self, v: &tamarin_term::lterm::LVar) {
@@ -473,26 +542,29 @@ impl System {
                 eprintln!("[RS_INS_GOAL] lemma={} gsNr={} solved=false loops={} goal={:?}", tag, age, looping, g);
             }
         }
-        let canon_g = canonical_goal_for_dedup(&g);
         // Single dedup scan: locate the existing slot (if any) once and
         // derive `is_new` from it, instead of running the same O(n)
         // `canonical_goal_for_dedup` comparison twice (once for the
         // trace, once for the find) on the goal-insertion hot path.
         //
-        // `canonical_goal_for_dedup` is identity (`g.clone()`) for every
-        // non-Disj variant, so we only need to canonicalise an existing
-        // entry when it is itself a `Disj` (and only then can it match a
-        // `Disj` `canon_g`; under `Goal`'s derived `PartialEq` distinct
-        // variants never compare equal). For the common non-Disj case
-        // this compares `existing == &canon_g` directly, avoiding one
-        // full `Goal` clone per existing goal per insertion.
-        let slot_idx = self.goals.iter().position(|(existing, _)| {
-            if matches!(existing, Goal::Disj(_)) {
-                canonical_goal_for_dedup(existing) == canon_g
-            } else {
-                *existing == canon_g
-            }
-        });
+        // `canonical_goal_for_dedup` is identity for every non-Disj
+        // variant, so we only need to canonicalise an existing entry when
+        // it is itself a `Disj` (and only then can it match a `Disj`
+        // `canon_g`; under `Goal`'s derived `PartialEq` distinct variants
+        // never compare equal). For the common non-Disj case this compares
+        // `existing == &*canon_g` directly.  `canon_g` now BORROWS `g`
+        // (`Cow::Borrowed`), so scope it to this block: its borrow ends
+        // before `g` is moved into the goal store below.
+        let slot_idx = {
+            let canon_g = canonical_goal_for_dedup(&g);
+            self.goals.iter().position(|(existing, _)| {
+                if matches!(existing, Goal::Disj(_)) {
+                    canonical_goal_for_dedup(existing) == canon_g
+                } else {
+                    *existing == *canon_g
+                }
+            })
+        };
         if trace_goal_insert() {
             let kindstr = match &g {
                 Goal::Action(i, fa) => format!("Action {:?} {:?}", i, fa),
@@ -522,11 +594,18 @@ impl System {
     pub fn add_node(&mut self, id: NodeId, rule: RuleACInst) {
         let pos = self.nodes.iter().position(|(k, _)| k == &id);
         if let Some(i) = pos {
+            // Rule-replace can LOWER the node max (old rule's max-bearing
+            // var may vanish) — invalidate BOTH caches.
             self.invalidate_max_var_idx_cache();
+            self.invalidate_node_max_cache();
             self.nodes_mut()[i].1 = rule;
         } else {
+            // Pure additive push — bump both the full cache and the
+            // node-component cache with the new node's vars.
             self.bump_cache_lvar(&id);
             self.bump_cache_rule(&rule);
+            self.bump_node_max_lvar(&id);
+            self.bump_node_max_rule(&rule);
             self.nodes_mut().push((id, rule));
         }
     }

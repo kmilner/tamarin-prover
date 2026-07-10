@@ -1411,6 +1411,48 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse the middle arrow of a rule: either the `-->` shortcut (no
+    /// actions/restrictions) or `--[ .. ]->` with a `fact_or_restr` loop
+    /// splitting action Facts from embedded Restrs, allowing a trailing comma
+    /// before `]->` (HS `commaSep` = `sepEndBy comma`, Rule.hs:186).
+    fn parse_actions_and_restrictions(&mut self) -> Result<(Vec<Fact>, Vec<Formula>), ParseError> {
+        if self.try_punct("-->") {
+            return Ok((vec![], vec![]));
+        }
+        self.require_punct("--[")?;
+        let mut acts = Vec::new();
+        let mut rstrs = Vec::new();
+        if !self.try_punct("]->") {
+            loop {
+                let item = self.fact_or_restr()?;
+                match item {
+                    FactOrRestr::Fact(f) => acts.push(f),
+                    FactOrRestr::Restr(phi) => rstrs.push(phi),
+                }
+                if !self.try_punct(",") { break; }
+                if self.peek_punct("]->") { break; }
+            }
+            self.require_punct("]->")?;
+        }
+        Ok((acts, rstrs))
+    }
+
+    /// Parse a SAPIC channel-message argument list (shared by `in`/`out`):
+    /// `(msg)` yields `(None, msg)`, `(chan, msg)` yields `(Some(chan), msg)`.
+    fn parse_chan_msg(&mut self) -> Result<(Option<Term>, Term), ParseError> {
+        self.require_punct("(")?;
+        // Either `(msg)` or `(chan, msg)`
+        let first = self.term(false)?;
+        if self.try_punct(",") {
+            let snd = self.term(false)?;
+            self.require_punct(")")?;
+            Ok((Some(first), snd))
+        } else {
+            self.require_punct(")")?;
+            Ok((None, first))
+        }
+    }
+
     fn parse_rule(&mut self) -> Result<Rule, ParseError> {
         self.require_kw("rule")?;
         let modulo = self.try_modulo();
@@ -1424,32 +1466,7 @@ impl<'a> Parser<'a> {
         // Premises [..]
         let premises = self.fact_list()?;
         // Actions / restrictions either `--[..]->` or `-->`
-        let (actions, embedded_restrictions);
-        if self.try_punct("-->") {
-            actions = vec![];
-            embedded_restrictions = vec![];
-        } else {
-            self.require_punct("--[")?;
-            let mut acts = Vec::new();
-            let mut rstrs = Vec::new();
-            self.skip_ws();
-            if !self.try_punct("]->") {
-                loop {
-                    let item = self.fact_or_restr()?;
-                    match item {
-                        FactOrRestr::Fact(f) => acts.push(f),
-                        FactOrRestr::Restr(phi) => rstrs.push(phi),
-                    }
-                    // HS `commaSep` (Rule.hs:186) = `sepEndBy comma`: a trailing
-                    // comma before `]->` is permitted.
-                    if !self.try_punct(",") { break; }
-                    if self.peek_punct("]->") { break; }
-                }
-                self.require_punct("]->")?;
-            }
-            actions = acts;
-            embedded_restrictions = rstrs;
-        }
+        let (actions, embedded_restrictions) = self.parse_actions_and_restrictions()?;
         let conclusions = self.fact_list()?;
         // Optional variants
         let variants = if self.try_kw("variants") {
@@ -1488,31 +1505,7 @@ impl<'a> Parser<'a> {
         self.require_punct(":")?;
         let let_block = if self.at_keyword("let") { self.parse_let_block()? } else { vec![] };
         let premises = self.fact_list()?;
-        let (actions, embedded_restrictions);
-        if self.try_punct("-->") {
-            actions = vec![];
-            embedded_restrictions = vec![];
-        } else {
-            self.require_punct("--[")?;
-            let mut acts = Vec::new();
-            let mut rstrs = Vec::new();
-            if !self.try_punct("]->") {
-                loop {
-                    let item = self.fact_or_restr()?;
-                    match item {
-                        FactOrRestr::Fact(f) => acts.push(f),
-                        FactOrRestr::Restr(phi) => rstrs.push(phi),
-                    }
-                    // HS `commaSep` (Rule.hs:186) = `sepEndBy comma`: a trailing
-                    // comma before `]->` is permitted.
-                    if !self.try_punct(",") { break; }
-                    if self.peek_punct("]->") { break; }
-                }
-                self.require_punct("]->")?;
-            }
-            actions = acts;
-            embedded_restrictions = rstrs;
-        }
+        let (actions, embedded_restrictions) = self.parse_actions_and_restrictions()?;
         let conclusions = self.fact_list()?;
         Ok(Rule {
             name, modulo, attributes, let_block,
@@ -1536,11 +1529,7 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_ws();
             // colour=, color=
-            if self.try_kw("colour") {
-                self.require_punct("=")?;
-                let c = self.lx.hex_color().ok_or_else(|| self.err("expected hex color"))?;
-                attrs.push(RuleAttr::Color(c));
-            } else if self.try_kw("color") {
+            if self.try_kw("colour") || self.try_kw("color") {
                 self.require_punct("=")?;
                 let c = self.lx.hex_color().ok_or_else(|| self.err("expected hex color"))?;
                 attrs.push(RuleAttr::Color(c));
@@ -2205,31 +2194,12 @@ impl<'a> Parser<'a> {
             return Ok(Some(SapicAction::Delete(t)));
         }
         if self.try_kw("in") {
-            self.require_punct("(")?;
-            // Either `(msg)` or `(chan, msg)`
-            let first = self.term(false)?;
-            let res = if self.try_punct(",") {
-                let snd = self.term(false)?;
-                self.require_punct(")")?;
-                SapicAction::ChIn { chan: Some(first), msg: snd }
-            } else {
-                self.require_punct(")")?;
-                SapicAction::ChIn { chan: None, msg: first }
-            };
-            return Ok(Some(res));
+            let (chan, msg) = self.parse_chan_msg()?;
+            return Ok(Some(SapicAction::ChIn { chan, msg }));
         }
         if self.try_kw("out") {
-            self.require_punct("(")?;
-            let first = self.term(false)?;
-            let res = if self.try_punct(",") {
-                let snd = self.term(false)?;
-                self.require_punct(")")?;
-                SapicAction::ChOut { chan: Some(first), msg: snd }
-            } else {
-                self.require_punct(")")?;
-                SapicAction::ChOut { chan: None, msg: first }
-            };
-            return Ok(Some(res));
+            let (chan, msg) = self.parse_chan_msg()?;
+            return Ok(Some(SapicAction::ChOut { chan, msg }));
         }
         if self.try_kw("lock") {
             let t = self.term(false)?;
@@ -2433,26 +2403,12 @@ impl<'a> Parser<'a> {
         }
         // Quantifiers: All / ∀ / Ex / ∃
         if self.try_kw("All") || self.try_punct("∀") {
-            let mut vs = Vec::new();
-            loop {
-                self.skip_ws();
-                if self.lx.peek() == Some('.') { break; }
-                let v = self.quantifier_binder()?;
-                vs.push(v);
-            }
-            self.require_punct(".")?;
+            let vs = self.quantifier_binders()?;
             let f = self.iff()?;
             return Ok(Formula::Forall(vs, Box::new(f)));
         }
         if self.try_kw("Ex") || self.try_punct("∃") {
-            let mut vs = Vec::new();
-            loop {
-                self.skip_ws();
-                if self.lx.peek() == Some('.') { break; }
-                let v = self.quantifier_binder()?;
-                vs.push(v);
-            }
-            self.require_punct(".")?;
+            let vs = self.quantifier_binders()?;
             let f = self.iff()?;
             return Ok(Formula::Exists(vs, Box::new(f)));
         }
@@ -2939,6 +2895,20 @@ impl<'a> Parser<'a> {
             v.sort = SortHint::Msg;
         }
         Ok(v)
+    }
+
+    /// Parse a quantifier's binder list (`All`/`Ex` share this): a sequence of
+    /// `quantifier_binder`s terminated by `.`, which is consumed.
+    fn quantifier_binders(&mut self) -> Result<Vec<VarSpec>, ParseError> {
+        let mut vs = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.lx.peek() == Some('.') { break; }
+            let v = self.quantifier_binder()?;
+            vs.push(v);
+        }
+        self.require_punct(".")?;
+        Ok(vs)
     }
 
     /// Consume `.<digit>+` as a variable index, otherwise leave input
@@ -3501,7 +3471,8 @@ end"#;
     // from rule / source-case names, and `test` is the CaseTest keyword
     // (Accountability.hs:26).  A rule named `test` prints its solved case as
     // `case test` at paren-depth 0 (unlike Scott's `test` which was inside
-    // `solve( ... )`), so the depth guard from 64e80ecc alone does not cover it.
+    // `solve( ... )`), so the paren-depth guard alone does not suppress it —
+    // the case-label suppression below is also needed.
     #[test]
     fn proof_case_label_named_after_keyword_does_not_truncate() {
         let s = r#"theory T begin

@@ -2180,8 +2180,7 @@ mod tests {
     #[test]
     fn dot_rule_node_uses_faithful_palette_fillcolor() {
         // End-to-end through system_to_dot_with: a lone protocol rule is the
-        // sole member of group 1, so its fill colour is the (1,0) palette hex
-        // #d5d897 (NOT the old placeholder "white").
+        // sole member of group 1, so its fill colour is the (1,0) palette hex #d5d897.
         use tamarin_theory::fact::out_fact;
         use tamarin_term::term::Term;
         use tamarin_term::vterm::Lit;

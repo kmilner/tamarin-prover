@@ -859,8 +859,6 @@ mod tests {
     // real prover (tamarin-prover v1.13.0, `--derivcheck-timeout=10`):
     //   * private `dec`  → `m` reported "Failed to derive Variable(s)".
     //   * public  `dec`  → `m` derivable, nothing reported.
-    // Before the fix, the Rust probe flipped privacy to public, so the private
-    // case wrongly matched the public verdict (no report).
 
     #[test]
     fn deriv_check_flags_var_recoverable_only_via_private_destructor() {

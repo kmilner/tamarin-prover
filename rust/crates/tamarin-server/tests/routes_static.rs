@@ -33,12 +33,7 @@ async fn test_static_css_served_as_text_css() {
         .await
         .expect("send /static/css/...");
     assert_eq!(res.status(), 200);
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(
         ct.starts_with("text/css"),
         "expected text/css, got {}",
@@ -63,12 +58,7 @@ async fn test_static_js_served_as_javascript() {
         .await
         .expect("send /static/js/...");
     assert_eq!(res.status(), 200);
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     // tower-http's ServeDir defaults to application/javascript (or
     // text/javascript on some setups).  Either is acceptable per RFC.
     assert!(

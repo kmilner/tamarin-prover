@@ -1084,32 +1084,9 @@ fn smart_ranking(
     // predicates that depend on system state — split_size,
     // source-cache one-case — can borrow `sys` / `ctx`.
     type Pred<'a> = Box<dyn Fn(&AnnotatedGoal) -> bool + 'a>;
-    // HS-faithful lazy: `smartRanking`'s `oneCaseOnly = catMaybes . map
-    // getMsgOneCase . L.get pcSources $ ctxt` is a thunk that only
-    // forces when an `isMsgOneCaseGoal` predicate fires.  That predicate
-    // returns False instantly for non-KU goals (`msgPremise` returns
-    // Nothing).  So if NO goal in the current list is a KU action goal,
-    // the thunk is never forced — and HS's `cdCases` thunks for
-    // FApp-headed KU sources stay unforced too, deferring saturate
-    // traces until the first KU goal appears.
-    //
-    // Replicate by only computing `one_case_syms` when at least one
-    // goal in `goals` is a KU action goal.  Otherwise pass an empty
-    // set — `is_msg_one_case_goal` returns False unconditionally.
-    let any_ku_action_goal = goals.iter().any(|a| {
-        use crate::constraint::constraints::Goal;
-        use crate::fact::FactTag;
-        matches!(&a.goal, Goal::Action(_, fa) if matches!(fa.tag, FactTag::Ku))
-    });
-    let one_case_syms: std::collections::BTreeSet<Vec<u8>> =
-        if any_ku_action_goal {
-            match ctx {
-                Some(c) => collect_one_case_syms(c),
-                None => Default::default(),
-            }
-        } else {
-            Default::default()
-        };
+    // HS-faithful lazy `oneCaseOnly` — only force the source-case analysis
+    // when a KU action goal is present (see `lazy_one_case_syms`).
+    let one_case_syms = lazy_one_case_syms(&goals, ctx);
     let solve_first: Vec<Pred> = vec![
         Box::new(is_chain_goal),
         Box::new(is_disj_goal),
@@ -1138,8 +1115,8 @@ fn smart_ranking(
     ];
     goals = sort_decision_tree_dyn(&solve_first, goals);
     // 3. sortDecisionTree notSolveLast — push solve-last goals to end.
-    let not_solve_last: Vec<fn(&AnnotatedGoal) -> bool> = vec![is_non_solve_last_goal];
-    goals = sort_decision_tree(&not_solve_last, goals);
+    let not_solve_last: Vec<Pred> = vec![Box::new(is_non_solve_last_goal)];
+    goals = sort_decision_tree_dyn(&not_solve_last, goals);
     // 3b. unmark — HS `smartRanking`'s `unmark | allowPremiseGLoopBreakers
     //     = map unmarkPremiseG` (ProofMethod.hs:1073).  Resets each
     //     PremiseG goal's usefulness to Useful so loop-breaker premises
@@ -1203,17 +1180,9 @@ fn sapic_ranking(
     pkcs11: bool,
 ) -> Vec<AnnotatedGoal> {
     let mut goals = open_goals(sys);
-    // HS-faithful lazy `oneCaseOnly` (see `smart_ranking`): only force the
-    // source-case analysis when a KU action goal is present.
-    let any_ku_action_goal = goals.iter().any(|a| {
-        use crate::fact::FactTag;
-        matches!(&a.goal, Goal::Action(_, fa) if matches!(fa.tag, FactTag::Ku))
-    });
-    let one_case_syms: std::collections::BTreeSet<Vec<u8>> = if any_ku_action_goal {
-        match ctx { Some(c) => collect_one_case_syms(c), None => Default::default() }
-    } else {
-        Default::default()
-    };
+    // HS-faithful lazy `oneCaseOnly` (see `lazy_one_case_syms`): only force
+    // the source-case analysis when a KU action goal is present.
+    let one_case_syms = lazy_one_case_syms(&goals, ctx);
     type Pred<'a> = Box<dyn Fn(&AnnotatedGoal) -> bool + 'a>;
     let solve_first: Vec<Pred> = if pkcs11 {
         vec![
@@ -1333,21 +1302,10 @@ fn inj_ranking(
 ) -> Vec<AnnotatedGoal> {
     let mut goals = open_goals(sys);
     type Pred<'a> = Box<dyn Fn(&AnnotatedGoal) -> bool + 'a>;
-    // Lazy one-case-syms exactly as in smart_ranking: only force the
-    // source-cache thunk when a KU action goal is present.
-    let any_ku_action_goal = goals.iter().any(|a| {
-        use crate::fact::FactTag;
-        matches!(&a.goal, Goal::Action(_, fa) if matches!(fa.tag, FactTag::Ku))
-    });
-    let one_case_syms: std::collections::BTreeSet<Vec<u8>> =
-        if any_ku_action_goal {
-            match ctx {
-                Some(c) => collect_one_case_syms(c),
-                None => Default::default(),
-            }
-        } else {
-            Default::default()
-        };
+    // Lazy one-case-syms exactly as in smart_ranking (see
+    // `lazy_one_case_syms`): only force the source-cache thunk when a KU
+    // action goal is present.
+    let one_case_syms = lazy_one_case_syms(&goals, ctx);
     // solveFirst — four priority classes.  Within each class the
     // relative order from goalNrRanking (insertion / nr order) is
     // preserved by the stable partition.
@@ -1480,6 +1438,38 @@ fn collect_one_case_syms(
     out
 }
 
+/// HS-faithful lazy `oneCaseOnly` shared by all three rankings.
+///
+/// `smartRanking`'s `oneCaseOnly = catMaybes . map getMsgOneCase . L.get
+/// pcSources $ ctxt` is a thunk that only forces when an `isMsgOneCaseGoal`
+/// predicate fires.  That predicate returns False instantly for non-KU goals
+/// (`msgPremise` returns Nothing).  So if NO goal in the current list is a KU
+/// action goal, the thunk is never forced — and HS's `cdCases` thunks for
+/// FApp-headed KU sources stay unforced too, deferring saturate traces until
+/// the first KU goal appears.
+///
+/// Replicate by only computing `one_case_syms` when at least one goal in
+/// `goals` is a KU action goal.  Otherwise return an empty set —
+/// `is_msg_one_case_goal` returns False unconditionally.
+fn lazy_one_case_syms(
+    goals: &[AnnotatedGoal],
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+) -> std::collections::BTreeSet<Vec<u8>> {
+    use crate::constraint::constraints::Goal;
+    use crate::fact::FactTag;
+    let any_ku_action_goal = goals.iter().any(|a| {
+        matches!(&a.goal, Goal::Action(_, fa) if matches!(fa.tag, FactTag::Ku))
+    });
+    if any_ku_action_goal {
+        match ctx {
+            Some(c) => collect_one_case_syms(c),
+            None => Default::default(),
+        }
+    } else {
+        Default::default()
+    }
+}
+
 fn is_msg_one_case_goal(
     a: &AnnotatedGoal,
     one_case_syms: &std::collections::BTreeSet<Vec<u8>>,
@@ -1503,24 +1493,6 @@ fn is_msg_one_case_goal(
         return one_case_syms.contains(s.name);
     }
     false
-}
-
-/// Stable partition: `sat ++ sortDecisionTree ps nonsat`. Haskell's
-/// `sortDecisionTree` walks the predicate list in order, peeling off
-/// the satisfying prefix at each pass.
-fn sort_decision_tree(
-    ps: &[fn(&AnnotatedGoal) -> bool],
-    xs: Vec<AnnotatedGoal>,
-) -> Vec<AnnotatedGoal> {
-    let mut result = Vec::with_capacity(xs.len());
-    let mut rest = xs;
-    for &p in ps {
-        let (sat, nonsat): (Vec<_>, Vec<_>) = rest.into_iter().partition(p);
-        result.extend(sat);
-        rest = nonsat;
-    }
-    result.extend(rest);
-    result
 }
 
 /// `tagUsefulness` — direct port of Haskell `ProofMethod.hs:1068`:
@@ -1595,16 +1567,11 @@ fn is_private_knows_goal(a: &AnnotatedGoal) -> bool {
     // the goalNr tie-break picks the wrong one — causing case-order
     // swaps in NAXOS_eCK_PFS_private (and the non-PFS variant
     // NAXOS_eCK_private).
-    msg_premise(&a.goal).map(is_private_function_toplevel).unwrap_or(false)
+    // Shared `isPrivateFunction` port (`crate::intruder_rules::is_private_function`,
+    // Term.hs:203-205): top-level function symbol is Private; no recursion.
+    msg_premise(&a.goal).map(crate::intruder_rules::is_private_function).unwrap_or(false)
 }
 
-/// HS `isPrivateFunction` (Term.hs:203-205): top-level function symbol
-/// is Private.  Does NOT recurse into subterms.
-fn is_private_function_toplevel(t: &tamarin_term::lterm::LNTerm) -> bool {
-    use tamarin_term::function_symbols::{FunSym, NoEqSym, Privacy};
-    use tamarin_term::term::Term;
-    matches!(t, Term::App(FunSym::NoEq(NoEqSym { privacy: Privacy::Private, .. }), _))
-}
 fn is_fresh_knows_goal(a: &AnnotatedGoal) -> bool {
     use tamarin_term::lterm::LSort;
     use tamarin_term::term::Term;
@@ -1965,13 +1932,49 @@ fn chain_kd_conc_term(
     fact.terms.first().cloned()
 }
 
+/// Shared `allKUActions`-before-target scan.  True iff some KU action for
+/// `term` fires at a node strictly always-before `target`.
+///
+/// HS `allKUActions sys = unsolvedActionAtoms sys ++ node actions`
+/// (System.hs:1575-1585): the KU action may exist only as an unsolved
+/// `ActionG i (KU term)` goal (node i not yet in sNodes), so scan unsolved
+/// ActionG goals in ADDITION to node rule actions.  `always_before(id,
+/// target)` does not depend on `fa` and the relation is invariant across the
+/// loops in one `open_goals` pass (`sys` is read-only), so the caller builds
+/// the adjacency once and threads it in.  Used by `chain_to_equality` and
+/// (per-arg) `all_msg_vars_known_earlier`.
+fn exists_ku_action_before(
+    sys: &System,
+    ab_adj: &crate::constraint::system::PrebuiltAdj,
+    term: &tamarin_term::lterm::LNTerm,
+    target: &crate::constraint::constraints::NodeId,
+) -> bool {
+    let is_ku_of = |fa: &crate::fact::LNFact| -> bool {
+        matches!(fa.tag, crate::fact::FactTag::Ku) && fa.terms.first() == Some(term)
+    };
+    // Unsolved ActionG goals half of allActions.
+    let in_goals = sys.goals.iter()
+        .filter(|(_, st)| !st.solved)
+        .any(|(g, _)| match g {
+            Goal::Action(i, fa) =>
+                is_ku_of(fa) && sys.always_before_with(ab_adj, i, target),
+            _ => false,
+        });
+    if in_goals { return true; }
+    // Node rule actions half of allActions.
+    sys.nodes.iter().any(|(id, rule)| {
+        id != target
+            && rule.actions.iter().any(is_ku_of)
+            && sys.always_before_with(ab_adj, id, target)
+    })
+}
+
 /// Haskell `chainToEquality` (Goals.hs:171-182).  Open the msg-var
 /// ChainG only when its premise targets an intruder equality rule
 /// AND there's an earlier KU action for the same msg var.
 ///
 /// IEquality is an INTRUDER rule (IntrRuleACInfo::IEquality), not a
-/// proto rule.  The earlier port checked `Proto(Stand("IEquality"))`
-/// which is always false — silently failing chainToEquality.
+/// proto rule — the match below must check the Intr variant.
 fn chain_to_equality(
     t_start: &tamarin_term::lterm::LNTerm,
     c: &crate::constraint::constraints::NodeConc,
@@ -1987,39 +1990,9 @@ fn chain_to_equality(
         crate::rule::RuleInfo::Intr(crate::rule::IntrRuleACInfo::IEquality));
     if !is_equality { return false; }
     // ku_before: there's a KU action for t_start at some node that
-    // is always-before c.0 in the less-relation.
-    //
-    // HS `allKUActions sys = unsolvedActionAtoms sys ++ node actions`
-    // (System.hs:1575-1585): the KU action may exist only as an
-    // unsolved `ActionG i (KU t_start)` goal (node i not yet
-    // materialised in sNodes), so we must scan unsolved ActionG goals
-    // in ADDITION to node rule actions — not just sys.nodes.  (Mirrors
-    // the precedent in simplify.rs allActions scan.)
-    //
-    // `always_before(id, &c.0)` is invariant across the actions of a node
-    // (it does not depend on `fa`) and the relation is invariant across the
-    // loops and across all goals in one `open_goals` pass, so the caller
-    // builds the adjacency once and threads it in; test the cheap tag/term
-    // predicate before the per-node `always_before_with` query.
-    let is_ku_of_t = |fa: &crate::fact::LNFact| -> bool {
-        matches!(fa.tag, crate::fact::FactTag::Ku)
-            && fa.terms.first() == Some(t_start)
-    };
-    // Unsolved ActionG goals (= HS unsolvedActionAtoms half of allActions).
-    let ku_before_goal = sys.goals.iter()
-        .filter(|(_, st)| !st.solved)
-        .any(|(g, _)| match g {
-            Goal::Action(i, fa) =>
-                is_ku_of_t(fa) && sys.always_before_with(ab_adj, i, &c.0),
-            _ => false,
-        });
-    // Node rule actions (= HS sNodes half of allActions).
-    let ku_before_node = sys.nodes.iter().any(|(id, rule)| {
-        if id == &c.0 { return false; }
-        rule.actions.iter().any(is_ku_of_t)
-            && sys.always_before_with(ab_adj, id, &c.0)
-    });
-    ku_before_goal || ku_before_node
+    // is always-before c.0 in the less-relation (see
+    // `exists_ku_action_before`).
+    exists_ku_action_before(sys, ab_adj, t_start, &c.0)
 }
 
 /// True if a goal is still "open": not vacuously False, not already
@@ -2153,35 +2126,10 @@ fn all_msg_vars_known_earlier(
 ) -> bool {
     if !args.iter().all(is_msg_var) { return false; }
     let i = &c.0;
-    // `always_before(j, i)` does not depend on `arg`, and the relation is
-    // invariant across both loops and across all goals in one `open_goals`
-    // pass (`sys` is read-only), so the caller builds it once and threads
-    // it in.
-    // HS `earlierMsgVars = do (j,_,t) <- allKUActions sys; ...` (Goals.hs:164)
-    // and `allKUActions sys = unsolvedActionAtoms sys ++ node actions`
-    // (System.hs:1575-1585): the KU action may exist only as an unsolved
-    // `ActionG j (KU arg)` goal (node j not yet in sNodes), so scan unsolved
-    // ActionG goals in ADDITION to node rule actions.
-    let is_ku_of = |fa: &crate::fact::LNFact, arg: &tamarin_term::lterm::LNTerm| -> bool {
-        matches!(fa.tag, crate::fact::FactTag::Ku) && fa.terms.first() == Some(arg)
-    };
-    args.iter().all(|arg| {
-        // Unsolved ActionG goals half of allActions.
-        let in_goals = sys.goals.iter()
-            .filter(|(_, st)| !st.solved)
-            .any(|(g, _)| match g {
-                Goal::Action(j, fa) =>
-                    is_ku_of(fa, arg) && sys.always_before_with(ab_adj, j, i),
-                _ => false,
-            });
-        // Node rule actions half of allActions.
-        let in_nodes = sys.nodes.iter().any(|(j, rule)| {
-            j != i
-                && sys.always_before_with(ab_adj, j, i)
-                && rule.actions.iter().any(|fa| is_ku_of(fa, arg))
-        });
-        in_goals || in_nodes
-    })
+    // HS `earlierMsgVars = do (j,_,t) <- allKUActions sys; ...` (Goals.hs:164):
+    // each arg must appear as a KU action always-before `i` (see
+    // `exists_ku_action_before`).
+    args.iter().all(|arg| exists_ku_action_before(sys, ab_adj, arg, i))
 }
 
 /// `isNullaryPublicFunction`: 0-arity public function symbols.

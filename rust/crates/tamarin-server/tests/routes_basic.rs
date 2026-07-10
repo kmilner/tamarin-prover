@@ -41,12 +41,7 @@ async fn test_get_index_returns_html_with_theory_listed() {
     let s = start_server_with_theory("issue193.spthy").await;
     let res = s.client.get(s.url("/")).send().await.expect("send /");
     assert_eq!(res.status(), 200);
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(
         ct.starts_with("text/html"),
         "expected text/html content-type, got {}",
@@ -88,12 +83,7 @@ async fn test_favicon_redirects_to_static_image() {
         .await
         .expect("send favicon");
     let status = res.status();
-    let loc = res
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let loc = header(&res, reqwest::header::LOCATION);
 
     // Haskell returns 303 + Location: /static/img/favicon.ico
     // Rust returns 308 (permanent redirect) + same Location.
@@ -124,12 +114,7 @@ async fn test_robots_txt() {
         .await
         .expect("send robots");
     assert_eq!(res.status(), 200);
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(ct.starts_with("text/plain"), "got CT={}", ct);
     let body = res.text().await.expect("read body");
 
@@ -212,12 +197,7 @@ async fn test_overview_help_html_structure() {
         .await
         .expect("send overview");
     assert_eq!(res.status(), 200);
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(ct.starts_with("text/html"), "got CT={}", ct);
     let body = res.text().await.expect("read body");
 
@@ -394,12 +374,7 @@ async fn test_main_help_envelope_matches_haskell_keys() {
         .await
         .expect("send main/help");
     assert_eq!(res.status(), 200);
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(
         ct.starts_with("application/json"),
         "expected application/json, got {}",
@@ -524,12 +499,7 @@ async fn test_main_with_missing_idx_returns_404_html() {
         .await
         .expect("send main with bad idx");
     assert_eq!(res.status(), 404, "missing idx must be 404 (matches Haskell)");
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(
         ct.starts_with("text/html"),
         "404 must be text/html; got {}",
@@ -548,12 +518,7 @@ async fn test_overview_with_missing_idx_returns_404_html() {
         .await
         .expect("send overview with bad idx");
     assert_eq!(res.status(), 404);
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(ct.starts_with("text/html"));
 }
 
@@ -571,12 +536,7 @@ async fn test_source_returns_plain_text() {
         .await
         .expect("send source");
     assert_eq!(res.status(), 200);
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(ct.starts_with("text/plain"), "got CT={}", ct);
     let body = res.text().await.expect("read");
     // Rust source is currently a minimal pretty-print: at least the
@@ -601,12 +561,7 @@ async fn test_message_deduction_returns_plain_text() {
         .await
         .expect("send message");
     assert_eq!(res.status(), 200);
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(ct.starts_with("text/plain"), "got CT={}", ct);
 }
 
@@ -625,23 +580,13 @@ async fn test_download_for_local_theory_returns_source_file() {
     // `getDownloadTheoryR` in `src/Web/Handler.hs:1669-1672` — it
     // returns `(typeOctet, source)`).  We mirror that exactly so the
     // frontend's "Save As" UX is bit-for-bit identical.
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert_eq!(
         ct, "application/octet-stream",
         "download must use application/octet-stream (matches Haskell)",
     );
 
-    let cd = res
-        .headers()
-        .get(reqwest::header::CONTENT_DISPOSITION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let cd = header(&res, reqwest::header::CONTENT_DISPOSITION);
     assert!(
         cd.contains("attachment"),
         "download must use Content-Disposition: attachment; got {:?}",
@@ -693,12 +638,7 @@ async fn test_unload_redirects_to_root() {
         "expected redirect, got {}",
         res.status()
     );
-    let loc = res
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let loc = header(&res, reqwest::header::LOCATION);
     assert!(
         loc == "/" || loc.ends_with("/"),
         "unload should redirect to / (got {:?})",

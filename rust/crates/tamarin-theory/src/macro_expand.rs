@@ -55,7 +55,7 @@ pub fn apply_macros_term(macros: &[p::Macro], term: &p::Term) -> p::Term {
                 for (param, value) in m.args.iter().zip(processed_args.iter()) {
                     subst.insert(param.name.clone(), value.clone());
                 }
-                let expanded = subst_term(&m.body, &subst);
+                let expanded = subst_term_by_name(&m.body, &subst);
                 // Re-expand the EXPANDED body to handle nested macros.
                 apply_macros_term(macros, &expanded)
             } else {
@@ -103,9 +103,12 @@ fn find_matching_macro<'a>(
     macros.iter().find(|m| m.name == name && m.args.len() == arity)
 }
 
-/// Apply substitution to a parser term.  HS's typed `apply subst term`
-/// (Macro.hs:48) becomes a structural name-keyed walk.
-fn subst_term(t: &p::Term, subst: &BTreeMap<String, p::Term>) -> p::Term {
+/// Apply a name-keyed substitution to a parser term.  HS's typed
+/// `apply subst term` (Macro.hs:48) becomes a structural name-keyed walk.
+/// Shared with `predicate_expand` (whose `Subst` newtype wraps the same
+/// `BTreeMap<String, p::Term>`), so both stay in lockstep on capture /
+/// replacement semantics.
+pub(crate) fn subst_term_by_name(t: &p::Term, subst: &BTreeMap<String, p::Term>) -> p::Term {
     match t {
         p::Term::Var(v) => match subst.get(&v.name) {
             Some(replacement) => replacement.clone(),
@@ -113,27 +116,27 @@ fn subst_term(t: &p::Term, subst: &BTreeMap<String, p::Term>) -> p::Term {
         },
         p::Term::App(name, args) => p::Term::App(
             name.clone(),
-            args.iter().map(|a| subst_term(a, subst)).collect(),
+            args.iter().map(|a| subst_term_by_name(a, subst)).collect(),
         ),
         p::Term::AlgApp(name, a, b) => p::Term::AlgApp(
             name.clone(),
-            Box::new(subst_term(a, subst)),
-            Box::new(subst_term(b, subst)),
+            Box::new(subst_term_by_name(a, subst)),
+            Box::new(subst_term_by_name(b, subst)),
         ),
         p::Term::Pair(items) => p::Term::Pair(
-            items.iter().map(|a| subst_term(a, subst)).collect(),
+            items.iter().map(|a| subst_term_by_name(a, subst)).collect(),
         ),
         p::Term::Diff(a, b) => p::Term::Diff(
-            Box::new(subst_term(a, subst)),
-            Box::new(subst_term(b, subst)),
+            Box::new(subst_term_by_name(a, subst)),
+            Box::new(subst_term_by_name(b, subst)),
         ),
         p::Term::BinOp(op, a, b) => p::Term::BinOp(
             *op,
-            Box::new(subst_term(a, subst)),
-            Box::new(subst_term(b, subst)),
+            Box::new(subst_term_by_name(a, subst)),
+            Box::new(subst_term_by_name(b, subst)),
         ),
         p::Term::PatMatch(inner) => p::Term::PatMatch(
-            Box::new(subst_term(inner, subst)),
+            Box::new(subst_term_by_name(inner, subst)),
         ),
         other => other.clone(),
     }

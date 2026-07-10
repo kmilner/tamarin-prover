@@ -136,18 +136,12 @@ pub fn load_from_source(
     {
         let term_errors = tamarin_theory::check_terms::check_terms_wf(
             &parsed_for_wf, &maude_sig);
-        if !term_errors.is_empty() {
-            let insert_before = wf_report.iter().position(|e| {
-                matches!(e.topic.as_str(),
-                    " Formula guardedness"
-                    | "Lemma annotations" | "Multiplication restriction of rules"
-                    | "Nat Sorts" | "Subterm Convergence Warning"
-                    | "Message Derivation Checks" | "Derivation Checks")
-            }).unwrap_or(wf_report.len());
-            let tail = wf_report.split_off(insert_before);
-            wf_report.extend(term_errors);
-            wf_report.extend(tail);
-        }
+        insert_wf_before(&mut wf_report, term_errors, &[
+            " Formula guardedness",
+            "Lemma annotations", "Multiplication restriction of rules",
+            "Nat Sorts", "Subterm Convergence Warning",
+            "Message Derivation Checks", "Derivation Checks",
+        ]);
     }
 
     // Formula guardedness (run.rs:638-656): each lemma/restriction formula that
@@ -155,17 +149,11 @@ pub fn load_from_source(
     // parser theory (HS `formulaReports`), before the SAPIC pass below.
     {
         let guard_errors = tamarin_theory::elaborate::check_guarded_wf(&parser_theory);
-        if !guard_errors.is_empty() {
-            let insert_before = wf_report.iter().position(|e| {
-                matches!(e.topic.as_str(),
-                    "Lemma annotations" | "Multiplication restriction of rules"
-                    | "Nat Sorts" | "Subterm Convergence Warning"
-                    | "Message Derivation Checks" | "Derivation Checks")
-            }).unwrap_or(wf_report.len());
-            let tail = wf_report.split_off(insert_before);
-            wf_report.extend(guard_errors);
-            wf_report.extend(tail);
-        }
+        insert_wf_before(&mut wf_report, guard_errors, &[
+            "Lemma annotations", "Multiplication restriction of rules",
+            "Nat Sorts", "Subterm Convergence Warning",
+            "Message Derivation Checks", "Derivation Checks",
+        ]);
     }
 
     // SAPIC `process:` translation — mirror `run.rs`'s CLI-side pass
@@ -222,18 +210,12 @@ pub fn load_from_source(
         let topic = "Facts occur in the left-hand-side but not in any right-hand-side ";
         wf_report.retain(|e| e.topic != topic);
         let lhs_rhs = tamarin_parser::wf::fact_lhs_occur_no_rhs(&post_thy);
-        if !lhs_rhs.is_empty() {
-            let insert_before = wf_report.iter().position(|e| {
-                matches!(e.topic.as_str(),
-                    "Formula terms" | " Formula guardedness"
-                    | "Lemma annotations" | "Multiplication restriction of rules"
-                    | "Nat Sorts" | "Subterm Convergence Warning"
-                    | "Message Derivation Checks" | "Derivation Checks")
-            }).unwrap_or(wf_report.len());
-            let tail = wf_report.split_off(insert_before);
-            wf_report.extend(lhs_rhs);
-            wf_report.extend(tail);
-        }
+        insert_wf_before(&mut wf_report, lhs_rhs, &[
+            "Formula terms", " Formula guardedness",
+            "Lemma annotations", "Multiplication restriction of rules",
+            "Nat Sorts", "Subterm Convergence Warning",
+            "Message Derivation Checks", "Derivation Checks",
+        ]);
     }
 
     if let Ok(maude) = MaudeHandle::start(maude_path, typed.signature.maude_sig.clone()) {
@@ -303,6 +285,24 @@ pub fn load_from_source(
         errors_html,
         proof_state: None,
     })
+}
+
+/// Splice `errors` into `report` immediately before the first entry whose
+/// `topic` is one of `anchors` (or at the end if none match), preserving the
+/// relative order of both the existing tail and the inserted errors.  Shared
+/// by the Formula-terms, Formula-guardedness, and SAPIC lhs/rhs passes, which
+/// differ only in their anchor topic list and the source of `errors`.
+fn insert_wf_before(report: &mut Vec<WfError>, errors: Vec<WfError>, anchors: &[&str]) {
+    if errors.is_empty() {
+        return;
+    }
+    let insert_before = report
+        .iter()
+        .position(|e| anchors.contains(&e.topic.as_str()))
+        .unwrap_or(report.len());
+    let tail = report.split_off(insert_before);
+    report.extend(errors);
+    report.extend(tail);
 }
 
 /// Build the HS `makeWfErrorsHtml` banner (`src/Web/Handler.hs:463-469`): wrap

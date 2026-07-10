@@ -334,6 +334,10 @@ fn try_hide_rule(v: &NodeId, ru: RuleACInst, sys: System) -> Result<System, Syst
             new_sys.edges.push(e);
         }
     }
+    // Node removal can LOWER the node-component max, so invalidate the
+    // node cache (the full cache is not maintained on this display-only
+    // simplify path, matching pre-existing behaviour — leave it as-is).
+    new_sys.invalidate_node_max_cache();
     new_sys.nodes_mut().retain(|(id, _)| id != v);
     Ok(new_sys)
 }

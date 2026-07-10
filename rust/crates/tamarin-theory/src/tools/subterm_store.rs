@@ -124,6 +124,43 @@ pub fn elem_not_below_reducible(
     }
 }
 
+/// Collector companion to [`elem_not_below_reducible`], specialised for the
+/// case where `inner` is a **Fresh-sort variable leaf**.
+///
+/// For a `Var` `inner`, `elem_not_below_reducible`'s `inner == outer` base case
+/// can only fire at a `Var` leaf (a var is a `Lit`, never an `App`), so the
+/// predicate reduces to "`inner` occurs in `outer` on a root-to-leaf path never
+/// crossing a reducible-headed `App`" — a property of `outer` and the var
+/// alone, INDEPENDENT of which fresh var is queried.  This walk collects, in a
+/// single pass over `t`, EVERY Fresh-sort variable `v` for which
+/// `elem_not_below_reducible(reducible, Lit(Var(v)), t)` holds.  Callers that
+/// would otherwise probe `t` once per candidate fresh var (see
+/// `enforce_fresh_ordering_pass`) precompute this set once and replace the walk
+/// with a hash-membership test.  The three arms mirror
+/// `elem_not_below_reducible` exactly: cross a reducible head ⇒ stop; other
+/// `App` ⇒ recurse args; a Fresh `Var` leaf ⇒ collect it; anything else ⇒
+/// contributes nothing.
+pub fn collect_fresh_vars_not_below_reducible(
+    reducible: &FastSet<FunSym>,
+    t: &LNTerm,
+    out: &mut FastSet<tamarin_term::lterm::LVar>,
+) {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::vterm::Lit;
+    match t {
+        Term::App(sym, args) => {
+            if reducible.contains(sym) { return; }
+            for a in args.iter() {
+                collect_fresh_vars_not_below_reducible(reducible, a, out);
+            }
+        }
+        Term::Lit(Lit::Var(v)) if v.sort == LSort::Fresh => {
+            out.insert(v.clone());
+        }
+        _ => {}
+    }
+}
+
 /// `hasSubtermCycle` — port of Haskell's
 /// `Theory.Tools.SubtermStore.hasSubtermCycle` (`SubtermStore.hs:223`).
 ///

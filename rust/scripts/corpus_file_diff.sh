@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Full-FILE raw diff of HS vs RS `--prove <file>` (proves ALL lemmas in the
 # file in one invocation — truest byte-identical metric, avoids per-lemma
-# source recompute).  Reconstructed 2026-06-20 after the original untracked
-# copy was lost; functionally equivalent.
+# source recompute).
 #
 # Two strictly-sequential phases so HS and RS never contend:
 #   Phase 1 (HS): run HS on every allowlisted file, cache stripped stdout by

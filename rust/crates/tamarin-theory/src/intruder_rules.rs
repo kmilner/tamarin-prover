@@ -117,7 +117,7 @@ pub fn destruction_rules(
 ) -> Vec<IntrRuleAC> {
     use tamarin_term::lterm::frees;
     use tamarin_term::positions::Position;
-    use tamarin_term::function_symbols::{FunSym, NoEqSym, Privacy};
+    use tamarin_term::function_symbols::{FunSym, Privacy};
     use tamarin_term::term::Term;
 
     let lhs = &rule.lhs;
@@ -125,18 +125,8 @@ pub fn destruction_rules(
     let positions: &[Position] = &rule.rhs.positions;
     if positions.is_empty() { return Vec::new(); }
 
-    // `containsPrivate` mirror.
-    fn contains_private(t: &tamarin_term::lterm::LNTerm) -> bool {
-        match t {
-            Term::Lit(_) => false,
-            Term::App(FunSym::NoEq(NoEqSym { privacy, .. }), args) => {
-                *privacy == Privacy::Private || args.iter().any(contains_private)
-            }
-            Term::App(_, args) => args.iter().any(contains_private),
-        }
-    }
-
-    if !(diff || !frees(rhs).is_empty() || contains_private(rhs)) {
+    // `containsPrivate` mirror (shared `tamarin_term::lterm::contains_private`).
+    if !(diff || !frees(rhs).is_empty() || tamarin_term::lterm::contains_private(rhs)) {
         return Vec::new();
     }
 
@@ -456,22 +446,12 @@ fn is_double_premise_rule(r: &IntrRuleAC) -> bool {
         .flat_map(|f| f.terms.iter())
         .any(|t| !tamarin_term::lterm::frees(t).is_empty());
     if frees_concs { return false; }
-    // Reject if any term (KD-premise or any prems-term) contains a private symbol.
-    fn contains_private(t: &tamarin_term::lterm::LNTerm) -> bool {
-        use tamarin_term::function_symbols::{FunSym, NoEqSym, Privacy};
-        use tamarin_term::term::Term;
-        match t {
-            Term::Lit(_) => false,
-            Term::App(FunSym::NoEq(NoEqSym { privacy, .. }), args) => {
-                *privacy == Privacy::Private || args.iter().any(contains_private)
-            }
-            Term::App(_, args) => args.iter().any(contains_private),
-        }
-    }
-    if contains_private(kd_fact_term) { return false; }
+    // Reject if any term (KD-premise or any prems-term) contains a private
+    // symbol (shared `tamarin_term::lterm::contains_private`).
+    if tamarin_term::lterm::contains_private(kd_fact_term) { return false; }
     for f in r.premises.iter() {
         for t in f.terms.iter() {
-            if contains_private(t) { return false; }
+            if tamarin_term::lterm::contains_private(t) { return false; }
         }
     }
     // KD-premise term must be a msg-var.
@@ -704,7 +684,7 @@ pub fn construction_rules(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<IntrRu
 // =============================================================================
 
 /// `isPrivateFunction` (Term.hs:203-205): top-level function symbol is Private.
-fn is_private_function(t: &LNTerm) -> bool {
+pub fn is_private_function(t: &LNTerm) -> bool {
     use tamarin_term::function_symbols::{FunSym, NoEqSym, Privacy};
     use tamarin_term::term::Term;
     matches!(t, Term::App(FunSym::NoEq(NoEqSym { privacy: Privacy::Private, .. }), _))
@@ -955,10 +935,7 @@ fn variants_intruder_with(
             fs.iter().map(|f| LNFact {
                 tag: f.tag.clone(),
                 annotations: f.annotations.clone(),
-                terms: f.terms.iter().map(|t| {
-                    let applied = apply_vterm(&sigma, t.clone());
-                    maude.reduce(&applied).unwrap_or(applied)
-                }).collect(),
+                terms: f.terms.iter().map(|t| norm_t(t.clone())).collect(),
             }).collect()
         };
         let new_prems = map_facts(&ru.premises);
@@ -1231,6 +1208,35 @@ pub(crate) fn norm_rule(
 // We mirror this by passing the `mk_action` argument as an `Fn(&LNFact)
 // -> Vec<LNFact>` closure.
 // =============================================================================
+
+// Shared `mkInfo`/action plumbing for `dh_intruder_rules` and
+// `bp_intruder_rules` (these are inline HS `where`-helpers, not distinct HS
+// functions, so a single Rust definition serves both generators).
+
+/// `ConstrRule (append (pack "_") xSymString)`.
+fn intr_constr_info(sym: &[u8]) -> IntrRuleACInfo {
+    let mut name = b"_".to_vec();
+    name.extend_from_slice(sym);
+    IntrRuleACInfo::ConstrRule(name)
+}
+
+/// `DestrRule (append (pack "_") xSymString) 0 True False` (IntruderRules.hs:243-244).
+/// Note budget=0 (NOT -1), subterm=True, constant=False.  `closeIntrRule` is
+/// what assigns the budget=-1 sentinel in our pipeline for subtermIntruderRules'
+/// destructors; here HS assigns budget=0 directly because these are
+/// convergent-eq destructors for which the budget is irrelevant
+/// (variantsIntruder will expand them).
+fn intr_destr_info(sym: &[u8]) -> IntrRuleACInfo {
+    let mut name = b"_".to_vec();
+    name.extend_from_slice(sym);
+    IntrRuleACInfo::DestrRule(name, 0, true, false)
+}
+
+/// `return :: a -> [a]` — singleton-list action constructor (HS).
+fn intr_mk_singleton(f: LNFact) -> Vec<LNFact> { vec![f] }
+/// `const [] :: a -> [a]` — empty action constructor (HS destructors).
+fn intr_mk_empty(_: LNFact) -> Vec<LNFact> { Vec::new() }
+
 /// `dhIntruderRules` — compute the intruder rules for the Diffie-Hellman
 /// theory.  Direct mirror of HS `dhIntruderRules` (IntruderRules.hs:230-283).
 ///
@@ -1338,28 +1344,11 @@ pub fn dh_intruder_rules(
         Rule::new(info, vec![], vec![concfact], acts)
     };
 
-    // `mkInfo` helpers — `ConstrRule (append (pack "_") xSymString)` etc.
-    let constr_info = |sym: &[u8]| -> IntrRuleACInfo {
-        let mut name = b"_".to_vec();
-        name.extend_from_slice(sym);
-        IntrRuleACInfo::ConstrRule(name)
-    };
-    // Destructor info: `DestrRule (append (pack "_") expSymString) 0 True False`
-    // (IntruderRules.hs:243-244).  Note budget=0 (NOT -1), subterm=True,
-    // constant=False.  `closeIntrRule` is what assigns budget=-1 sentinel
-    // in our pipeline for subtermIntruderRules' destructors; here HS
-    // assigns budget=0 directly because these are convergent-eq destructors
-    // for which the budget is irrelevant (variantsIntruder will expand them).
-    let destr_info = |sym: &[u8]| -> IntrRuleACInfo {
-        let mut name = b"_".to_vec();
-        name.extend_from_slice(sym);
-        IntrRuleACInfo::DestrRule(name, 0, true, false)
-    };
-
-    // `return :: a -> [a]` — singleton-list action constructor (HS).
-    let mk_singleton: &dyn Fn(LNFact) -> Vec<LNFact> = &|f| vec![f];
-    // `const [] :: a -> [a]` — empty action constructor (HS destructors).
-    let mk_empty: &dyn Fn(LNFact) -> Vec<LNFact> = &|_| Vec::new();
+    // Shared `mkInfo`/action plumbing (`intr_constr_info` etc.).
+    let constr_info = intr_constr_info;
+    let destr_info = intr_destr_info;
+    let mk_singleton: &dyn Fn(LNFact) -> Vec<LNFact> = &intr_mk_singleton;
+    let mk_empty: &dyn Fn(LNFact) -> Vec<LNFact> = &intr_mk_empty;
 
     let constrs: Vec<IntrRuleAC> = vec![
         // expRule  (ConstrRule "_exp")        kuFact return
@@ -1485,20 +1474,11 @@ pub fn bp_intruder_rules(
         Rule::new(info, vec![bfact, efact], vec![concfact], acts)
     };
 
-    // `mkInfo` helpers mirror dh_intruder_rules' `constr_info`/`destr_info`.
-    let constr_info = |sym: &[u8]| -> IntrRuleACInfo {
-        let mut name = b"_".to_vec();
-        name.extend_from_slice(sym);
-        IntrRuleACInfo::ConstrRule(name)
-    };
-    let destr_info = |sym: &[u8]| -> IntrRuleACInfo {
-        let mut name = b"_".to_vec();
-        name.extend_from_slice(sym);
-        IntrRuleACInfo::DestrRule(name, 0, true, false)
-    };
-
-    let mk_singleton: &dyn Fn(LNFact) -> Vec<LNFact> = &|f| vec![f];
-    let mk_empty: &dyn Fn(LNFact) -> Vec<LNFact> = &|_| Vec::new();
+    // Shared `mkInfo`/action plumbing (`intr_constr_info` etc.).
+    let constr_info = intr_constr_info;
+    let destr_info = intr_destr_info;
+    let mk_singleton: &dyn Fn(LNFact) -> Vec<LNFact> = &intr_mk_singleton;
+    let mk_empty: &dyn Fn(LNFact) -> Vec<LNFact> = &intr_mk_empty;
 
     // Constructor rules: `pmultRule (ConstrRule "_pmult") kuFact return`
     // and `emapRule (ConstrRule "_em") kuFact return`.
@@ -1834,8 +1814,7 @@ mod tests {
     // =========================================================================
     // Haskell-faithfulness invariants for `destruction_rules`.
     //
-    // Mirrors IntruderRules.hs:129-157.  Two patterns are easy to break
-    // and were broken historically:
+    // Mirrors IntruderRules.hs:129-157.  Two easy-to-break patterns:
     //
     //   1. Pattern #1 line 135: at the LAST position step, if the
     //      current term is an FApp AND rhs has free vars, return [].
@@ -1852,7 +1831,6 @@ mod tests {
     /// skip-last guard, Rust emits a second (degenerate) destructor at
     /// the inner step, producing `KD(x) + KU(...) → KD(x)` — a
     /// self-loop that explodes the chain search on denning_sacco.
-    /// See project_rust_destruction_rules_skip_last.md.
     #[test]
     fn destruction_rules_sym_enc_emits_exactly_one_destructor() {
         let sig = tamarin_term::maude_sig::sym_enc_maude_sig();
@@ -1863,8 +1841,7 @@ mod tests {
             "sym-enc rule `sdec(senc(x, y), y) = x` must yield EXACTLY ONE \
              destructor — the skip-last pattern (IntruderRules.hs:135) \
              elides the inner step.  Got {} rules.  If this regresses, \
-             denning_sacco-class chain explosion will silently reappear \
-             (see project_rust_destruction_rules_skip_last.md).",
+             denning_sacco-class chain explosion will silently reappear.",
             rules.len());
         let r = &rules[0];
         // Premise[0] = KD(senc(x, y)); follow-on premises = KU(y).

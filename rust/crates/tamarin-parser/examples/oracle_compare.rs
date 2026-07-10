@@ -9,7 +9,6 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
 
 use tamarin_parser::{ast, parse_theory};
 
@@ -170,6 +169,3 @@ fn structural_equal(a: &Counts, b: &Counts) -> bool {
         && a.lemmas == b.lemmas
         && a.restrictions == b.restrictions
 }
-
-#[allow(unused)]
-fn _t() -> Duration { Duration::from_secs(1) }

@@ -188,6 +188,41 @@ pub fn is_applicable_for_display(
     }
 }
 
+/// HS `uniqueListBy (comparing fst) id distinguish` (ProofMethod.hs:465,
+/// 527-532): singleton case names stay bare; each duplicate group of
+/// size `n` is rewritten to `<name>_case_<i>` with the running index `i`
+/// (1,2,3…) zero-padded to the width of `show n`.  Input order is
+/// preserved.  Shared by the `SolveGoal` and `Induction` arms of
+/// [`exec_proof_method`].
+///
+/// HS-faithful zero-padding: `distinguish`
+///   distinguish n =
+///     [ (\(x,y) -> (... x ++ "_case_" ++ pad (show i), y)) | i <- [1..] ]
+///     where l = length (show n); pad cs = replicate (l - length cs) '0' ++ cs
+/// so total<10 → width 1 (no padding); total>=10 → width 2 ("01"..); etc.
+fn distinguish_case_names(cases: Vec<(String, System)>) -> Vec<(String, System)> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (name, _) in &cases {
+        *counts.entry(name.clone()).or_default() += 1;
+    }
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(cases.len());
+    for (name, s) in cases.into_iter() {
+        let total = counts[&name];
+        let key = if total > 1 {
+            let n = seen.entry(name.clone()).or_default();
+            *n += 1;
+            let width = total.to_string().len();
+            format!("{}_case_{:0width$}", name, *n, width = width)
+        } else {
+            name
+        };
+        out.push((key, s));
+    }
+    out
+}
+
 pub fn exec_proof_method(
     ctx: &ProofContext,
     method: &ProofMethod,
@@ -497,7 +532,6 @@ pub fn exec_proof_method(
                     // preserves the order from `dispatch_solve_goal`,
                     // which matches Haskell's `disjunctionOfList`
                     // iteration order (rule order in `joinAllRules`).
-                    use std::collections::HashMap;
                     // simplify can fan out per case — flat-map.
                     let kept_raw: Vec<(String, System)> = cases.into_iter()
                         .flat_map(|(name, sys, seed)| {
@@ -533,33 +567,9 @@ pub fn exec_proof_method(
                             kept_raw,
                         )
                     };
-                    let mut counts: HashMap<String, usize> = HashMap::new();
-                    for (name, _) in &kept {
-                        *counts.entry(name.clone()).or_default() += 1;
-                    }
-                    let mut seen: HashMap<String, usize> = HashMap::new();
-                    let mut out = Vec::new();
-                    for (name, s) in kept.into_iter() {
-                        let total = counts[&name];
-                        let key = if total > 1 {
-                            let n = seen.entry(name.clone()).or_default();
-                            *n += 1;
-                            // HS-faithful zero-padding: ProofMethod.hs `distinguish`
-                            //   distinguish n =
-                            //     [ (\(x,y) -> (... x ++ "_case_" ++ pad (show i), y))
-                            //     | i <- [(1::Int)..] ]
-                            //     where l      = length (show n)
-                            //           pad cs = replicate (l - length cs) '0' ++ cs
-                            // For total<10 width=1 (no padding); total>=10 width=2 ("01"..);
-                            // total>=100 width=3, etc.
-                            let width = total.to_string().len();
-                            format!("{}_case_{:0width$}", name, *n, width = width)
-                        } else {
-                            name
-                        };
-                        out.push((key, s));
-                    }
-                    Some(out)
+                    // HS `uniqueListBy ... distinguish` — rename duplicate
+                    // case names to `name_case_N`.
+                    Some(distinguish_case_names(kept))
             }
         }
         ProofMethod::Induction => {
@@ -588,11 +598,10 @@ pub fn exec_proof_method(
             // an `empty_trace` formula `Disj([])` (gfalse) stays in
             // `sFormulas` untouched and never produces a DisjG goal —
             // `FormulasFalse` contradiction picks it up directly.
-            // Before this fix, RS called `insert_formula(base)` which for
-            // `Disj([])` (empty_trace's base case) inserted an empty
-            // DisjG goal at gsNr=0, shifting every subsequent gsNr in
-            // every sibling branch and producing a divergent goal
-            // sequence vs HS at the very first insertGoal call.
+            // (Routing through insert_formula would insert the empty DisjG
+            // goal at gsNr=0, shifting every subsequent gsNr in every
+            // sibling branch and diverging from HS at the first insertGoal
+            // call.)
             // HS `process . induction` (ProofMethod.hs:428, 521-525):
             // `runReduction (induction <* simplifySystem)` under the DisjT
             // monad.  `simplifySystem` CAN fan out at induction time — a
@@ -660,31 +669,10 @@ pub fn exec_proof_method(
             };
             // HS `uniqueListBy (comparing fst) id distinguish`
             // (ProofMethod.hs:465, 527-532): singleton names stay bare;
-            // duplicate groups of size n get `<name>_case_<i>` with `i`
-            // zero-padded to the width of `show n`.  (The empty-name
+            // duplicate groups get `<name>_case_<i>`.  (The empty-name
             // branch of `distinguish` is unreachable here — both
             // induction case names are non-empty.)
-            let mut name_counts: std::collections::BTreeMap<&str, usize>
-                = std::collections::BTreeMap::new();
-            for (n, _) in &named { *name_counts.entry(n.as_str()).or_insert(0) += 1; }
-            let widths: std::collections::BTreeMap<String, usize> = name_counts
-                .iter()
-                .map(|(n, c)| ((*n).to_string(), c.to_string().len()))
-                .collect();
-            let counts_owned: std::collections::BTreeMap<String, usize> = name_counts
-                .iter().map(|(n, c)| ((*n).to_string(), *c)).collect();
-            let mut seen: std::collections::BTreeMap<String, usize>
-                = std::collections::BTreeMap::new();
-            let out: Vec<(String, System)> = named.into_iter()
-                .map(|(n, s)| {
-                    let total = counts_owned[&n];
-                    if total == 1 { return (n, s); }
-                    let i = seen.entry(n.clone()).and_modify(|v| *v += 1).or_insert(1);
-                    let digits = widths[&n];
-                    ((format!("{}_case_{:0width$}", n, i, width = digits)), s)
-                })
-                .collect();
-            Some(out)
+            Some(distinguish_case_names(named))
         }
     }
 }

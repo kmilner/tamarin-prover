@@ -260,6 +260,9 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
         use tamarin_term::vterm::Lit;
         match t {
             Term::Lit(Lit::Con(_)) => false,
+            // Bare variables are always in normal form (`go_nf` returns true
+            // for every `Lit`), so skip the `nf_via_haskell` call.
+            Term::Lit(Lit::Var(_)) => false,
             Term::App(sym, args) if irreducible.contains(sym) => {
                 args.iter().any(|a| any_non_nf(sig, irreducible, a))
             }
@@ -859,29 +862,13 @@ fn has_forbidden_chain(sys: &System) -> bool {
 fn has_forbidden_exp(sys: &System) -> bool {
     use crate::fact::FactTag;
     use crate::rule::{IntrRuleACInfo, RuleInfo};
-    use tamarin_term::function_symbols::{EXP_SYM_STRING, FunSym, AcSym, INV_SYM_STRING};
+    use tamarin_term::function_symbols::{EXP_SYM_STRING, FunSym};
     use tamarin_term::lterm::{LNTerm, LSort, is_msg_var, frees, contains_private, sort_of_name};
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
 
-    // `niFactors`: HS Term/LTerm.hs:351-355.  The non-inverse
-    // factors of a term.  `Mult(ts...)` → concat-map ni_factors;
-    // `Inv(t)` → ni_factors t; else `[t]`.
-    fn ni_factors(t: &LNTerm) -> Vec<LNTerm> {
-        match t {
-            Term::App(FunSym::Ac(AcSym::Mult), args) => {
-                let mut out = Vec::new();
-                for a in args.iter() { out.extend(ni_factors(a)); }
-                out
-            }
-            Term::App(FunSym::NoEq(s), args)
-                if s.name == INV_SYM_STRING && args.len() == 1 =>
-            {
-                ni_factors(&args[0])
-            }
-            _ => vec![t.clone()],
-        }
-    }
+    // `niFactors` / multiset-subset are shared at module scope
+    // (`ni_factors` / `ni_factors_subset`).
 
     // `isSimpleTerm`: HS Term/LTerm.hs:383-386.
     // `not (containsPrivate t) && all (LSortFresh /=) (lits t)`.
@@ -909,18 +896,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
         ok
     }
 
-    // `kFactView`: returns (DirTag, term) for KU / KD facts.
-    // DirTag::Up = KU (constructible), DirTag::Dn = KD (destruction).
-    #[derive(Copy, Clone, PartialEq, Eq)]
-    enum DirTag { Up, Dn }
-    fn k_fact_view(fa: &crate::fact::LNFact) -> Option<(DirTag, &LNTerm)> {
-        if fa.terms.len() != 1 { return None; }
-        match fa.tag {
-            FactTag::Ku => Some((DirTag::Up, &fa.terms[0])),
-            FactTag::Kd => Some((DirTag::Dn, &fa.terms[0])),
-            _ => None,
-        }
-    }
+    // `kFactView` is shared at module scope (returns `KDir`/term).
     fn view_exp(t: &LNTerm) -> Option<(&LNTerm, &LNTerm)> {
         if let Term::App(FunSym::NoEq(s), args) = t {
             if s.name == EXP_SYM_STRING && args.len() == 2 {
@@ -972,13 +948,13 @@ fn has_forbidden_exp(sys: &System) -> bool {
         let conc = &ru.conclusions[0];
 
         let (dt1, p1_term) = match k_fact_view(p1) { Some(x) => x, None => continue };
-        if dt1 != DirTag::Dn { continue; }
+        if dt1 != KDir::Dn { continue; }
         if view_exp(p1_term).is_none() { continue; }
         let (dt2, b) = match k_fact_view(p2) { Some(x) => x, None => continue };
-        if dt2 != DirTag::Up { continue; }
+        if dt2 != KDir::Up { continue; }
 
         let (dtc, conc_term) = match k_fact_view(conc) { Some(x) => x, None => continue };
-        if dtc != DirTag::Dn { continue; }
+        if dtc != KDir::Dn { continue; }
 
         // The "earlier MsgVars" set: KU-known terms which are MsgVars
         // whose node `j` is `alwaysBefore` `i`.
@@ -1010,19 +986,8 @@ fn has_forbidden_exp(sys: &System) -> bool {
             //     + niFactors c \\ niFactors b == []
             if !is_simple_term(g) || !all_msg_vars_known_earlier(g) { false }
             else {
-                let nfc = ni_factors(c);
-                // multiset difference: every element of nfc must appear in nfb.
-                let mut nfb_remaining = ni_factors(b);
-                let mut all_in_b = true;
-                for x in &nfc {
-                    if let Some(pos) = nfb_remaining.iter().position(|y| y == x) {
-                        nfb_remaining.remove(pos);
-                    } else {
-                        all_in_b = false;
-                        break;
-                    }
-                }
-                all_in_b
+                // niFactors c \\ niFactors b == [] (multiset subset).
+                ni_factors_subset(c, b)
             }
         } else {
             // (2) conc = g (not exp-shaped)
@@ -1097,15 +1062,15 @@ fn is_forbidden_d_pmult<I>(ru: &crate::rule::Rule<crate::rule::RuleInfo<I, crate
     let conc = &ru.conclusions[0];
 
     // p1 = KD(pmult(_, p))
-    let (dt1, p1_term) = match bp_k_fact_view(p1) { Some(x) => x, None => return false };
-    if dt1 != BpDirTag::Dn { return false; }
+    let (dt1, p1_term) = match k_fact_view(p1) { Some(x) => x, None => return false };
+    if dt1 != KDir::Dn { return false; }
     let _p = match bp_view_pmult(p1_term) { Some((_s, p)) => p, None => return false };
     // p2 = KU(b)
-    let (dt2, b) = match bp_k_fact_view(p2) { Some(x) => x, None => return false };
-    if dt2 != BpDirTag::Up { return false; }
+    let (dt2, b) = match k_fact_view(p2) { Some(x) => x, None => return false };
+    if dt2 != KDir::Up { return false; }
     // conc = KD(pmult(c, p))
-    let (dtc, conc_term) = match bp_k_fact_view(conc) { Some(x) => x, None => return false };
-    if dtc != BpDirTag::Dn { return false; }
+    let (dtc, conc_term) = match k_fact_view(conc) { Some(x) => x, None => return false };
+    if dtc != KDir::Dn { return false; }
     let (c, p_conc) = match bp_view_pmult(conc_term) { Some(x) => x, None => return false };
 
     // HS `isForbiddenDPMult` (Contradictions.hs) gates ONLY on the
@@ -1113,7 +1078,7 @@ fn is_forbidden_d_pmult<I>(ru: &crate::rule::Rule<crate::rule::RuleInfo<I, crate
     // for p1, `(UpK, b)` for p2, `(DnK, FPMult c p)` for conc) — there is no
     // `isDPMultRule` guard (contrast isForbiddenDEMap/Order which DO guard).
     if !never_contains_fresh_priv(p_conc) { return false; }
-    bp_factors_subset(c, b)
+    ni_factors_subset(c, b)
 }
 
 /// `isForbiddenDEMap` — Contradictions.hs.
@@ -1134,8 +1099,8 @@ fn is_forbidden_d_emap(sys: &System,
 
     // ke_f := premIdx 1 of the dExp rule
     let ke_f = &ru_exp.premises[1];
-    let (dt_ke, ke) = match bp_k_fact_view(ke_f) { Some(x) => x, None => return false };
-    if dt_ke != BpDirTag::Up { return false; }
+    let (dt_ke, ke) = match k_fact_view(ke_f) { Some(x) => x, None => return false };
+    if dt_ke != KDir::Up { return false; }
 
     // Find the edge ((ns,_) → (i, PremIdx 0)) i.e. the rule providing
     // the dExp's first premise (the dEMap rule).
@@ -1151,11 +1116,11 @@ fn is_forbidden_d_emap(sys: &System,
 
     let sp_f = &ru_emap.premises[0];
     let rq_f = &ru_emap.premises[1];
-    let (dt_sp, sp_term) = match bp_k_fact_view(sp_f) { Some(x) => x, None => return false };
-    if dt_sp != BpDirTag::Dn { return false; }
+    let (dt_sp, sp_term) = match k_fact_view(sp_f) { Some(x) => x, None => return false };
+    if dt_sp != KDir::Dn { return false; }
     let (s_sc, p_pt) = match bp_view_pmult(sp_term) { Some(x) => x, None => return false };
-    let (dt_rq, rq_term) = match bp_k_fact_view(rq_f) { Some(x) => x, None => return false };
-    if dt_rq != BpDirTag::Dn { return false; }
+    let (dt_rq, rq_term) = match k_fact_view(rq_f) { Some(x) => x, None => return false };
+    if dt_rq != KDir::Dn { return false; }
     let (r_sc, q_pt) = match bp_view_pmult(rq_term) { Some(x) => x, None => return false };
 
     bp_over_complicated(s_sc, p_pt, ke) || bp_over_complicated(r_sc, q_pt, ke)
@@ -1184,16 +1149,16 @@ fn is_forbidden_d_emap_order(sys: &System,
     let f_p1 = &ru.premises[1];
     let f_c0 = &ru.conclusions[0];
 
-    let (dt0, t0) = match bp_k_fact_view(f_p0) { Some(x) => x, None => return false };
-    if dt0 != BpDirTag::Dn { return false; }
+    let (dt0, t0) = match k_fact_view(f_p0) { Some(x) => x, None => return false };
+    if dt0 != KDir::Dn { return false; }
     let (s_sc, p_pt) = match bp_view_pmult(t0) { Some(x) => x, None => return false };
 
-    let (dt1, t1) = match bp_k_fact_view(f_p1) { Some(x) => x, None => return false };
-    if dt1 != BpDirTag::Dn { return false; }
+    let (dt1, t1) = match k_fact_view(f_p1) { Some(x) => x, None => return false };
+    if dt1 != KDir::Dn { return false; }
     let (r_sc, q_pt) = match bp_view_pmult(t1) { Some(x) => x, None => return false };
 
-    let (dtc, tc) = match bp_k_fact_view(f_c0) { Some(x) => x, None => return false };
-    if dtc != BpDirTag::Dn { return false; }
+    let (dtc, tc) = match k_fact_view(f_c0) { Some(x) => x, None => return false };
+    if dtc != KDir::Dn { return false; }
 
     // tc = exp(em(p', q'), Mult([s', r', ...]))
     let (em_t, mult_arg) = match tc {
@@ -1268,17 +1233,19 @@ fn is_forbidden_d_emap_order(sys: &System,
     tags_of(rp1) > tags_of(rp2)
 }
 
-/// `kFactView` (BP scope): returns (DirTag, term) for KU / KD facts.
+/// `kFactView`: returns (KDir, term) for KU / KD facts.
+/// `KDir::Up` = KU (constructible), `KDir::Dn` = KD (destruction).
+/// Shared by `has_forbidden_exp` and the BP contradiction checks.
 #[derive(Copy, Clone, PartialEq, Eq)]
-enum BpDirTag { Up, Dn }
-fn bp_k_fact_view(fa: &crate::fact::LNFact)
-    -> Option<(BpDirTag, &tamarin_term::lterm::LNTerm)>
+enum KDir { Up, Dn }
+fn k_fact_view(fa: &crate::fact::LNFact)
+    -> Option<(KDir, &tamarin_term::lterm::LNTerm)>
 {
     use crate::fact::FactTag;
     if fa.terms.len() != 1 { return None; }
     match fa.tag {
-        FactTag::Ku => Some((BpDirTag::Up, &fa.terms[0])),
-        FactTag::Kd => Some((BpDirTag::Dn, &fa.terms[0])),
+        FactTag::Ku => Some((KDir::Up, &fa.terms[0])),
+        FactTag::Kd => Some((KDir::Dn, &fa.terms[0])),
         _ => None,
     }
 }
@@ -1297,30 +1264,31 @@ fn bp_view_pmult(t: &tamarin_term::lterm::LNTerm)
     None
 }
 
-/// Non-inverse factors of a term — see `ni_factors` inside
-/// `has_forbidden_exp`.  Duplicated here for BP-scope use.
-fn bp_ni_factors(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::LNTerm> {
+/// `niFactors`: HS Term/LTerm.hs:351-355.  The non-inverse factors of a
+/// term.  `Mult(ts...)` → concat-map ni_factors; `Inv(t)` → ni_factors t;
+/// else `[t]`.  Shared by `has_forbidden_exp` and the BP checks.
+fn ni_factors(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::LNTerm> {
     use tamarin_term::function_symbols::{AcSym, FunSym, INV_SYM_STRING};
     use tamarin_term::term::Term;
     match t {
         Term::App(FunSym::Ac(AcSym::Mult), args) => {
             let mut out = Vec::new();
-            for a in args.iter() { out.extend(bp_ni_factors(a)); }
+            for a in args.iter() { out.extend(ni_factors(a)); }
             out
         }
         Term::App(FunSym::NoEq(s), args)
             if s.name == INV_SYM_STRING && args.len() == 1 =>
-            bp_ni_factors(&args[0]),
+            ni_factors(&args[0]),
         _ => vec![t.clone()],
     }
 }
 
 /// `niFactors c \\ niFactors b == []`: every non-inverse factor of `c`
 /// appears in `b`'s non-inverse factors (multiset semantics).
-fn bp_factors_subset(c: &tamarin_term::lterm::LNTerm,
+fn ni_factors_subset(c: &tamarin_term::lterm::LNTerm,
                      b: &tamarin_term::lterm::LNTerm) -> bool {
-    let nfc = bp_ni_factors(c);
-    let mut remaining = bp_ni_factors(b);
+    let nfc = ni_factors(c);
+    let mut remaining = ni_factors(b);
     for x in &nfc {
         if let Some(pos) = remaining.iter().position(|y| y == x) {
             remaining.remove(pos);
@@ -1336,7 +1304,33 @@ fn bp_factors_subset(c: &tamarin_term::lterm::LNTerm,
 fn bp_over_complicated(scalar: &tamarin_term::lterm::LNTerm,
                        point: &tamarin_term::lterm::LNTerm,
                        ke: &tamarin_term::lterm::LNTerm) -> bool {
-    bp_factors_subset(scalar, ke) && never_contains_fresh_priv(point)
+    ni_factors_subset(scalar, ke) && never_contains_fresh_priv(point)
+}
+
+/// Build the raw less-relation adjacency `rawLessRel se` as a map from each
+/// node to its successors (System.hs:1613-1622):
+/// `rawLessRel = getLessRel sLessAtoms ++ rawEdgeRel` where
+/// `rawEdgeRel = sEdges ++ unsolvedChains`.  Each `LessAtom` gives
+/// `smaller → larger`, each edge gives `src.0 → tgt.0`, and each unsolved
+/// `ChainG c p` gives `c.0 → p.0` (without the chain edges reachability
+/// through an open chain is lost).  Matches `build_always_before_adj`
+/// (system.rs:660-667).  Shared by `non_injective_fact_instances` and
+/// `node_after_last`.
+fn raw_less_adj(sys: &System) -> BTreeMap<NodeId, Vec<NodeId>> {
+    let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+    for l in &sys.less_atoms {
+        adj.entry(l.smaller.clone()).or_default().push(l.larger.clone());
+    }
+    for e in &sys.edges {
+        adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
+    }
+    for (g, st) in sys.goals.iter() {
+        if st.solved { continue; }
+        if let crate::constraint::constraints::Goal::Chain(c, p) = g {
+            adj.entry(c.0.clone()).or_default().push(p.0.clone());
+        }
+    }
+    adj
 }
 
 /// Direct port of Haskell's `nonInjectiveFactInstances`
@@ -1359,28 +1353,11 @@ fn non_injective_fact_instances(
         ctxt.injective_fact_insts.iter().map(|(t, _)| t).collect();
     if inj_tags.is_empty() { return out; }
 
-    // Build reverse adjacency: who can reach whom via less + edges.
-    // We re-implement here rather than reuse always_before because we
-    // need to enumerate reachable sets, not query a single pair.
-    let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-    for l in &sys.less_atoms {
-        adj.entry(l.smaller.clone()).or_default().push(l.larger.clone());
-    }
-    for e in &sys.edges {
-        adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
-    }
-    // HS `nonInjectiveFactInstances` uses `less = rawLessRel se`, and
-    // `rawLessRel = getLessRel sLessAtoms ++ rawEdgeRel` where
-    // `rawEdgeRel = sEdges ++ unsolvedChains` (System.hs:1613-1622). Each
-    // unsolved `ChainG c p` contributes a `(c.0, p.0)` edge to the
-    // reachability relation; without it we miss reachability through open
-    // chains. Matches `build_always_before_adj` (system.rs:660-667).
-    for (g, st) in sys.goals.iter() {
-        if st.solved { continue; }
-        if let crate::constraint::constraints::Goal::Chain(c, p) = g {
-            adj.entry(c.0.clone()).or_default().push(p.0.clone());
-        }
-    }
+    // Build reverse adjacency: who can reach whom via the raw less-relation
+    // (less + edges + unsolved chains — see `raw_less_adj`).  We enumerate
+    // reachable sets here rather than reuse always_before, which only
+    // queries a single pair.
+    let adj = raw_less_adj(sys);
     // `adj` is invariant across this function, so memoize each node's
     // reachable set: `reachable(i)` is taken once per edge and `reachable(j)`
     // once per reachable `j`, with the same `j` recurring across edges.
@@ -1716,31 +1693,14 @@ fn node_after_last(sys: &System) -> Vec<Contradiction> {
     // `isInTrace sys i = i ∈ sNodes ∨ isLast sys i ∨
     //                    any ((i ==) . fst) (unsolvedActionAtoms sys)`.
     //
-    // Walk BOTH less_atoms AND edges (rawLessRel) — without edges,
-    // the typing-case `Last(#vr_inner)` branch never contradicts even
-    // when `vr_inner` has a chain-edge successor that pins down the
-    // ordering.  Filter by `isInTrace`: a successor only counts if
-    // it's a rule instance in `sNodes`, the system's last, or carries
-    // an unsolved Action goal — otherwise abstract precompute-time
-    // node-ids spuriously trip the contradiction.
-    let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-    for l in &sys.less_atoms {
-        adj.entry(l.smaller.clone()).or_default().push(l.larger.clone());
-    }
-    for e in &sys.edges {
-        adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
-    }
-    // `rawLessRel = lessAtoms ∪ rawEdgeRel` and
-    // `rawEdgeRel = sEdges ++ unsolvedChains` (System.hs:1613-1622), so
-    // each unsolved `ChainG c p` contributes a `(c.0, p.0)` edge. Without
-    // it `reachableSet` misses successors reachable only through an open
-    // chain. Matches `build_always_before_adj` (system.rs:660-667).
-    for (g, st) in sys.goals.iter() {
-        if st.solved { continue; }
-        if let crate::constraint::constraints::Goal::Chain(c, p) = g {
-            adj.entry(c.0.clone()).or_default().push(p.0.clone());
-        }
-    }
+    // Walk the raw less-relation (less_atoms ∪ edges ∪ unsolved chains —
+    // see `raw_less_adj`).  Without edges the typing-case `Last(#vr_inner)`
+    // branch never contradicts even when `vr_inner` has a chain-edge
+    // successor that pins down the ordering.  Filter by `isInTrace`: a
+    // successor only counts if it's a rule instance in `sNodes`, the
+    // system's last, or carries an unsolved Action goal — otherwise
+    // abstract precompute-time node-ids spuriously trip the contradiction.
+    let adj = raw_less_adj(sys);
     // isInTrace: collect every node-id that is "in the trace".
     let mut in_trace: BTreeSet<NodeId> = BTreeSet::new();
     for (id, _) in sys.nodes.iter() {

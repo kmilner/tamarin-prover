@@ -197,12 +197,7 @@ async fn test_next_main_lemma_matches_haskell() {
         .await
         .expect("send");
     assert_eq!(res.status(), 200);
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let ct = content_type(&res);
     assert!(ct.starts_with("text/plain"), "got CT={}", ct);
     let body = res.text().await.expect("read body");
 

@@ -42,7 +42,7 @@ use tamarin_theory::guarded::{formula_to_guarded, Guarded};
 use tamarin_theory::pretty_system::pretty_non_graph_system;
 use tamarin_theory::theory::{LemmaAttr, OpenProtoRule, TraceQuantifier};
 
-use crate::handlers::path_parse::{prefix_with_underscore, url_path_escape};
+use crate::handlers::path_parse::{encode_sub_path, url_path_escape};
 use crate::handlers::root::html_escape;
 
 /// Per-lemma live proof state, held inside [`TheoryEntry`].
@@ -715,7 +715,7 @@ pub fn render_sub_proof_snippet(
             "no annotated constraint system / {} sub-case(s)",
             node.children.len()));
     }
-    let url_path = encode_path(proof_path);
+    let url_path = encode_sub_path(proof_path);
     // HS `subProofSnippet = vcat [ …proofMethods…, text "", <h3>Constraint
     // system</h3>, [dynamic-graph], sequent, <h3>N sub-case(s)</h3>, …subCases ]`
     // — each element is a `vcat` line; join with `\n`, then postprocess once.
@@ -750,7 +750,7 @@ pub fn render_sub_proof_snippet(
     for (case_name, child) in node.children.iter() {
         let mut child_path = proof_path.to_vec();
         child_path.push(case_name.clone());
-        let child_url = encode_path(&child_path);
+        let child_url = encode_sub_path(&child_path);
         // HS `withTag "h4" [] (text "Case" <-> text name)` = `<h4>Case NAME</h4>`.
         parts.push(format!("<h4>Case {}</h4>",
             tamarin_theory::pretty_hpj::escape_html_entities(case_name)));
@@ -1011,7 +1011,7 @@ fn render_node(
     path: &[String],
     node: &ProofNode,
 ) {
-    let url_path = encode_path(path);
+    let url_path = encode_sub_path(path);
     out.push_str("<div class=\"proof-node\">");
     // Method line with status badge.
     let badge = status_badge(&node.status);
@@ -1105,16 +1105,6 @@ fn action_link(
         method = method,
         label = label,
     )
-}
-
-fn encode_path(path: &[String]) -> String {
-    if path.is_empty() { return String::new(); }
-    let mut s = String::new();
-    for seg in path {
-        s.push('/');
-        s.push_str(&url_path_escape(&prefix_with_underscore(seg)));
-    }
-    s
 }
 
 fn goal_summary(g: &Goal) -> String {
@@ -1265,9 +1255,4 @@ end
         // which inserts a single space: `Disj (⊥)`.
         assert_eq!(goal_summary(&Goal::Disj(Disj(vec![]))), "Disj (\u{22A5})");
     }
-
-    // (Contradiction-reason rendering is now handled by the shared
-    // `--prove` renderer `tamarin_theory::pretty_theory::pretty_proof_method_inline`
-    // that `method_label` delegates to; the former duplicate
-    // `pretty_contradiction` port here was removed.)
 }

@@ -540,7 +540,7 @@ mod tests {
         assert_eq!(b, " hello ");
     }
 
-    // --- Finding 1: full Parsec/Haskell escape decoding for string_literal ---
+    // --- string_literal: full Parsec/Haskell escape decoding ---
 
     #[test]
     fn string_literal_decodes_char_escapes() {
@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(l.string_literal(), None);
     }
 
-    // --- Finding 1: strict export_body grammar ---
+    // --- export_body: strict grammar ---
 
     #[test]
     fn export_body_accepts_only_backslash_and_quote_escapes() {
@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(l.export_body(), None);
     }
 
-    // --- Finding 4: formal_comment rejects a body-internal lone `*` ---
+    // --- formal_comment: rejects a body-internal lone `*` ---
 
     #[test]
     fn formal_comment_rejects_internal_lone_star() {
@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(l.formal_comment(), None);
     }
 
-    // --- Finding 5: single_quoted strips leading whitespace (lexeme open quote) ---
+    // --- single_quoted: strips leading whitespace (lexeme open quote) ---
 
     #[test]
     fn single_quoted_strips_leading_ws_keeps_trailing() {
@@ -617,7 +617,7 @@ mod tests {
         assert_eq!(b.single_quoted().as_deref(), Some("n "));
     }
 
-    // --- Finding 2: identifier rejects reserved names ---
+    // --- identifier: rejects reserved names ---
 
     #[test]
     fn identifier_rejects_reserved_names() {

@@ -93,12 +93,6 @@ struct Subst {
     map: BTreeMap<String, p::Term>,
 }
 
-impl Subst {
-    fn lookup(&self, name: &str) -> Option<&p::Term> {
-        self.map.get(name)
-    }
-}
-
 // =============================================================================
 // Recursion
 // =============================================================================
@@ -480,28 +474,12 @@ fn find_predicate<'a>(preds: &'a [p::Predicate], fact: &p::Fact) -> Option<&'a p
     })
 }
 
+/// Name-keyed term substitution.  Delegates to the shared
+/// `macro_expand::subst_term_by_name` (the `Subst` newtype is just a wrapper
+/// around the same `BTreeMap<String, p::Term>`), keeping predicate- and
+/// macro-expansion substitution in lockstep.
 fn subst_term(t: &p::Term, subst: &Subst) -> p::Term {
-    match t {
-        p::Term::Var(v) => match subst.lookup(&v.name) {
-            Some(replacement) => replacement.clone(),
-            None => t.clone(),
-        },
-        p::Term::App(name, args) =>
-            p::Term::App(name.clone(), args.iter().map(|a| subst_term(a, subst)).collect()),
-        p::Term::AlgApp(name, a, b) => p::Term::AlgApp(
-            name.clone(),
-            Box::new(subst_term(a, subst)),
-            Box::new(subst_term(b, subst)),
-        ),
-        p::Term::Pair(items) => p::Term::Pair(items.iter().map(|a| subst_term(a, subst)).collect()),
-        p::Term::Diff(a, b) =>
-            p::Term::Diff(Box::new(subst_term(a, subst)), Box::new(subst_term(b, subst))),
-        p::Term::BinOp(op, a, b) =>
-            p::Term::BinOp(*op, Box::new(subst_term(a, subst)), Box::new(subst_term(b, subst))),
-        p::Term::PatMatch(inner) =>
-            p::Term::PatMatch(Box::new(subst_term(inner, subst))),
-        other => other.clone(),
-    }
+    crate::macro_expand::subst_term_by_name(t, &subst.map)
 }
 
 #[cfg(test)]

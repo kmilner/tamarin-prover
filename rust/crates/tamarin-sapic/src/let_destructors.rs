@@ -385,121 +385,21 @@ fn subst_cond_formula(
     f: &tamarin_parser::ast::Formula,
 ) -> tamarin_parser::ast::Formula {
     use tamarin_parser::ast as p;
-    fn varspec_sort(s: &p::SortHint) -> tamarin_term::lterm::LSort {
-        use tamarin_term::lterm::LSort;
-        match s {
-            p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) => LSort::Fresh,
-            p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) => LSort::Pub,
-            p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node) => LSort::Node,
-            p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat) => LSort::Nat,
-            p::SortHint::Msg | p::SortHint::Suffix(p::SuffixSort::Msg) | p::SortHint::Untagged => {
-                LSort::Msg
-            }
-        }
-    }
-    // The image of a `let`-bound free var, lowered into the parser-AST term
+    // For each FREE `Var`, its `let`-bound image lowered into the parser-AST term
     // universe (via the LN form, so AC normal form / pub-literal rendering match
-    // HS).  Returns `None` if `v` is not in the subst domain.
-    fn image(subst: &Subst<Name, SapicLVar>, v: &p::VarSpec) -> Option<p::Term> {
-        let lv = LVar::new(v.name.clone(), varspec_sort(&v.sort), v.idx);
+    // HS).  `None` leaves the var unchanged (not in the subst domain).
+    crate::convert::map_free_terms(f, &mut |v: &p::VarSpec, _bound| {
+        let lv = LVar::new(v.name.clone(), crate::convert::sort_of_hint(&v.sort), v.idx);
         // The Case-B subst keys an untyped `SapicLVar` (and, when the bound var
         // was typed, its typed variant too); a `Cond`-formula var is untyped, so
         // probe the untyped key first, then the typed-erased path.
         let img = subst
             .image_of(&SapicLVar::untyped(lv.clone()))
             .or_else(|| subst.image_of(&SapicLVar::new(lv.clone(), None)));
-        img.map(|t| crate::base_translation::ln_term_to_parser(&crate::base_translation::to_ln_term(t)))
-    }
-    fn rt(subst: &Subst<Name, SapicLVar>, bound: &[String], t: &p::Term) -> p::Term {
-        match t {
-            p::Term::Var(v) => {
-                if bound.iter().any(|n| n == &v.name) {
-                    return t.clone();
-                }
-                match image(subst, v) {
-                    Some(rep) => rep,
-                    None => t.clone(),
-                }
-            }
-            p::Term::App(n, args) => {
-                p::Term::App(n.clone(), args.iter().map(|a| rt(subst, bound, a)).collect())
-            }
-            p::Term::Pair(items) => {
-                p::Term::Pair(items.iter().map(|a| rt(subst, bound, a)).collect())
-            }
-            p::Term::AlgApp(n, a, b) => p::Term::AlgApp(
-                n.clone(),
-                Box::new(rt(subst, bound, a)),
-                Box::new(rt(subst, bound, b)),
-            ),
-            p::Term::Diff(a, b) => {
-                p::Term::Diff(Box::new(rt(subst, bound, a)), Box::new(rt(subst, bound, b)))
-            }
-            p::Term::BinOp(op, a, b) => {
-                p::Term::BinOp(*op, Box::new(rt(subst, bound, a)), Box::new(rt(subst, bound, b)))
-            }
-            p::Term::PatMatch(inner) => p::Term::PatMatch(Box::new(rt(subst, bound, inner))),
-            other => other.clone(),
-        }
-    }
-    fn ra(subst: &Subst<Name, SapicLVar>, bound: &[String], a: &p::Atom) -> p::Atom {
-        use p::Atom::*;
-        match a {
-            Eq(l, r) => Eq(rt(subst, bound, l), rt(subst, bound, r)),
-            Less(l, r) => Less(rt(subst, bound, l), rt(subst, bound, r)),
-            LessMset(l, r) => LessMset(rt(subst, bound, l), rt(subst, bound, r)),
-            Subterm(l, r) => Subterm(rt(subst, bound, l), rt(subst, bound, r)),
-            Action(fa, t) => Action(
-                p::Fact {
-                    persistent: fa.persistent,
-                    name: fa.name.clone(),
-                    args: fa.args.iter().map(|x| rt(subst, bound, x)).collect(),
-                    annotations: fa.annotations.clone(),
-                },
-                rt(subst, bound, t),
-            ),
-            Last(t) => Last(rt(subst, bound, t)),
-            Pred(fa) => Pred(p::Fact {
-                persistent: fa.persistent,
-                name: fa.name.clone(),
-                args: fa.args.iter().map(|x| rt(subst, bound, x)).collect(),
-                annotations: fa.annotations.clone(),
-            }),
-        }
-    }
-    fn rf(subst: &Subst<Name, SapicLVar>, bound: &mut Vec<String>, f: &p::Formula) -> p::Formula {
-        use p::Formula::*;
-        match f {
-            True => True,
-            False => False,
-            Atom(a) => Atom(ra(subst, bound, a)),
-            Not(g) => Not(Box::new(rf(subst, bound, g))),
-            And(a, b) => And(Box::new(rf(subst, bound, a)), Box::new(rf(subst, bound, b))),
-            Or(a, b) => Or(Box::new(rf(subst, bound, a)), Box::new(rf(subst, bound, b))),
-            Implies(a, b) => Implies(Box::new(rf(subst, bound, a)), Box::new(rf(subst, bound, b))),
-            Iff(a, b) => Iff(Box::new(rf(subst, bound, a)), Box::new(rf(subst, bound, b))),
-            Forall(vs, body) => {
-                let saved = bound.len();
-                for v in vs {
-                    bound.push(v.name.clone());
-                }
-                let r = Forall(vs.clone(), Box::new(rf(subst, bound, body)));
-                bound.truncate(saved);
-                r
-            }
-            Exists(vs, body) => {
-                let saved = bound.len();
-                for v in vs {
-                    bound.push(v.name.clone());
-                }
-                let r = Exists(vs.clone(), Box::new(rf(subst, bound, body)));
-                bound.truncate(saved);
-                r
-            }
-        }
-    }
-    let mut bound = Vec::new();
-    rf(subst, &mut bound, f)
+        img.map(|t| {
+            crate::base_translation::ln_term_to_parser(&crate::base_translation::to_ln_term(t))
+        })
+    })
 }
 
 /// Lift an `LNTerm` (untyped) back to a SAPIC term (all variables untyped).

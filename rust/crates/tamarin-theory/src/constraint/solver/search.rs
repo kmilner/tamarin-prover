@@ -497,11 +497,23 @@ fn re_expand_depth_limited(
     // Re-roll up the parent's status from current children — mirrors
     // `expand_inner`'s `node.status = if any_solved ...` rollup
     // (the `Semigroup ProofStatus` port below).
+    if !node.children.is_empty() {
+        node.status = rollup_from_children(&node.children);
+    }
+}
+
+/// Roll a node's children up into its status, mirroring Haskell's
+/// `Semigroup ProofStatus` precedence (`Theory.Proof:409`):
+/// `Solved` > `Sorry` > `Unfinishable` > `Contradictory`.  Returns
+/// `Sorry` for an empty child set (the defensive fallback both call
+/// sites already used); a caller that must leave `status` untouched on
+/// empty children guards the call itself.
+fn rollup_from_children(children: &BTreeMap<String, ProofNode>) -> NodeStatus {
     let mut any_solved = false;
     let mut any_contra = false;
     let mut any_unfin = false;
     let mut any_sorry = false;
-    for child in node.children.values() {
+    for child in children.values() {
         match child.status {
             NodeStatus::Solved => any_solved = true,
             NodeStatus::Contradictory => any_contra = true,
@@ -510,18 +522,16 @@ fn re_expand_depth_limited(
             NodeStatus::Open => {}
         }
     }
-    if !node.children.is_empty() {
-        node.status = if any_solved {
-            NodeStatus::Solved
-        } else if any_sorry {
-            NodeStatus::Sorry
-        } else if any_unfin {
-            NodeStatus::Unfinishable
-        } else if any_contra {
-            NodeStatus::Contradictory
-        } else {
-            NodeStatus::Sorry
-        };
+    if any_solved {
+        NodeStatus::Solved
+    } else if any_sorry {
+        NodeStatus::Sorry
+    } else if any_unfin {
+        NodeStatus::Unfinishable
+    } else if any_contra {
+        NodeStatus::Contradictory
+    } else {
+        NodeStatus::Sorry
     }
 }
 
@@ -666,10 +676,6 @@ fn expand_inner(
         };
         return;
     }
-    let mut any_contra = false;
-    let mut any_solved = false;
-    let mut any_unfin = false;
-    let mut any_sorry = false;
     // Early-break-on-Solved (Haskell `foldMap` semantics):
     //
     // Haskell's Disj-monad is lazy — once any branch returns
@@ -754,24 +760,13 @@ fn expand_inner(
         let path_snapshot: Vec<String> =
             crate::constraint::solver::trace::case_path_snapshot();
         let deadline_snapshot = *deadline;
-        // B1 (lemma-level parallelism) faithfulness: `run_proof_search` now
-        // runs on a rayon WORKER thread (the outer per-lemma `par_iter`
-        // dispatches it there), so `into_par_iter().collect()` below — called
-        // from a worker — lets rayon run the per-case closures ON THIS SAME
-        // THREAD (work-participation), where they mutate the per-search
-        // thread-locals (`DEPTH_LIMIT_HIT` reset to false at the top of each
-        // closure; `MAX_DEPTH`/`DEADLINE`/case_path re-seeded).  Pre-B1,
-        // `run_proof_search` ran on `main` while the closures ran on distinct
-        // worker threads, so those mutations were isolated from the search's
-        // own flags.  Under B1 they are NOT — a later non-depth-limited
-        // sibling closure's `DEPTH_LIMIT_HIT = false` would clobber an earlier
-        // sibling's `true`, and the search's `MAX_DEPTH`/case_path would be
-        // left at a worker's value.  Snapshot the parent's per-search
-        // thread-locals here and restore them after `collect`, folding
-        // `DEPTH_LIMIT_HIT` as `prior || any_hit` so the parallel branch's
-        // effect on the search's flags is IDENTICAL to the serial branch
-        // (which only ever raises `DEPTH_LIMIT_HIT`, never lowers it).  This
-        // is output-neutral whether or not B1 is active.
+        // `run_proof_search` runs on a rayon WORKER thread, so
+        // `into_par_iter().collect()` runs the per-case closures ON THIS SAME
+        // THREAD, mutating per-search thread-locals (`DEPTH_LIMIT_HIT`,
+        // `MAX_DEPTH`, `DEADLINE`, case_path).  A sibling's `false` could
+        // clobber an earlier `true`.  Snapshot the parent's thread-locals and
+        // restore after `collect`, folding `DEPTH_LIMIT_HIT` as
+        // `prior || any_hit`, matching the serial branch.
         let parent_depth_limit_hit = DEPTH_LIMIT_HIT.with(|f| f.get());
         let results: Vec<(String, ProofNode, bool)> = cases.into_par_iter().map(|(name, sys)| {
             // Each rayon worker has its own thread-locals.  Initialise
@@ -785,37 +780,14 @@ fn expand_inner(
             crate::constraint::solver::trace::case_path_set(&path_snapshot);
             let push_path = !name.is_empty();
             if push_path { crate::constraint::solver::trace::case_path_push(&name); }
-            // === Determinism fix: per-worker MaudeHandle ===
+            // Per-worker MaudeHandle: siblings must not share `ctx.maude`'s
+            // `fresh_counter` -- concurrent mutation would make LVar.idx
+            // allocation (and proof-tree shape) depend on worker interleaving,
+            // breaking deterministic output.
             //
-            // The original parallel branch shared `ctx.maude`'s
-            // `Arc<AtomicU64> fresh_counter` across sibling workers.
-            // Multiple sites mutate this counter as a side-effect of
-            // ordinary solving (`reset_counter_to` in proof_method.rs,
-            // `ensure_above` in reduction.rs, `ensure_above`/
-            // `reset_counter_to`/`reserve_idxs` in sources.rs, the
-            // per-var `reserve_idxs(1)` in `freshen_system_some_inst`).
-            // Under rayon, two workers' interleavings race on these
-            // ops: worker A's apply_source allocates LVar indices that
-            // depend on whether worker B's apply_source has run yet,
-            // producing different LVar.idx in A's subsystem across
-            // runs.  Because LVar.idx is part of System content (and
-            // hence of goal-equality, dedup, and rank inputs), the
-            // resulting proof tree shape diverges.  Observable on
-            // wireguard::key_secrecy as 190/189/188/163/151/147/126
-            // steps across runs (default --processors).
-            //
-            // HS-faithful fix: HS's `runReduction m ctxt sys (avoid sys)`
-            // is called per child case (ProofMethod.hs:306, inside
-            // `process`) with a FRESH FreshT counter seeded from
-            // `avoid sys`.  In HS
-            // siblings never share a counter — each child case has
-            // its own FreshT.  We mirror that by cloning `ctx.maude`
-            // with its OWN `fresh_counter` per worker, seeded the
-            // same way `Reduction::new` does (bounds_max(sys) + 1).
-            // Sibling workers' allocations are now independent and
-            // deterministic given the worker's own sys.  Within a
-            // worker the whole subtree is sequential, so the counter
-            // is race-free.
+            // HS-faithful: HS seeds a fresh FreshT counter per child case from
+            // `avoid sys` (ProofMethod.hs:306).  Mirror by cloning `ctx.maude`
+            // with its own `fresh_counter` per worker (bounds_max(sys) + 1).
             //
             // If a `maude_pool` is configured, also borrow a per-worker
             // Maude subprocess so workers don't serialise on the
@@ -875,16 +847,13 @@ fn expand_inner(
         DEADLINE.with(|d| d.set(Some(deadline_snapshot)));
         crate::constraint::solver::trace::case_path_set(&path_snapshot);
         for (name, child, _hit) in results {
-            match child.status {
-                NodeStatus::Solved => any_solved = true,
-                NodeStatus::Contradictory => any_contra = true,
-                NodeStatus::Unfinishable => any_unfin = true,
-                NodeStatus::Sorry => any_sorry = true,
-                NodeStatus::Open => {}
-            }
             node.children.insert(name, child);
         }
     } else {
+        // Serial branch keeps a local `any_solved` purely to drive the
+        // Haskell-lazy early break; the final node status is rolled up
+        // from `node.children` by `rollup_from_children` below.
+        let mut any_solved = false;
         for (name, sys) in cases {
             if any_solved { break; }  // Haskell-lazy: stop on first TraceFound.
             let mut child = ProofNode {
@@ -901,12 +870,8 @@ fn expand_inner(
             if push_path { crate::constraint::solver::trace::case_path_push(&name); }
             expand(ctx, &mut child, budget, deadline, depth + 1);
             if push_path { crate::constraint::solver::trace::case_path_pop(); }
-            match child.status {
-                NodeStatus::Solved => any_solved = true,
-                NodeStatus::Contradictory => any_contra = true,
-                NodeStatus::Unfinishable => any_unfin = true,
-                NodeStatus::Sorry => any_sorry = true,
-                NodeStatus::Open => {}
+            if matches!(child.status, NodeStatus::Solved) {
+                any_solved = true;
             }
             node.children.insert(name, child);
         }
@@ -932,23 +897,72 @@ fn expand_inner(
     // `CompleteProof` (all branches closed without finding a
     // witness) corresponds to our `Contradictory` — every path
     // exhausts to ⊥.
-    node.status = if any_solved {
-        NodeStatus::Solved
-    } else if any_sorry {
-        NodeStatus::Sorry
-    } else if any_unfin {
-        NodeStatus::Unfinishable
-    } else if any_contra {
-        // All children closed without any Solved — every path
-        // reached ⊥, so the parent is Contradictory.
-        NodeStatus::Contradictory
-    } else {
-        // No children at all — defensive fallback; the empty
-        // case-set was already handled earlier as `Contradictory`.
-        NodeStatus::Sorry
-    };
+    // (`Contradictory` = all children closed without a Solved; the
+    // empty-children fallback is `Sorry`, but the empty case-set was
+    // already handled earlier as `Contradictory`.)
+    node.status = rollup_from_children(&node.children);
     // Note: `Contradictory` is only reached when no child is
     // Solved/Sorry/Unfinishable — i.e. every branch closed to ⊥.
+}
+
+/// Run the goal ranker, centralising the two non-`Ok` outcomes shared
+/// by [`candidate_methods`] and [`candidate_methods_with_expl`]:
+///   * `Err("__ORACLE_QUIT_ON_EMPTY__")` → `Err(())`, signalling the
+///     caller to emit a single `ApplySorry` candidate (HS ProofMethod.hs:621).
+///   * any other `Err` → oracle exec failure: hard abort exactly like HS
+///     (uncaught IO exception kills the invocation with EMPTY stdout —
+///     ProofMethod.hs:608, inside `oracleRanking` under `unsafePerformIO`,
+///     where `readProcess` throws).  Print to stderr, flush stdout (so
+///     nothing leaks before exit), exit with code 1.
+fn rank_goals_or_abort(
+    sys: &System,
+    ctx: &ProofContext,
+    depth: usize,
+) -> Result<Vec<crate::constraint::solver::annotated_goals::AnnotatedGoal>, ()> {
+    match crate::constraint::solver::goals::rank_goals_with(sys, Some(ctx), depth) {
+        Ok(gs) => Ok(gs),
+        Err(e) if e.0 == "__ORACLE_QUIT_ON_EMPTY__" => Err(()),
+        Err(e) => {
+            eprintln!("tamarin-prover: {}", e);
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Insert an `Induction` candidate at the HS-mandated position when the
+/// system is in its initial state and the first formula supports
+/// induction.  Haskell's automatic path (`rankProofMethods`,
+/// ProofMethod.hs:527) gates `insertInduction` on `isInitialSystem sys`
+/// only; `execMethods` then filters non-applicable methods (the
+/// `ginduct` check here is our analog of `getInductionCases`).  Position:
+/// index 0 for `UseInduction`, index 1 (after `Simplify`) for
+/// `AvoidInduction`.  `mk` builds the element — a bare
+/// `ProofMethod::Induction`, or the `(ProofMethod::Induction, String)`
+/// pair the UI variant needs.
+fn insert_induction_at<T>(
+    out: &mut Vec<T>,
+    sys: &System,
+    ctx: &ProofContext,
+    mk: impl Fn() -> T,
+) {
+    use crate::constraint::solver::context::UseInduction;
+    if !is_initial_system(sys) {
+        return;
+    }
+    let can_induct = sys
+        .formulas
+        .first()
+        .map(|fm| crate::guarded::ginduct(fm).is_ok())
+        .unwrap_or(false);
+    if !can_induct {
+        return;
+    }
+    match ctx.use_induction {
+        UseInduction::UseInduction => out.insert(0, mk()),
+        UseInduction::AvoidInduction => out.insert(1, mk()),
+    }
 }
 
 /// Build the priority-ordered list of candidate proof methods to
@@ -971,7 +985,6 @@ pub fn candidate_methods(
     ctx: &ProofContext,
     depth: usize,
 ) -> Vec<ProofMethod> {
-    use crate::constraint::solver::context::UseInduction;
     let mut out: Vec<ProofMethod> = Vec::new();
     // Haskell-faithful: build the FULL ranked goal list, not just the
     // first one (ProofMethod.hs:520-540).  Haskell's `proofMethods`
@@ -983,28 +996,14 @@ pub fn candidate_methods(
     //
     // `depth` drives round-robin heuristic scheduling (ProofMethod.hs:581-590,
     // `useHeuristic`'s `rankings !! (depth `mod` n)`).
-    let goals_result = crate::constraint::solver::goals::rank_goals_with(sys, Some(ctx), depth);
-    let goals = match goals_result {
+    // Oracle ranked nothing and quitOnEmpty is set: emit ApplySorry.
+    // HS: `guard (quitOnEmpty && not (null inp) && null ranked) *> Just ApplySorry`
+    // (ProofMethod.hs:621, inside `oracleRanking`) — stoppingMethod fires.
+    // We represent this as an empty candidate list with a special Sorry.
+    let goals = match rank_goals_or_abort(sys, ctx, depth) {
         Ok(gs) => gs,
-        Err(e) if e.0 == "__ORACLE_QUIT_ON_EMPTY__" => {
-            // Oracle ranked nothing and quitOnEmpty is set: emit ApplySorry.
-            // HS: `guard (quitOnEmpty && not (null inp) && null ranked) *> Just ApplySorry`
-            // (ProofMethod.hs:621, inside `oracleRanking`) — stoppingMethod fires.
-            // We represent this as an empty candidate list with a special Sorry.
-            return vec![ProofMethod::Sorry(Some("Oracle ranked no proof methods".into()))];
-        }
-        Err(e) => {
-            // Oracle exec failed — hard abort.  HS behaviour: uncaught IO
-            // exception → whole tamarin-prover invocation dies with
-            // EMPTY stdout (ProofMethod.hs:608, inside `oracleRanking`
-            // under `unsafePerformIO`, where `readProcess` throws).
-            // Mirror exactly: print to stderr, flush stdout (so nothing
-            // is printed), exit with code 1.
-            eprintln!("tamarin-prover: {}", e);
-            // Flush stdout to ensure nothing leaks before exit.
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-            std::process::exit(1);
+        Err(()) => {
+            return vec![ProofMethod::Sorry(Some("Oracle ranked no proof methods".into()))]
         }
     };
     // Construct: [Simplify, goal_1, goal_2, ..., goal_N].
@@ -1013,28 +1012,7 @@ pub fn candidate_methods(
         out.push(ProofMethod::SolveGoal(g.goal));
     }
     // Insert Induction at the appropriate position in initial state.
-    // Haskell's automatic path (`rankProofMethods`, ProofMethod.hs:527)
-    // gates `insertInduction` on `isInitialSystem sys` only; `execMethods`
-    // then filters non-applicable methods (the `ginduct` check below is
-    // our analog of `getInductionCases`).
-    let initial = is_initial_system(sys);
-    if initial {
-        let can_induct = sys.formulas.first()
-            .map(|fm| crate::guarded::ginduct(fm).is_ok())
-            .unwrap_or(false);
-        if can_induct {
-            match ctx.use_induction {
-                UseInduction::UseInduction => {
-                    // [Induction, Simplify, goals...]
-                    out.insert(0, ProofMethod::Induction);
-                }
-                UseInduction::AvoidInduction => {
-                    // [Simplify, Induction, goals...]
-                    out.insert(1, ProofMethod::Induction);
-                }
-            }
-        }
-    }
+    insert_induction_at(&mut out, sys, ctx, || ProofMethod::Induction);
     out
 }
 
@@ -1057,22 +1035,14 @@ pub fn candidate_methods_with_expl(
 ) -> Vec<(ProofMethod, String)> {
     use crate::constraint::constraints::Goal;
     use crate::constraint::solver::annotated_goals::Usefulness;
-    use crate::constraint::solver::context::UseInduction;
-    let goals = match crate::constraint::solver::goals::rank_goals_with(sys, Some(ctx), depth) {
+    // Oracle ranked nothing with quitOnEmpty → ApplySorry (expl "").
+    let goals = match rank_goals_or_abort(sys, ctx, depth) {
         Ok(gs) => gs,
-        // Oracle ranked nothing with quitOnEmpty → ApplySorry (expl "").
-        Err(e) if e.0 == "__ORACLE_QUIT_ON_EMPTY__" => {
+        Err(()) => {
             return vec![(
                 ProofMethod::Sorry(Some("Oracle ranked no proof methods".into())),
                 String::new(),
-            )];
-        }
-        // Oracle exec failure — same hard abort as `candidate_methods`.
-        Err(e) => {
-            eprintln!("tamarin-prover: {}", e);
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-            std::process::exit(1);
+            )]
         }
     };
     let mut out: Vec<(ProofMethod, String)> = Vec::with_capacity(goals.len() + 2);
@@ -1095,21 +1065,7 @@ pub fn candidate_methods_with_expl(
         let expl = format!("nr. {}{}{}", ag.seq, source_rule, suffix);
         out.push((ProofMethod::SolveGoal(ag.goal), expl));
     }
-    if is_initial_system(sys) {
-        let can_induct = sys
-            .formulas
-            .first()
-            .map(|fm| crate::guarded::ginduct(fm).is_ok())
-            .unwrap_or(false);
-        if can_induct {
-            match ctx.use_induction {
-                UseInduction::UseInduction => out.insert(0, (ProofMethod::Induction, String::new())),
-                UseInduction::AvoidInduction => {
-                    out.insert(1, (ProofMethod::Induction, String::new()))
-                }
-            }
-        }
-    }
+    insert_induction_at(&mut out, sys, ctx, || (ProofMethod::Induction, String::new()));
     out
 }
 

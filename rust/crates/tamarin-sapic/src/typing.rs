@@ -141,70 +141,10 @@ fn collect_comb_vars(c: &ProcessCombinator<SapicLVar>, out: &mut std::collection
 /// quantifier).  Used to seed the `renameUnique` avoidance set and as the
 /// rename domain.
 fn cond_formula_free_lvars(f: &tamarin_parser::ast::Formula) -> Vec<LVar> {
-    use tamarin_parser::ast as p;
-    fn collect_term(t: &p::Term, bound: &[String], out: &mut Vec<LVar>) {
-        match t {
-            p::Term::Var(v)
-                if !bound.iter().any(|n| n == &v.name) => {
-                    out.push(LVar::new(v.name.clone(), crate::convert::sort_of_hint(&v.sort), v.idx));
-                }
-            p::Term::App(_, args) | p::Term::Pair(args) => {
-                for a in args {
-                    collect_term(a, bound, out);
-                }
-            }
-            p::Term::AlgApp(_, a, b) | p::Term::Diff(a, b) | p::Term::BinOp(_, a, b) => {
-                collect_term(a, bound, out);
-                collect_term(b, bound, out);
-            }
-            p::Term::PatMatch(inner) => collect_term(inner, bound, out),
-            _ => {}
-        }
-    }
-    fn collect_atom(a: &p::Atom, bound: &[String], out: &mut Vec<LVar>) {
-        use p::Atom::*;
-        match a {
-            Eq(l, r) | Less(l, r) | LessMset(l, r) | Subterm(l, r) => {
-                collect_term(l, bound, out);
-                collect_term(r, bound, out);
-            }
-            Action(fa, t) => {
-                for arg in &fa.args {
-                    collect_term(arg, bound, out);
-                }
-                collect_term(t, bound, out);
-            }
-            Last(t) => collect_term(t, bound, out),
-            Pred(fa) => {
-                for arg in &fa.args {
-                    collect_term(arg, bound, out);
-                }
-            }
-        }
-    }
-    fn collect(f: &p::Formula, bound: &mut Vec<String>, out: &mut Vec<LVar>) {
-        use p::Formula::*;
-        match f {
-            True | False => {}
-            Atom(a) => collect_atom(a, bound, out),
-            Not(g) => collect(g, bound, out),
-            And(a, b) | Or(a, b) | Implies(a, b) | Iff(a, b) => {
-                collect(a, bound, out);
-                collect(b, bound, out);
-            }
-            Forall(vs, body) | Exists(vs, body) => {
-                let saved = bound.len();
-                for v in vs {
-                    bound.push(v.name.clone());
-                }
-                collect(body, bound, out);
-                bound.truncate(saved);
-            }
-        }
-    }
     let mut out = Vec::new();
-    let mut bound = Vec::new();
-    collect(f, &mut bound, &mut out);
+    crate::convert::fold_free_vars(f, &mut |v, _bound| {
+        out.push(LVar::new(v.name.clone(), crate::convert::sort_of_hint(&v.sort), v.idx));
+    });
     out
 }
 
@@ -218,104 +158,17 @@ fn rename_cond_formula(
     f: &tamarin_parser::ast::Formula,
 ) -> tamarin_parser::ast::Formula {
     use tamarin_parser::ast as p;
-    fn rt(subst: &BTreeMap<LVar, LVar>, bound: &[String], t: &p::Term) -> p::Term {
-        match t {
-            p::Term::Var(v) => {
-                if bound.iter().any(|n| n == &v.name) {
-                    return t.clone();
-                }
-                let key = LVar::new(v.name.clone(), crate::convert::sort_of_hint(&v.sort), v.idx);
-                match subst.get(&key) {
-                    Some(nv) => p::Term::Var(p::VarSpec {
-                        name: nv.name.to_string(),
-                        idx: nv.idx,
-                        sort: v.sort,
-                        typ: v.typ.clone(),
-                    }),
-                    None => t.clone(),
-                }
-            }
-            p::Term::App(n, args) => {
-                p::Term::App(n.clone(), args.iter().map(|a| rt(subst, bound, a)).collect())
-            }
-            p::Term::Pair(items) => {
-                p::Term::Pair(items.iter().map(|a| rt(subst, bound, a)).collect())
-            }
-            p::Term::AlgApp(n, a, b) => p::Term::AlgApp(
-                n.clone(),
-                Box::new(rt(subst, bound, a)),
-                Box::new(rt(subst, bound, b)),
-            ),
-            p::Term::Diff(a, b) => {
-                p::Term::Diff(Box::new(rt(subst, bound, a)), Box::new(rt(subst, bound, b)))
-            }
-            p::Term::BinOp(op, a, b) => {
-                p::Term::BinOp(*op, Box::new(rt(subst, bound, a)), Box::new(rt(subst, bound, b)))
-            }
-            p::Term::PatMatch(inner) => p::Term::PatMatch(Box::new(rt(subst, bound, inner))),
-            other => other.clone(),
-        }
-    }
-    fn ra(subst: &BTreeMap<LVar, LVar>, bound: &[String], a: &p::Atom) -> p::Atom {
-        use p::Atom::*;
-        match a {
-            Eq(l, r) => Eq(rt(subst, bound, l), rt(subst, bound, r)),
-            Less(l, r) => Less(rt(subst, bound, l), rt(subst, bound, r)),
-            LessMset(l, r) => LessMset(rt(subst, bound, l), rt(subst, bound, r)),
-            Subterm(l, r) => Subterm(rt(subst, bound, l), rt(subst, bound, r)),
-            Action(fa, t) => Action(
-                p::Fact {
-                    persistent: fa.persistent,
-                    name: fa.name.clone(),
-                    args: fa.args.iter().map(|x| rt(subst, bound, x)).collect(),
-                    annotations: fa.annotations.clone(),
-                },
-                rt(subst, bound, t),
-            ),
-            Last(t) => Last(rt(subst, bound, t)),
-            Pred(fa) => Pred(p::Fact {
-                persistent: fa.persistent,
-                name: fa.name.clone(),
-                args: fa.args.iter().map(|x| rt(subst, bound, x)).collect(),
-                annotations: fa.annotations.clone(),
-            }),
-        }
-    }
-    fn rf(subst: &BTreeMap<LVar, LVar>, bound: &mut Vec<String>, f: &p::Formula) -> p::Formula {
-        use p::Formula::*;
-        match f {
-            True => True,
-            False => False,
-            Atom(a) => Atom(ra(subst, bound, a)),
-            Not(g) => Not(Box::new(rf(subst, bound, g))),
-            And(a, b) => And(Box::new(rf(subst, bound, a)), Box::new(rf(subst, bound, b))),
-            Or(a, b) => Or(Box::new(rf(subst, bound, a)), Box::new(rf(subst, bound, b))),
-            Implies(a, b) => {
-                Implies(Box::new(rf(subst, bound, a)), Box::new(rf(subst, bound, b)))
-            }
-            Iff(a, b) => Iff(Box::new(rf(subst, bound, a)), Box::new(rf(subst, bound, b))),
-            Forall(vs, body) => {
-                let saved = bound.len();
-                for v in vs {
-                    bound.push(v.name.clone());
-                }
-                let r = Forall(vs.clone(), Box::new(rf(subst, bound, body)));
-                bound.truncate(saved);
-                r
-            }
-            Exists(vs, body) => {
-                let saved = bound.len();
-                for v in vs {
-                    bound.push(v.name.clone());
-                }
-                let r = Exists(vs.clone(), Box::new(rf(subst, bound, body)));
-                bound.truncate(saved);
-                r
-            }
-        }
-    }
-    let mut bound = Vec::new();
-    rf(subst, &mut bound, f)
+    crate::convert::map_free_terms(f, &mut |v, _bound| {
+        let key = LVar::new(v.name.clone(), crate::convert::sort_of_hint(&v.sort), v.idx);
+        subst.get(&key).map(|nv| {
+            p::Term::Var(p::VarSpec {
+                name: nv.name.to_string(),
+                idx: nv.idx,
+                sort: v.sort,
+                typ: v.typ.clone(),
+            })
+        })
+    })
 }
 
 /// Rename a SAPIC term's variables according to `subst` (`LVar -> LVar`),

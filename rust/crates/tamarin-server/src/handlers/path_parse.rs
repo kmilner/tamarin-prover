@@ -76,6 +76,20 @@ pub fn prefix_with_underscore(s: &str) -> String {
     else { s.to_string() }
 }
 
+/// Encode a proof/method sub-path as leading-slash-joined URL segments,
+/// applying [`prefix_with_underscore`] then [`url_path_escape`] to each
+/// (mirrors Yesod `getUrlRender`'s per-segment encoding).  Empty input
+/// yields the empty string, so callers can append the result directly
+/// after `.../proof/<lemma>` or `.../method/<lemma>/<idx>`.
+pub fn encode_sub_path(sub: &[String]) -> String {
+    let mut s = String::new();
+    for seg in sub {
+        s.push('/');
+        s.push_str(&url_path_escape(&prefix_with_underscore(seg)));
+    }
+    s
+}
+
 /// Inverse of [`prefix_with_underscore`].
 pub fn unprefix_underscore(s: &str) -> String {
     if s == "_" { String::new() }
