@@ -84,8 +84,8 @@ impl Eq for NoEqSym {}
 // (a correctness lint: a derived `Hash` next to a hand-written `Eq` risks the
 // `a == b ⇒ hash(a) == hash(b)` invariant being violated).  Here both are
 // content-based — the `Eq`/`Ord` pointer fast-path only ever returns early when
-// the contents are provably equal — so the invariant holds.  The field order
-// matches the previous `derive(Hash)`, keeping the hash byte-identical.
+// the contents are provably equal — so the invariant holds.  The field order matches
+// Eq/Ord's (name, arity, privacy, constructability).
 impl std::hash::Hash for NoEqSym {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -98,8 +98,8 @@ impl std::hash::Hash for NoEqSym {
 impl Ord for NoEqSym {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Field order matches the previous derive: name, arity, privacy,
-        // constructability.  Only the name compare gains the ptr fast-path.
+        // Field order: name, arity, privacy, constructability (consistent with
+        // Eq/Hash).  Only the name compare gains the ptr fast-path.
         let name_ord = if std::ptr::eq(self.name.as_ptr(), other.name.as_ptr()) {
             std::cmp::Ordering::Equal
         } else {

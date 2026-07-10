@@ -744,8 +744,7 @@ fn fact_terms_match_exact(
             Some(t) => &t == r,
             // Unparseable / unconvertible arg: we cannot establish exact
             // equality.  HS always has a concrete parsed term here, so
-            // failing closed (no match) mirrors an `M.member` miss rather
-            // than the old too-loose "treat as matching" behaviour.
+            // failing closed (no match) mirrors an `M.member` miss.
             None => false,
         }
     })
@@ -1050,7 +1049,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             let want_tgt = tgt_var;
             let want_c = *conc_idx as usize;
             let want_p = *prem_idx as usize;
-            let mut matches: Vec<&Goal> = sys.goals
+            let matches: Vec<&Goal> = sys.goals
                 .iter()
                 .filter(|(_, st)| !st.solved)
                 .filter_map(|(g, _)| match g {
@@ -1066,13 +1065,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                     _ => None,
                 })
                 .collect();
-            if matches.len() == 1 {
-                return Some(matches.remove(0).clone());
-            }
-            if !matches.is_empty() {
-                return Some(matches[0].clone());
-            }
-            None
+            matches.first().copied().cloned()
         }
         GoalSpec::Subterm { small_raw, big_raw } => {
             // HS `stSplitGoal` (Proof.hs:63-66) parses to
@@ -1089,7 +1082,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             use tamarin_term::pretty::pretty_lnterm;
             let want_small = canonicalise_term_text(small_raw);
             let want_big = canonicalise_term_text(big_raw);
-            let mut matches: Vec<&Goal> = sys.goals
+            let matches: Vec<&Goal> = sys.goals
                 .iter()
                 .filter(|(_, st)| !st.solved)
                 .filter_map(|(g, _)| match g {
@@ -1103,11 +1096,8 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                     _ => None,
                 })
                 .collect();
-            if matches.len() == 1 {
-                return Some(matches.remove(0).clone());
-            }
-            if !matches.is_empty() {
-                return Some(matches[0].clone());
+            if let Some(g) = matches.first() {
+                return Some((*g).clone());
             }
             // Fallback: if exactly one open Subterm goal exists, use
             // it (the skeleton text uniquely identifies it by being
@@ -1360,7 +1350,7 @@ mod tests {
         let ctx = ProofContext::new(h, Vec::new());
         let mut sys = System::empty();
         // Force out of initial state so is_finished can run.
-        sys.solved_formulas.push(crate::guarded::gtrue());
+        sys.solved_formulas.push(std::sync::Arc::new(crate::guarded::gtrue()));
         let skel = ParsedProofTree {
             method: ParsedMethod::Contradiction,
             cases: Vec::new(),

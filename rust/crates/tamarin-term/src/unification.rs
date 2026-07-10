@@ -662,8 +662,8 @@ mod tests {
         // pattern = mult(a,b) (AC), subject = x (var).  Subject is a Lit
         // Var, NOT an FApp(AC) — HS reaches `_ -> NoMatcher`, not the
         // AC arm (which needs BOTH sides AC-headed).  This is the exact
-        // LAK06 shape (`Xor(..)` pattern vs `k.0` var subject) that the
-        // old `any_ac_op` heuristic wrongly shipped to Maude.
+        // LAK06 shape (`Xor(..)` pattern vs `k.0` var subject): the AC-headed
+        // pattern facing a var subject is NoMatcher, never a Maude fallback.
         let t: LNTerm = msg_var("x", 0);
         let p: LNTerm = mult(msg_var("a", 0), msg_var("b", 0));
         match solve_match_lterm(&sn, Match::match_with(t, p)) {
@@ -709,8 +709,8 @@ mod tests {
 // Haskell-faithfulness invariants
 // =============================================================================
 //
-// These tests pin semantic choices we missed during the initial port and
-// only caught after weeks of mis-directed debugging.  The cost of getting
+// These tests pin subtle term-layer semantic choices whose violation is
+// easy to miss.  The cost of getting
 // any of these wrong is a silent divergence — the wrong unifier "works"
 // in the logical sense (produces equivalent equality classes) but the
 // SHAPE of the result differs, which downstream code can implicitly

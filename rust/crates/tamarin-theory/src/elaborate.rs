@@ -1507,26 +1507,12 @@ pub fn canonicalize_ac_in_pterm(t: &p::Term) -> p::Term {
 
 /// Apply `canonicalize_ac_in_pterm` to every term in a fact.
 pub fn canonicalize_ac_in_pfact(f: &p::Fact) -> p::Fact {
-    let mut out = f.clone();
-    for arg in out.args.iter_mut() {
-        *arg = canonicalize_ac_in_pterm(arg);
-    }
-    out
+    crate::macro_expand::map_fact_terms(f, &|t| canonicalize_ac_in_pterm(t))
 }
 
 /// Apply `canonicalize_ac_in_pterm` to every term in a parser-AST atom.
 pub fn canonicalize_ac_in_atom(a: &p::Atom) -> p::Atom {
-    use p::Atom::*;
-    let ct = canonicalize_ac_in_pterm;
-    match a {
-        Eq(x, y) => Eq(ct(x), ct(y)),
-        Less(x, y) => Less(ct(x), ct(y)),
-        LessMset(x, y) => LessMset(ct(x), ct(y)),
-        Subterm(x, y) => Subterm(ct(x), ct(y)),
-        Action(f, t) => Action(canonicalize_ac_in_pfact(f), ct(t)),
-        Last(t) => Last(ct(t)),
-        Pred(f) => Pred(canonicalize_ac_in_pfact(f)),
-    }
+    crate::macro_expand::map_atom_terms(a, &|t| canonicalize_ac_in_pterm(t))
 }
 
 /// Apply `canonicalize_ac_in_pterm` to every term in a parser-AST formula.
@@ -1538,29 +1524,7 @@ pub fn canonicalize_ac_in_atom(a: &p::Atom) -> p::Atom {
 /// order on the free-variable parser AST so the subsequent guarded conversion
 /// (Free→Bound abstraction) preserves exactly what HS would have produced.
 pub fn canonicalize_ac_in_formula(f: &p::Formula) -> p::Formula {
-    use p::Formula::*;
-    match f {
-        False => False,
-        True => True,
-        Atom(a) => Atom(canonicalize_ac_in_atom(a)),
-        Not(g) => Not(Box::new(canonicalize_ac_in_formula(g))),
-        And(g, h) => And(
-            Box::new(canonicalize_ac_in_formula(g)),
-            Box::new(canonicalize_ac_in_formula(h))),
-        Or(g, h) => Or(
-            Box::new(canonicalize_ac_in_formula(g)),
-            Box::new(canonicalize_ac_in_formula(h))),
-        Implies(g, h) => Implies(
-            Box::new(canonicalize_ac_in_formula(g)),
-            Box::new(canonicalize_ac_in_formula(h))),
-        Iff(g, h) => Iff(
-            Box::new(canonicalize_ac_in_formula(g)),
-            Box::new(canonicalize_ac_in_formula(h))),
-        Forall(vs, g) => Forall(vs.clone(),
-            Box::new(canonicalize_ac_in_formula(g))),
-        Exists(vs, g) => Exists(vs.clone(),
-            Box::new(canonicalize_ac_in_formula(g))),
-    }
+    crate::macro_expand::map_formula_terms(f, &|t| canonicalize_ac_in_pterm(t))
 }
 
 /// Names of arity-1 NoEq function symbols in the (closed-theory) signature.
@@ -1635,12 +1599,7 @@ pub fn rewrite_arity1_fact(
     fa: &p::Fact,
     arity1: &std::collections::HashSet<String>,
 ) -> p::Fact {
-    p::Fact {
-        persistent: fa.persistent,
-        name: fa.name.clone(),
-        args: fa.args.iter().map(|a| rewrite_arity1_term(a, arity1)).collect(),
-        annotations: fa.annotations.clone(),
-    }
+    crate::macro_expand::map_fact_terms(fa, &|t| rewrite_arity1_term(t, arity1))
 }
 
 /// Apply [`rewrite_arity1_term`] to every term in a parser-AST atom.
@@ -1648,17 +1607,7 @@ pub fn rewrite_arity1_atom(
     a: &p::Atom,
     arity1: &std::collections::HashSet<String>,
 ) -> p::Atom {
-    use p::Atom::*;
-    let rt = |t: &p::Term| rewrite_arity1_term(t, arity1);
-    match a {
-        Eq(x, y) => Eq(rt(x), rt(y)),
-        Less(x, y) => Less(rt(x), rt(y)),
-        LessMset(x, y) => LessMset(rt(x), rt(y)),
-        Subterm(x, y) => Subterm(rt(x), rt(y)),
-        Action(f, t) => Action(rewrite_arity1_fact(f, arity1), rt(t)),
-        Last(t) => Last(rt(t)),
-        Pred(f) => Pred(rewrite_arity1_fact(f, arity1)),
-    }
+    crate::macro_expand::map_atom_terms(a, &|t| rewrite_arity1_term(t, arity1))
 }
 
 /// Apply [`rewrite_arity1_term`] to every term in a parser-AST formula.
@@ -1667,29 +1616,7 @@ pub fn rewrite_arity1_formula(
     f: &p::Formula,
     arity1: &std::collections::HashSet<String>,
 ) -> p::Formula {
-    use p::Formula::*;
-    match f {
-        False => False,
-        True => True,
-        Atom(a) => Atom(rewrite_arity1_atom(a, arity1)),
-        Not(g) => Not(Box::new(rewrite_arity1_formula(g, arity1))),
-        And(g, h) => And(
-            Box::new(rewrite_arity1_formula(g, arity1)),
-            Box::new(rewrite_arity1_formula(h, arity1))),
-        Or(g, h) => Or(
-            Box::new(rewrite_arity1_formula(g, arity1)),
-            Box::new(rewrite_arity1_formula(h, arity1))),
-        Implies(g, h) => Implies(
-            Box::new(rewrite_arity1_formula(g, arity1)),
-            Box::new(rewrite_arity1_formula(h, arity1))),
-        Iff(g, h) => Iff(
-            Box::new(rewrite_arity1_formula(g, arity1)),
-            Box::new(rewrite_arity1_formula(h, arity1))),
-        Forall(vs, g) => Forall(vs.clone(),
-            Box::new(rewrite_arity1_formula(g, arity1))),
-        Exists(vs, g) => Exists(vs.clone(),
-            Box::new(rewrite_arity1_formula(g, arity1))),
-    }
+    crate::macro_expand::map_formula_terms(f, &|t| rewrite_arity1_term(t, arity1))
 }
 
 /// Shared conversion core for [`term_to_lnterm`] and [`term_to_sapic_term`].

@@ -62,7 +62,6 @@ pub fn to_ln_fact(f: &tamarin_theory::sapic::SapicLNFact) -> tamarin_theory::fac
     nf
 }
 
-/// `toLVar v = slvar v`.
 /// Apply a SAPIC substitution to a SAPIC term. Shared by `inline` and
 /// `let_destructors` (both substitute SAPIC terms identically).
 pub(crate) fn subst_term(
@@ -83,6 +82,29 @@ pub(crate) fn subst_fact(
     nf
 }
 
+/// `Data.List.union xs ys = xs ++ filter (`notElem` xs) (nub ys)`: keep `xs` in
+/// order (duplicates preserved), then append each element of `ys` that is not
+/// already present (deduped within the appended tail too, via the growing
+/// membership check).  Generic over any `PartialEq` element, matching HS's
+/// `Eq`-based `union`.
+pub(crate) fn list_union<T: PartialEq + Clone>(xs: &[T], ys: &[T]) -> Vec<T> {
+    let mut out = xs.to_vec();
+    for y in ys {
+        if !out.contains(y) {
+            out.push(y.clone());
+        }
+    }
+    out
+}
+
+/// `Data.List.intersect xs ys`: keep every element of `xs` (in `xs`-order,
+/// duplicates preserved) that is an `Eq`-member of `ys`.  Generic over any
+/// `PartialEq` element.
+pub(crate) fn list_intersect<T: PartialEq + Clone>(xs: &[T], ys: &[T]) -> Vec<T> {
+    xs.iter().filter(|x| ys.contains(x)).cloned().collect()
+}
+
+/// `toLVar v = slvar v`.
 pub fn to_lvar(v: &SapicLVar) -> LVar {
     v.var.clone()
 }
@@ -808,7 +830,7 @@ fn fresh_msg_var_avoiding(name: &str, tildex: &BTreeSet<LVar>) -> LVar {
 }
 
 /// `freeset = fromList . frees` over an `LNTerm` — its variables.
-fn ln_term_vars(t: &LNTerm) -> BTreeSet<LVar> {
+pub(crate) fn ln_term_vars(t: &LNTerm) -> BTreeSet<LVar> {
     tamarin_term::vterm::vars_vterm(t).into_iter().collect()
 }
 
@@ -1071,8 +1093,17 @@ pub fn predicate_restrictions() -> Vec<tamarin_parser::ast::Restriction> {
 /// byte-identical to HS's hand-written strings, and AC/sort handling matches the
 /// parser path).  `has_delete` selects the full variants (the process also
 /// `contains isDelete`) over the NoDelete variants.
-pub fn state_restrictions(has_delete: bool) -> Vec<tamarin_parser::ast::Restriction> {
+/// Parse one of the hard-coded restriction strings (`parseRestriction`'s job in
+/// HS) and wrap it in a named `Restriction`.  Shared by all four hard-coded
+/// restriction builders so the parse+panic+wrap shape lives in one place.
+fn parse_restriction(name: &str, src: &str) -> tamarin_parser::ast::Restriction {
     use tamarin_parser::ast as p;
+    let formula = tamarin_parser::parser::parse_formula_str(src)
+        .unwrap_or_else(|e| panic!("Error parsing hard-coded restriction {name}: {e:?}"));
+    p::Restriction { name: name.to_string(), formula, attributes: vec![] }
+}
+
+pub fn state_restrictions(has_delete: bool) -> Vec<tamarin_parser::ast::Restriction> {
     // `parseRestriction`'s formula body, verbatim from Basetranslation.hs.
     let (set_in_src, set_notin_src) = if has_delete {
         (
@@ -1100,12 +1131,10 @@ pub fn state_restrictions(has_delete: bool) -> Vec<tamarin_parser::ast::Restrict
              (All #t1 y . Insert(x,y)@t1 ==>  #t3<#t1 )",
         )
     };
-    let parse = |name: &str, src: &str| -> p::Restriction {
-        let formula = tamarin_parser::parser::parse_formula_str(src)
-            .unwrap_or_else(|e| panic!("Error parsing hard-coded restriction {name}: {e:?}"));
-        p::Restriction { name: name.to_string(), formula, attributes: vec![] }
-    };
-    vec![parse("set_in", set_in_src), parse("set_notin", set_notin_src)]
+    vec![
+        parse_restriction("set_in", set_in_src),
+        parse_restriction("set_notin", set_notin_src),
+    ]
 }
 
 
@@ -1115,13 +1144,10 @@ pub fn state_restrictions(has_delete: bool) -> Vec<tamarin_parser::ast::Restrict
 /// `parseRestriction`; we parse the same formula body so the rendered output is
 /// byte-identical to HS.
 pub fn in_event_restriction() -> tamarin_parser::ast::Restriction {
-    use tamarin_parser::ast as p;
     let src = "All x #t3. ChannelIn(x)@t3 ==> (Ex #t2. K(x)@t2 & #t2 < #t3\n\
                & (All #t1. Event()@t1  ==> #t1 < #t2 | #t3 < #t1)\n\
                & (All #t1 xp. K(xp)@t1 ==> #t1 < #t2 | #t1 = #t2 | #t3 < #t1))";
-    let formula = tamarin_parser::parser::parse_formula_str(src)
-        .unwrap_or_else(|e| panic!("Error parsing hard-coded restriction in_event: {e:?}"));
-    p::Restriction { name: "in_event".to_string(), formula, attributes: vec![] }
+    parse_restriction("in_event", src)
 }
 
 // =============================================================================
@@ -1149,17 +1175,11 @@ const RES_LOCKING_POS_NO_UNLOCK: &str = "All p pp l x lp #t1 #t3. LockPOS(p, l, 
 /// `Lock_<idx>`/`Unlock_<idx>` (HS `mapAtoms subst`, with
 /// `hardcode s = s ++ "_" ++ show (lvarIdx v)`).
 pub fn res_locking(has_unlock: bool, v: &LVar) -> tamarin_parser::ast::Restriction {
-    use tamarin_parser::ast as p;
     let src = if has_unlock { RES_LOCKING_POS } else { RES_LOCKING_POS_NO_UNLOCK };
-    let mut formula = tamarin_parser::parser::parse_formula_str(src)
-        .unwrap_or_else(|e| panic!("Error parsing hard-coded restriction locking: {e:?}"));
     let idx = v.idx;
-    rename_lock_pos_atoms(&mut formula, idx);
-    p::Restriction {
-        name: format!("locking_{idx}"),
-        formula,
-        attributes: vec![],
-    }
+    let mut restr = parse_restriction(&format!("locking_{idx}"), src);
+    rename_lock_pos_atoms(&mut restr.formula, idx);
+    restr
 }
 
 /// HS `subst` inside `resLocking` (Basetranslation.hs:414-422): rewrite the
@@ -1195,19 +1215,16 @@ fn rename_lock_pos_atoms(f: &mut tamarin_parser::ast::Formula, idx: u64) {
 /// `resLockingPure` (Basetranslation.hs:388-402): the two `locking1`/`locking2`
 /// restrictions used only in the pure-state case (state-channel optimisation).
 pub fn res_locking_pure() -> Vec<tamarin_parser::ast::Restriction> {
-    use tamarin_parser::ast as p;
-    let parse = |name: &str, src: &str| -> p::Restriction {
-        let formula = tamarin_parser::parser::parse_formula_str(src)
-            .unwrap_or_else(|e| panic!("Error parsing hard-coded restriction {name}: {e:?}"));
-        p::Restriction { name: name.to_string(), formula, attributes: vec![] }
-    };
     let locking1 = "All p l x #t1 pp lp #t2 #t3 . Lock(p,l,x)@t1 &  Lock(pp,lp,x)@t2\n\
                      & Unlock(p,l,x)@t3 & not(#t1=#t2)\n\
                    ==> (t2 < t1) | (t3 < t2)";
     let locking2 = "All p l x #t1 pp lp #t2 #t3 . Lock(p,l,x)@t1 &  Unlock(pp,lp,x)@t2\n\
            & Unlock(p,l,x)@t3 & not(#t2=#t3)\n\
            ==> (t3 < t2) | (t2 < t1)";
-    vec![parse("locking1", locking1), parse("locking2", locking2)]
+    vec![
+        parse_restriction("locking1", locking1),
+        parse_restriction("locking2", locking2),
+    ]
 }
 
 #[cfg(test)]

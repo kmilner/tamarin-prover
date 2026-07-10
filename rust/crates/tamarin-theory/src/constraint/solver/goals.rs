@@ -258,19 +258,19 @@ pub fn parse_heuristic_str_with_tactics(
 /// use it.
 pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     let mut out = Vec::new();
-    // HS `existingDeps = rawLessRel sys` — built ONCE per openGoals pass
-    // and shared across every KU goal's `currentlyDeducible`/`extractible`
-    // check (Goals.hs:120), rather than rebuilt per goal.
-    let adj = build_raw_less_adj(sys);
-    // HS always-before adjacency — invariant across all goals in this pass
-    // (`sys` is read-only), so build it ONCE and thread it through
-    // `is_open_in_sys` into the Chain-goal helpers rather than rebuilding
-    // it per Chain goal.
+    // HS `existingDeps = rawLessRel sys` — built ONCE per openGoals pass and
+    // shared across every KU goal's `currentlyDeducible`/`extractible` check
+    // (Goals.hs:120) AND the Chain-goal `is_open_in_sys` always-before
+    // queries, rather than rebuilt per goal. The `rawLessRel` relation and
+    // the always-before adjacency are the SAME map (identical build), and
+    // `sys` is read-only across this pass, so one `PrebuiltAdj` feeds both:
+    // `is_open_in_sys` takes the `&PrebuiltAdj` (BFS via `always_before_with`)
+    // and `goal_usefulness_with_adj` takes its inner `&BTreeMap` via `.map()`.
     let ab_adj = sys.build_always_before_adj();
     for (goal, status) in sys.goals.iter() {
         if status.solved { continue; }
         if !is_open_in_sys(goal, sys, &ab_adj) { continue; }
-        let u = goal_usefulness_with_adj(goal, status.looping, sys, &adj);
+        let u = goal_usefulness_with_adj(goal, status.looping, sys, ab_adj.map());
         // Use the persistent goal-number (`_gsNr`), NOT the Vec
         // position.  Haskell's `openGoals` returns `(goal, (gsNr,
         // useful))` (Goals.hs) and the rankings begin with
@@ -284,7 +284,7 @@ pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     // guaranteed to be in nr order (subst_goals / conjoin rebuild it),
     // so sort explicitly.  Stable so equal-nr goals (shouldn't happen,
     // but defensive) keep Vec order.
-    out.sort_by_key(|a| a.seq);
+    sort_goal_nr(&mut out);
     out
 }
 
@@ -338,11 +338,6 @@ pub(crate) fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
         (Goal::Split(sa), Goal::Split(sb)) => sa.cmp(sb),
         _ => Ordering::Equal,
     }
-}
-
-/// Plain (non-annotated) open goals.
-pub fn plain_open_goals(sys: &System) -> Vec<Goal> {
-    open_goals(sys).into_iter().map(|a| a.goal).collect()
 }
 
 /// Error type for oracle execution failures.
@@ -408,6 +403,24 @@ pub fn rank_goals_with(
     Ok(result)
 }
 
+/// `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:593-594): stable
+/// order by the unique creation number.  Shared by the ranking dispatch
+/// and the tactic presort so the trivial nr-sort is written once.
+fn sort_goal_nr(ags: &mut [AnnotatedGoal]) {
+    ags.sort_by_key(|g| g.seq);
+}
+
+/// `sortOn (\(_, (nr, useless)) -> (useless, nr))` (ProofMethod.hs:485):
+/// order by the derived `Ord Usefulness` (declaration order, NOT
+/// `tagUsefulness`), breaking ties by creation number.  Shared by the
+/// `UsefulGoalNr` ranking arm and the tactic presort.
+fn sort_useful_goal_nr(ags: &mut [AnnotatedGoal]) {
+    ags.sort_by(|a, b| {
+        a.usefulness.cmp(&b.usefulness)
+            .then_with(|| a.seq.cmp(&b.seq))
+    });
+}
+
 fn rank_goals_with_inner(
     sys: &System,
     ctx: Option<&crate::constraint::solver::context::ProofContext>,
@@ -458,10 +471,7 @@ fn rank_goals_with_inner(
             // LoopBreaker and ProbablyConstructible).  Rust's `Usefulness`
             // derives Ord in the same declaration order.
             let mut ags = open_goals(sys);
-            ags.sort_by(|a, b| {
-                a.usefulness.cmp(&b.usefulness)
-                    .then_with(|| a.seq.cmp(&b.seq))
-            });
+            sort_useful_goal_nr(&mut ags);
             Ok(ags)
         }
         GoalRanking::Tactic { quit_on_empty, tactic } => {
@@ -615,17 +625,14 @@ fn apply_presort(
         GoalRanking::GoalNr => {
             // sortOn (fst . snd) — ags from open_goals are already nr-sorted.
             let mut a = ags;
-            a.sort_by_key(|g| g.seq);
+            sort_goal_nr(&mut a);
             a
         }
         GoalRanking::UsefulGoalNr => {
             // sortOn (\(_, (nr, useless)) -> (useless, nr)) — derived
             // `Ord Usefulness` (ProofMethod.hs:485), NOT tagUsefulness.
             let mut a = ags;
-            a.sort_by(|x, y| {
-                x.usefulness.cmp(&y.usefulness)
-                    .then_with(|| x.seq.cmp(&y.seq))
-            });
+            sort_useful_goal_nr(&mut a);
             a
         }
         GoalRanking::Smart(use_loop_breakers) => {
@@ -642,7 +649,7 @@ fn apply_presort(
         // oracle/tactic presort is unreachable).  Fall back to nr order.
         _ => {
             let mut a = ags;
-            a.sort_by_key(|g| g.seq);
+            sort_goal_nr(&mut a);
             a
         }
     }
@@ -754,7 +761,7 @@ fn rank_by_blocks(
     // (unmatched) goals are skipped (dropped, matching HS `tail
     // groupedPrio`).  Pushing in ags order preserves presort order within
     // each bucket, and emitting buckets 0..n keeps ascending block-index
-    // order — identical to the prior nested loop.
+    // order.
     let mut buckets: Vec<Vec<AnnotatedGoal>> = vec![Vec::new(); blocks.len()];
     for (g, fm) in ags.iter().zip(first_match.iter()) {
         if let Some(bi) = *fm {
@@ -1918,6 +1925,18 @@ pub fn is_open_for_saturate(g: &Goal, sys: &System) -> bool {
     is_open_in_sys(g, sys, &ab_adj)
 }
 
+/// Like [`is_open_for_saturate`] but reuses a prebuilt always-before
+/// adjacency instead of rebuilding it per call.  The relation depends
+/// only on `sys` (not on `g`), so a caller scanning many goals against
+/// an unmutated system builds it once and threads it in.
+pub fn is_open_for_saturate_with(
+    g: &Goal,
+    sys: &System,
+    ab_adj: &crate::constraint::system::PrebuiltAdj,
+) -> bool {
+    is_open_in_sys(g, sys, ab_adj)
+}
+
 /// `chain_kd_conc_term`: the KD-fact term at the chain's source-
 /// conclusion, or None if the source-conclusion isn't a KD fact.
 fn chain_kd_conc_term(
@@ -2198,8 +2217,8 @@ pub fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
     // spot.  `open_goals` builds it once and uses
     // `goal_usefulness_with_adj` to share it across all goals (mirroring
     // HS's `existingDeps = rawLessRel sys` shared in `openGoals`).
-    let adj = build_raw_less_adj(sys);
-    goal_usefulness_with_adj(g, looping, sys, &adj)
+    let adj = sys.build_always_before_adj();
+    goal_usefulness_with_adj(g, looping, sys, adj.map())
 }
 
 /// HS `prettyGoals`'s `useful` annotation STRING (System.hs:1745-1752) for
@@ -2231,8 +2250,8 @@ pub fn goal_useful_annotation(
                 return " (useful1)";
             }
             if let Some(m) = fa.terms.first() {
-                let adj = build_raw_less_adj(sys);
-                if currently_deducible(sys, &adj, i, m) {
+                let adj = sys.build_always_before_adj();
+                if currently_deducible(sys, adj.map(), i, m) {
                     return " (currently deducible)";
                 }
                 if probably_constructible(m) {
@@ -2317,7 +2336,7 @@ fn has_ku_guards(sys: &System) -> bool {
             Guarded::Atom(_) => false,
         }
     }
-    sys.formulas.iter().any(walk_guards)
+    sys.formulas.iter().any(|f| walk_guards(f))
 }
 
 /// `currentlyDeducible i m` — direct port of Haskell's
@@ -2409,53 +2428,56 @@ fn toplevel_terms(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::L
 /// This adjacency is invariant across all goals in one `openGoals`
 /// pass (only the BFS seed `i` varies per KU goal), so HS computes
 /// `existingDeps = rawLessRel sys` ONCE in the `where` clause of
-/// `openGoals` (Goals.hs:120) and shares it.  We build it once in
-/// `open_goals` and thread it through `goal_usefulness_with_adj`.
+/// `openGoals` (Goals.hs:120) and shares it.  We get it from the single
+/// [`System::build_always_before_adj`] `PrebuiltAdj` (built once in
+/// `open_goals`) via `.map()` and thread it through
+/// `goal_usefulness_with_adj` — the `rawLessRel` map and the always-before
+/// adjacency are the SAME relation, built identically.
 type RawLessAdj = std::collections::BTreeMap<
     crate::constraint::constraints::NodeId,
     Vec<crate::constraint::constraints::NodeId>,
 >;
 
-/// Build the `rawLessRel` adjacency once for the whole system.
-fn build_raw_less_adj(sys: &System) -> RawLessAdj {
-    let mut adj: RawLessAdj = std::collections::BTreeMap::new();
-    for l in &sys.less_atoms {
-        adj.entry(l.smaller.clone()).or_default().push(l.larger.clone());
-    }
-    for e in &sys.edges {
-        adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
-    }
-    // HS-faithful `unsolvedChains` contribution to rawEdgeRel
-    // (System.hs:1613-1616): one conc-node -> prem-node edge per
-    // unsolved Chain goal.
-    for (g, st) in sys.goals.iter() {
-        if st.solved { continue; }
-        if let crate::constraint::constraints::Goal::Chain(c, p) = g {
-            adj.entry(c.0.clone()).or_default().push(p.0.clone());
-        }
-    }
-    adj
-}
-
-/// `rawLessRel`-based forward reachability: every node id reachable
-/// from `i` via the prebuilt `rawLessRel` adjacency (transitive
-/// closure).  Mirrors HS `D.reachableSet [i] existingDeps`
-/// (Goals.hs:155).
-fn reachable_from(
+/// Forward transitive-reachability set over a `rawLessRel` adjacency
+/// (`from -> [to]` successor lists).  With `include_seed = true` the
+/// returned set contains `from` itself — mirroring HS `D.reachableSet
+/// [from] rel`, which seeds the visited set with `from` (Data/DAG/
+/// Simple.hs:76-79); with `false` the seed is removed, yielding the
+/// "strictly reachable" set (≥1 edge) the contradiction checks want.
+///
+/// Traversal order (BFS vs DFS) is immaterial: the result is a
+/// `BTreeSet`, so any spanning order produces the identical set.  This is
+/// the single reachability routine shared by `reachable_from`
+/// (`extractible`, seed retained) and contradictions.rs's
+/// `non_injective_fact_instances` / `node_after_last` (seed removed).
+pub(crate) fn reachable_set_adj(
     adj: &RawLessAdj,
-    i: &crate::constraint::constraints::NodeId,
+    from: &crate::constraint::constraints::NodeId,
+    include_seed: bool,
 ) -> std::collections::BTreeSet<crate::constraint::constraints::NodeId> {
     use std::collections::{BTreeSet, VecDeque};
     let mut seen: BTreeSet<crate::constraint::constraints::NodeId> = BTreeSet::new();
     let mut q: VecDeque<crate::constraint::constraints::NodeId> = VecDeque::new();
-    q.push_back(i.clone());
+    q.push_back(from.clone());
     while let Some(n) = q.pop_front() {
         if !seen.insert(n.clone()) { continue; }
         if let Some(succs) = adj.get(&n) {
             for s in succs { q.push_back(s.clone()); }
         }
     }
+    if !include_seed { seen.remove(from); }
     seen
+}
+
+/// `rawLessRel`-based forward reachability: every node id reachable
+/// from `i` via the prebuilt `rawLessRel` adjacency (transitive
+/// closure).  Mirrors HS `D.reachableSet [i] existingDeps`
+/// (Goals.hs:155) — seed retained.
+fn reachable_from(
+    adj: &RawLessAdj,
+    i: &crate::constraint::constraints::NodeId,
+) -> std::collections::BTreeSet<crate::constraint::constraints::NodeId> {
+    reachable_set_adj(adj, i, true)
 }
 
 /// `checkTermLits p t` — true iff every leaf-literal sort in `t`
@@ -2635,7 +2657,10 @@ pub fn dispatch_solve_goal(
     //   - `Out`  → "OutFact"
     //   - `In`   → "InFact"
     //   - `Proto(mult, name, _)` → "ProtoFact <Mult> \"<name>\" <arity>"
-    {
+    // Gate the whole label build behind the cached `TAM_RS_TRACE_EXEC`
+    // flag: the `format!` + `fact_tag_haskell`/`fact_term_head` allocs fire
+    // on every goal dispatch, and are dead work unless the trace is on.
+    if crate::constraint::solver::trace::exec_enabled() {
         use crate::constraint::solver::trace::{trace_exec, sort_prefix};
         let label = match g {
             Goal::Action(_, fa)  => format!("solveGoal kind=Action fact={}({})",

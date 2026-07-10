@@ -104,6 +104,84 @@ fn rust_rule_count(src: &str) -> usize {
         .count()
 }
 
+/// Map a lemma's trace quantifier + solved-root status onto tamarin's
+/// verdict string.  Returns `None` for the incomparable fallthrough
+/// (root status is neither Solved nor Contradictory) — each caller keeps
+/// its own None handling/logging.  Shared by the two corpus probes below.
+fn verdict_str(
+    tq: &tamarin_parser::ast::TraceQuantifier,
+    st: &tamarin_theory::constraint::solver::search::NodeStatus,
+) -> Option<&'static str> {
+    use tamarin_parser::ast::TraceQuantifier;
+    use tamarin_theory::constraint::solver::search::NodeStatus;
+    match (tq, st) {
+        (TraceQuantifier::ExistsTrace, NodeStatus::Solved) => Some("verified"),
+        (TraceQuantifier::ExistsTrace, NodeStatus::Contradictory) => Some("falsified"),
+        (TraceQuantifier::AllTraces, NodeStatus::Contradictory) => Some("verified"),
+        (TraceQuantifier::AllTraces, NodeStatus::Solved) => Some("falsified"),
+        _ => None,
+    }
+}
+
+/// Per-lemma kill-watchdog used by the corpus probes.  The wall-clock
+/// deadline at `search::expand` fires BETWEEN expand calls, but a single
+/// blocking Maude IPC read sits forever if Maude itself hangs.  A watchdog
+/// thread kills the subprocess after a hard cap; the blocked read then
+/// returns EOF and `prove_lemma` unwinds with an error.  Without this, even
+/// one hung lemma blocks the whole `par_iter().collect()`.
+struct WatchdogGuard {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WatchdogGuard {
+    /// Signal completion, join the watchdog thread, and report whether it
+    /// fired (killed the subprocess) before we finished.
+    fn finish(mut self) -> bool {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+        self.fired.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for WatchdogGuard {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// Spawn a watchdog thread that kills `h`'s subprocess after `dur`, unless
+/// the returned guard is finished/dropped first.
+fn spawn_kill_watchdog(
+    h: tamarin_term::maude_proc::MaudeHandle,
+    dur: std::time::Duration,
+) -> WatchdogGuard {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let done = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicBool::new(false));
+    let done_clone = done.clone();
+    let fired_clone = fired.clone();
+    let join = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + dur;
+        while std::time::Instant::now() < deadline {
+            if done_clone.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        fired_clone.store(true, Ordering::Relaxed);
+        h.kill_subprocess();
+    });
+    WatchdogGuard { done, fired, join: Some(join) }
+}
+
 #[test]
 fn fixture_tiny_setup_round_trip() {
     let path = fixtures_dir().join("tiny_setup.spthy");
@@ -550,7 +628,6 @@ end"#;
 #[ignore = "verdict-only metric is deprecated; use corpus_proof_skeleton_match_probe"]
 fn corpus_verdict_match_coverage_probe() {
     use rayon::prelude::*;
-    use tamarin_theory::constraint::solver::search::NodeStatus;
     use tamarin_theory::prove::prove_lemma;
 
     // Configure rayon thread-pool with a larger stack — Goal-Ord + Sk
@@ -683,7 +760,6 @@ fn corpus_verdict_match_coverage_probe() {
     // Phase 4: run prove_lemma per lemma in parallel.  Each lemma gets
     // its own MaudeHandle (independent subprocess); rayon manages
     // thread-pool sizing via num_cpus.
-    use tamarin_parser::ast::TraceQuantifier;
     #[derive(Clone)]
     enum LemmaOutcome {
         Match,
@@ -695,32 +771,11 @@ fn corpus_verdict_match_coverage_probe() {
         let h = match tamarin_term::maude_proc::MaudeHandle::start(&mp, w.elab_sig.clone()) {
             Ok(h) => h, Err(_) => return LemmaOutcome::Incomparable,
         };
-        // Watchdog: the wall-clock deadline at search::expand fires
-        // BETWEEN expand calls, but a single blocking Maude IPC read
-        // sits in stdin/stdout forever if Maude itself hangs.  Spawn
-        // a watchdog thread that kills the subprocess after a hard
-        // cap; the blocked read then returns EOF and prove_lemma
-        // unwinds with an error → Incomparable.  Without this, even
-        // one hung lemma blocks the whole `par_iter().collect()`.
-        let watchdog_handle = h.clone();
-        let watchdog_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watchdog_done_clone = watchdog_done.clone();
-        let watchdog_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watchdog_fired_clone = watchdog_fired.clone();
-        let watchdog = std::thread::spawn(move || {
-            // 20s per-lemma cap — twice the 10s deadline so genuine
-            // long-but-terminating lemmas finish, but real hangs are
-            // bounded.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            while std::time::Instant::now() < deadline {
-                if watchdog_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            watchdog_fired_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-            watchdog_handle.kill_subprocess();
-        });
+        // 20s per-lemma cap — twice the 10s deadline so genuine
+        // long-but-terminating lemmas finish, but real hangs are
+        // bounded.  Watchdog kills Maude → prove_lemma unwinds with an
+        // error → Incomparable.
+        let watchdog = spawn_kill_watchdog(h.clone(), std::time::Duration::from_secs(20));
         let t0 = std::time::Instant::now();
         // Budget 2000: the deadline (10s) is the real gate; budget
         // gives slack so search isn't budget-bounded into a Sorry on
@@ -739,10 +794,9 @@ fn corpus_verdict_match_coverage_probe() {
             prove_lemma(theory_ref, &lemma_name_inner, h_inner, 2000)
         }));
         let elapsed = t0.elapsed();
-        watchdog_done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = watchdog.join();
+        let watchdog_fired = watchdog.finish();
         let fname = w.path.file_name().unwrap().to_string_lossy().into_owned();
-        if watchdog_fired.load(std::sync::atomic::Ordering::Relaxed) {
+        if watchdog_fired {
             // Watchdog killed Maude — log to surface the offender.
             eprintln!("WATCHDOG: {}::{} killed after {:?}",
                 fname, w.lemma_name, elapsed);
@@ -755,16 +809,13 @@ fn corpus_verdict_match_coverage_probe() {
             Ok(Ok(r)) => r,
             _ => return LemmaOutcome::Incomparable,
         };
-        let our_verdict = match (&w.trace_quantifier, &root.status) {
-            (TraceQuantifier::ExistsTrace, NodeStatus::Solved) => "verified",
-            (TraceQuantifier::ExistsTrace, NodeStatus::Contradictory) => "falsified",
-            (TraceQuantifier::AllTraces, NodeStatus::Contradictory) => "verified",
-            (TraceQuantifier::AllTraces, NodeStatus::Solved) => "falsified",
-            (_, s) => {
+        let our_verdict = match verdict_str(&w.trace_quantifier, &root.status) {
+            Some(v) => v,
+            None => {
                 if dbg_incomp {
                     eprintln!("INCOMPARABLE: {}::{} → {:?} (tamarin={})",
                         w.path.file_name().unwrap().to_string_lossy(),
-                        w.lemma_name, s, w.tamarin_verdict);
+                        w.lemma_name, &root.status, w.tamarin_verdict);
                 }
                 return LemmaOutcome::Incomparable;
             }
@@ -829,7 +880,6 @@ fn corpus_verdict_match_coverage_probe() {
 #[ignore = "heavyweight whole-corpus probe; oracle files trigger process::exit. Run with --ignored"]
 fn corpus_proof_skeleton_match_probe() {
     use rayon::prelude::*;
-    use tamarin_theory::constraint::solver::search::NodeStatus;
     use tamarin_theory::prove::prove_lemma;
     use tamarin_theory::proof_skeleton::{extract_from_haskell, first_divergence, render};
 
@@ -940,7 +990,6 @@ fn corpus_proof_skeleton_match_probe() {
     }).collect();
 
     // Phase 4: per-lemma prove + diff in parallel.
-    use tamarin_parser::ast::TraceQuantifier;
     #[derive(Clone)]
     enum Outcome {
         StructMatch,
@@ -952,17 +1001,7 @@ fn corpus_proof_skeleton_match_probe() {
         let h = match tamarin_term::maude_proc::MaudeHandle::start(&mp, w.elab_sig.clone()) {
             Ok(h) => h, Err(_) => return Outcome::Incomparable,
         };
-        let watchdog_handle = h.clone();
-        let watchdog_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watchdog_done_clone = watchdog_done.clone();
-        let watchdog = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            while std::time::Instant::now() < deadline {
-                if watchdog_done_clone.load(std::sync::atomic::Ordering::Relaxed) { return; }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            watchdog_handle.kill_subprocess();
-        });
+        let watchdog = spawn_kill_watchdog(h.clone(), std::time::Duration::from_secs(20));
         // Catch panics — pre-existing overflow bugs in
         // reduction.rs::bounds_max+1 sites surface on some corpus
         // lemmas (tracked separately).  Without catch_unwind, one
@@ -974,18 +1013,14 @@ fn corpus_proof_skeleton_match_probe() {
         let root_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             prove_lemma(theory_ref, &lemma_name, h_for_prove, 2000)
         }));
-        watchdog_done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = watchdog.join();
+        let _ = watchdog.finish();
         let root = match root_result {
             Ok(Ok(r)) => r,
             _ => return Outcome::Incomparable,
         };
-        let our_verdict = match (&w.trace_quantifier, &root.status) {
-            (TraceQuantifier::ExistsTrace, NodeStatus::Solved) => "verified",
-            (TraceQuantifier::ExistsTrace, NodeStatus::Contradictory) => "falsified",
-            (TraceQuantifier::AllTraces, NodeStatus::Contradictory) => "verified",
-            (TraceQuantifier::AllTraces, NodeStatus::Solved) => "falsified",
-            _ => return Outcome::Incomparable,
+        let our_verdict = match verdict_str(&w.trace_quantifier, &root.status) {
+            Some(v) => v,
+            None => return Outcome::Incomparable,
         };
         let fname = w.path.file_name().unwrap().to_string_lossy().into_owned();
         let file_lemma = format!("{}::{}", fname, w.lemma_name);
@@ -1219,9 +1254,7 @@ fn probe_nspk3_cyclic_leaf() {
 }
 
 /// Probe: chaum_unforgeability — KU(sign) source-case count + rendered
-/// proof skeleton, for diagnosing the B_1_case_N divergence (mostly
-/// fixed via `minimize_intruder_rules` port + variant-fanout revert).
-/// Now diagnoses the remaining `case fresh vs case B_1` divergence at
+/// proof skeleton. Diagnoses the `case fresh vs case B_1` divergence at
 /// chaum::exec line 7 + chaum::unforgeability line 22.
 #[test]
 #[ignore = "diagnostic probe — chaum B_1 over-enum; run with --ignored"]
@@ -1649,7 +1682,7 @@ fn atom_decomposition_creates_action_goal_in_simplify() {
         tamarin_theory::guarded::Guarded::Atom(tamarin_theory::guarded::atom_to_gatom_free(&action_atom)),
     ]);
     let mut sys = System::empty();
-    sys.formulas.push(g);
+    sys.formulas.push(std::sync::Arc::new(g));
     let mut r = Reduction::new(&ctx, sys);
     simplify_system(&mut r);
     // Action atom should have produced a Goal::Action.
@@ -1771,7 +1804,7 @@ fn simplify_conj_wrapping_disj_produces_goal() {
     let a2 = tamarin_theory::guarded::Guarded::Atom(tamarin_theory::guarded::atom_to_gatom_free(&Atom::Last(mkvar("j"))));
     let disj = tamarin_theory::guarded::Guarded::Disj(vec![a1, a2]);
     let mut sys = System::empty();
-    sys.formulas.push(tamarin_theory::guarded::Guarded::Conj(vec![disj]));
+    sys.formulas.push(std::sync::Arc::new(tamarin_theory::guarded::Guarded::Conj(vec![disj])));
     let mut r = Reduction::new(&ctx, sys);
     simplify_system(&mut r);
     assert!(r.sys.goals.iter().any(|(g, _)|
@@ -1846,7 +1879,7 @@ fn proof_search_end_to_end_tiny_theory() {
     // Mark non-initial via a solved formula (Haskell's
     // `isInitialSystem` uses solved_formulas emptiness, not the
     // node/edge count).
-    sys.solved_formulas.push(tamarin_theory::guarded::gtrue());
+    sys.solved_formulas.push(std::sync::Arc::new(tamarin_theory::guarded::gtrue()));
     sys.add_node(
         tamarin_term::lterm::LVar::new(
             "i", tamarin_term::lterm::LSort::Node, 0),
@@ -1919,9 +1952,9 @@ fn solve_premise_goal_against_fixture_matches_rule_count() {
     let fa = tamarin_theory::fact::out_fact(tx);
     let p = (i, tamarin_theory::rule::PremIdx(0));
     let out = r.solve_premise_goal(&p, &fa);
-    // Exactly one matching rule — solver returns LinearNamed
-    // (carrying the producing rule's case name) since the cases.len()==1
-    // collapse at reduction.rs:1837 was added.
+    // Exactly one matching rule — solver returns LinearNamed, carrying
+    // the producing rule's case name (a single case collapses to a
+    // named linear case).
     assert!(matches!(out, GoalCases::Linear | GoalCases::LinearNamed(_)));
     assert_eq!(r.sys.nodes.len(), 1);
     assert_eq!(r.sys.edges.len(), 1);

@@ -2254,8 +2254,8 @@ mod tests {
     /// i.e. the offending operand is the fresh var `~x` (NOT the nat-sorted
     /// `%a`), the message has NO rule name, and `t` is the WHOLE fact-arg
     /// term.  (The AC operand order `(~x%+%a)` is a pre-existing pretty-print
-    /// limitation: RS renders source order `(%a%+~x)`; the message FORMAT —
-    /// which is what this finding fixes — matches HS exactly.)
+    /// limitation: RS renders source order `(%a%+~x)`; the message FORMAT
+    /// matches HS exactly.)
     #[test]
     fn nat_sorts_message_format() {
         let t = parse("theory T begin builtins: natural-numbers \

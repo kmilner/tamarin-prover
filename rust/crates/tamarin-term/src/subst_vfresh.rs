@@ -267,25 +267,16 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
     /// `compose_vfresh` to produce structurally-equivalent SubstVFresh
     /// shapes per variant.
     ///
-    /// `fresh_start` is the precomputed `succ . maxIdx . frees(avoid)` the
-    /// caller would otherwise build a set/list to derive: it is the ONLY thing
-    /// the old `avoid: &[LVar]` argument was used for (its max idx + 1), so we
-    /// take it directly and skip materialising the avoid collection.
+    /// `fresh_start` is the precomputed `succ . maxIdx . frees(avoid)`: the
+    /// single value the rename actually needs from the avoid set (its max
+    /// idx + 1), passed directly so the avoid collection is never materialised.
     pub fn fresh_to_free_uniform_shift(&self, fresh_start: u64)
         -> crate::subst::Subst<C, LVar>
     {
         use std::collections::BTreeMap;
         use crate::subst::Subst;
         // Collect ALL distinct range vars in insertion order.
-        let mut range_vars: Vec<LVar> = Vec::new();
-        let mut seen: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
-        for t in self.range() {
-            for w in crate::vterm::vars_vterm(t) {
-                if seen.insert(w.clone()) {
-                    range_vars.push(w);
-                }
-            }
-        }
+        let range_vars: Vec<LVar> = distinct_range_vars(self.range());
         if range_vars.is_empty() {
             // No range vars to rename — just downgrade.
             let pairs: Vec<(LVar, VTerm<C, LVar>)> = self.to_list();
@@ -357,14 +348,11 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         //     skips a variable;
         //   - `freshToFreeAvoidingFast` (:74-81) renames all range vars
         //     via `rename ... \`evalFreshAvoiding\` t` — same.
-        // We therefore rename every range var unconditionally and ignore
-        // `_preserve`.  HS maintains the invariant that VFresh ranges are
-        // pure-fresh (composeVFresh's `extendWithRenaming`,
-        // Substitution.hs:40-47), so keeping a range var's identity would
-        // be unsound: it could fuse a Maude witness with an unrelated live
-        // system var that happens to share (name, sort, idx).
-        let preserve = std::collections::BTreeSet::new();
-        let preserve = &preserve;
+        // We therefore rename every range var unconditionally.  HS maintains
+        // the invariant that VFresh ranges are pure-fresh (composeVFresh's
+        // `extendWithRenaming`, Substitution.hs:40-47), so keeping a range
+        // var's identity would be unsound: it could fuse a Maude witness with
+        // an unrelated live system var that happens to share (name, sort, idx).
         // HS-faithful port (Substitution.hs:54-66):
         //
         //   freshToFree subst = (`evalBindT` noBindings) $ do
@@ -410,7 +398,7 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         for (lv, t) in slist.into_iter() {
             // Determine the namehint mode based on the OUTER term shape.
             let outer_is_singleton_var = matches!(&t, Term::Lit(Lit::Var(_)));
-            let renamed = rename_lvars_with_hint(&t, &mut rename, preserve, &mut alloc_idxs,
+            let renamed = rename_lvars_with_hint(&t, &mut rename, &mut alloc_idxs,
                 outer_is_singleton_var, &lv);
             pairs.push((lv, renamed));
         }
@@ -437,16 +425,13 @@ fn shifted_idx(idx: u64, shift: i128) -> u64 {
 fn rename_lvars_with_hint<C: Ord + Clone, F: FnMut(u64) -> u64>(
     t: &VTerm<C, LVar>,
     rename: &mut BTreeMap<LVar, LVar>,
-    preserve: &std::collections::BTreeSet<LVar>,
     alloc_idxs: &mut F,
     outer_is_singleton_var: bool,
     lv: &LVar,
 ) -> VTerm<C, LVar> {
     match t {
         Term::Lit(Lit::Var(v)) => {
-            if preserve.contains(v) {
-                Term::Lit(Lit::Var(v.clone()))
-            } else if let Some(new) = rename.get(v).cloned() {
+            if let Some(new) = rename.get(v).cloned() {
                 Term::Lit(Lit::Var(new))
             } else {
                 // Allocate a fresh idx; name hint depends on outer
@@ -465,7 +450,7 @@ fn rename_lvars_with_hint<C: Ord + Clone, F: FnMut(u64) -> u64>(
         Term::Lit(Lit::Con(c)) => Term::Lit(Lit::Con(c.clone())),
         Term::App(f, args) => {
             let new_args: Vec<_> = args.iter()
-                .map(|a| rename_lvars_with_hint(a, rename, preserve, alloc_idxs,
+                .map(|a| rename_lvars_with_hint(a, rename, alloc_idxs,
                     outer_is_singleton_var, lv))
                 .collect();
             // Route through the smart constructor so AC/C argument lists
@@ -490,6 +475,129 @@ pub fn free_to_fresh_raw<C: Ord + Clone>(s: crate::subst::Subst<C, LVar>)
     -> LSubstVFresh<C>
 {
     LSubstVFresh::from_list(s.to_list())
+}
+
+/// `composeVFresh s1_0 s2` (Substitution.hs:41-47).  Dispatches to a
+/// closed-form fast path for the dominant `s1_0 = ∅` shape and otherwise runs
+/// the full 4-stage pipeline in [`compose_vfresh_general`].
+///
+/// Every locally-solved `unify` runs `flattenUnif` as `[∅ composeVFresh m]`
+/// (maude_proc.rs local fast paths), so `s1_0` is empty by construction there;
+/// the AC-arm and rule-variant call sites pass a non-empty `s1_0` and take the
+/// general path unchanged.
+pub fn compose_vfresh<C>(
+    s1_0: &LSubstVFresh<C>,
+    s2: &crate::subst::Subst<C, LVar>,
+) -> LSubstVFresh<C>
+where
+    C: Ord + Clone,
+{
+    if s1_0.is_empty() {
+        let fast = compose_vfresh_empty_s1(s2);
+        // Differential guard during bring-up: the fast path must be VALUE-
+        // identical to the general composition (witness idxs feed
+        // `Ord LNSubstVFresh` and split-case ordering).  Only compiled in
+        // debug builds; the full 402-file byte gate is the release check.
+        #[cfg(debug_assertions)]
+        {
+            let slow = compose_vfresh_general(s1_0, s2);
+            debug_assert!(
+                fast == slow,
+                "compose_vfresh empty-s1 fast path diverged from general composition",
+            );
+        }
+        return fast;
+    }
+    compose_vfresh_general(s1_0, s2)
+}
+
+/// Closed-form `composeVFresh ∅ s2`.
+///
+/// For an empty `s1_0` the general pipeline's four intermediate structures
+/// collapse to a single uniform, order-preserving range-var rename.  Deriving
+/// it from the code (Substitution.hs:41-47):
+///
+///  * `extendWithRenaming (varsRange s2) ∅` renames every distinct range var
+///    `w` of `s2` down by `vs_min = min idx of varsRange s2` (its avoid set is
+///    empty ⇒ `freshStart = 0`);
+///  * `freshToFreeAvoidingFast _ (s2, ∅)` then shifts every range var up by
+///    `fresh_start = maxIdx(frees s2) + 1` (the shifted-down vars have min idx
+///    0, so `shift = fresh_start`).  `frees ∅ = keys ∅ = {}`, so the avoid set
+///    is exactly `frees s2` (its domain and range vars).
+///
+/// The two shifts fold to one uniform delta `> 0`, so `w' = LVar{w.name,
+/// w.sort, w.idx - vs_min + maxIdx(frees s2) + 1}` for each range var `w`, with
+/// `w'.idx > maxIdx(frees s2) ≥` every domain key idx.  Hence:
+///
+///  * `s1 = {w -> Var(w') | w ∈ varsRange s2}` (nothing dropped: `w' ≠ w`);
+///  * `s1 `compose` s2` = `{k -> s2[k][w↦w'] | (k,_) ∈ s2}` (the `map_range`
+///    trivial-drop is vacuous — `w'.idx > k.idx` — but is still applied for
+///    definitional parity) `∪ {w -> Var(w') | w ∈ varsRange s2, w ∉ dom s2}`;
+///  * `freeToFreshRaw` re-tags without dropping.
+///
+/// The per-mapping term walk reuses `apply_vterm_map` — the exact primitive
+/// `Subst::compose` calls — so AC re-sorting and sharing are byte-identical.
+fn compose_vfresh_empty_s1<C>(s2: &crate::subst::Subst<C, LVar>) -> LSubstVFresh<C>
+where
+    C: Ord + Clone,
+{
+    use std::collections::BTreeSet;
+    // Distinct range vars of s2 (varsRange s2), plus the max idx over all of
+    // s2's free vars (its avoid set; frees s2 walks BOTH domain and range).
+    let mut range_vars: Vec<LVar> = Vec::new();
+    let mut seen: BTreeSet<LVar> = BTreeSet::new();
+    let mut max_idx: Option<u64> = None;
+    for v in s2.dom() {
+        max_idx = Some(max_idx.map_or(v.idx, |m| m.max(v.idx)));
+    }
+    for t in s2.range() {
+        for v in crate::vterm::vars_vterm(t) {
+            max_idx = Some(max_idx.map_or(v.idx, |m| m.max(v.idx)));
+            if seen.insert(v.clone()) {
+                range_vars.push(v);
+            }
+        }
+    }
+    // No range vars ⇒ nothing to rename: extendWithRenaming is a no-op and
+    // freshToFreeAvoidingFast is the identity, so composeVFresh collapses to
+    // `freeToFreshRaw s2`.
+    if range_vars.is_empty() {
+        return LSubstVFresh::from_list(s2.to_list());
+    }
+    let vs_min: u64 = range_vars.iter().map(|v| v.idx).min().unwrap();
+    // `fresh_start` = succ . maxIdx . frees s2 (= maxIdx over dom+range + 1).
+    let fresh_start: u64 = max_idx.unwrap() + 1;
+    // Fold the two order-preserving shifts (down by vs_min, up by fresh_start)
+    // through the shared `shifted_idx` at each step so the load-bearing clamp
+    // cannot drift from the general path.  Step 1 never clamps (result ≤ idx),
+    // so this equals a single positive uniform shift `fresh_start - vs_min`.
+    let mut s1_map: BTreeMap<LVar, VTerm<C, LVar>> = BTreeMap::new();
+    for w in &range_vars {
+        let down = shifted_idx(w.idx, -(vs_min as i128));
+        let up = shifted_idx(down, fresh_start as i128);
+        let w_prime = LVar { name: w.name, sort: w.sort, idx: up };
+        s1_map.insert(w.clone(), Term::Lit(Lit::Var(w_prime)));
+    }
+    let mut out: Vec<(LVar, VTerm<C, LVar>)> = Vec::new();
+    // `s1 `compose` s2` first arm = `s2.map_range(|t| apply_vterm(s1, t))`:
+    // rename every range var through the mapping, dropping trivial results
+    // exactly as `map_range` does.
+    for (v, t) in s2.iter() {
+        let t2 = crate::subst::apply_vterm_map(&s1_map, t.clone());
+        if !matches!(&t2, Term::Lit(Lit::Var(w)) if w == v) {
+            out.push((v.clone(), t2));
+        }
+    }
+    // `compose`'s second arm: s1's own bindings whose domain s2 does not
+    // rebind, added unconditionally (w' ≠ w, so never trivial anyway).
+    let dom: BTreeSet<&LVar> = s2.dom().collect();
+    for w in &range_vars {
+        if !dom.contains(w) {
+            // `s1_map[w]` exists for every range var by construction.
+            out.push((w.clone(), s1_map[w].clone()));
+        }
+    }
+    LSubstVFresh::from_list(out)
 }
 
 /// `composeVFresh s1 s2`: composes the fresh substitution `s1` with the
@@ -518,7 +626,28 @@ pub fn free_to_fresh_raw<C: Ord + Clone>(s: crate::subst::Subst<C, LVar>)
 /// (RuleVariants.hs:74-77).  Without this pipeline, two variants whose
 /// Maude-back-conversion shapes happen to collide will end up with
 /// structurally-identical range vars and collapse at `perform_split`.
-pub fn compose_vfresh<C>(
+/// Collect all distinct range vars in first-appearance order.
+///
+/// Walks the given range terms (each expanded via `vars_vterm`, whose per-term
+/// order is preserved) and keeps only the first occurrence of each var, guarded
+/// by a `seen` set.  Shared by `fresh_to_free_uniform_shift` and
+/// `compose_vfresh_general`, which differ only in which subst's range is walked.
+fn distinct_range_vars<'a, C: 'a>(
+    range: impl Iterator<Item = &'a VTerm<C, LVar>>,
+) -> Vec<LVar> {
+    let mut out: Vec<LVar> = Vec::new();
+    let mut seen: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+    for t in range {
+        for v in crate::vterm::vars_vterm(t) {
+            if seen.insert(v.clone()) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+fn compose_vfresh_general<C>(
     s1_0: &LSubstVFresh<C>,
     s2: &crate::subst::Subst<C, LVar>,
 ) -> LSubstVFresh<C>
@@ -526,15 +655,7 @@ where
     C: Ord + Clone,
 {
     // varsRange s2: vars in s2's range
-    let mut vs_in_range_s2: Vec<LVar> = Vec::new();
-    let mut seen: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
-    for t in s2.range() {
-        for v in crate::vterm::vars_vterm(t) {
-            if seen.insert(v.clone()) {
-                vs_in_range_s2.push(v);
-            }
-        }
-    }
+    let vs_in_range_s2: Vec<LVar> = distinct_range_vars(s2.range());
     let extended = s1_0.extend_with_renaming(&vs_in_range_s2);
     // Avoid set for freshToFreeAvoidingFast: `evalFreshAvoiding (s2, s1_0)`
     // (Substitution.hs:47) = `frees (s2, s1_0)` = `frees s2 <> frees s1_0`.

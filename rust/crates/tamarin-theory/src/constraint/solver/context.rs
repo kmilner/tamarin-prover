@@ -263,13 +263,12 @@ impl ProofContext {
     ///
     /// This is an `Arc` refcount bump of the read-only bundle
     /// ([`ProofContextShared`] — `full_sources`, `intruder_rules`,
-    /// `unique_sources`, `restrictions`, …), NOT a deep clone.  The
-    /// previous implementation deep-cloned every read-only `Vec`; in
-    /// particular `Source::clone` deep-copied `cases_cell` (a
-    /// `Mutex<Option<Vec<(Vec<String>, System)>>>`, each `System`
-    /// heavy), so a wide parallel node in `search.rs` (running inside
-    /// `cases.into_par_iter().map(...)`) re-cloned all of `full_sources`
-    /// once per child case (the top `System::clone` cost on this spine).
+    /// `unique_sources`, `restrictions`, …), NOT a deep clone.  A deep
+    /// clone would re-copy every read-only `Vec` — notably each
+    /// `Source`'s `cases_cell` (a `Mutex<Option<Vec<(Vec<String>,
+    /// System)>>>`, each `System` heavy) — once per child case inside
+    /// `cases.into_par_iter()` in search.rs, the top `System::clone`
+    /// cost on this spine; the `Arc` bump avoids that.
     /// Sharing is safe here: `with_swapped_maude` clones are created only
     /// DURING a lemma's proof search — after `ensure_saturated` has run
     /// and set `saturate_state = Done` — so the shared `full_sources`
@@ -394,12 +393,9 @@ impl ProofContext {
         // Match saturated sources back to originals BY GOAL.  Saturate
         // may drop sources whose cases all `mzero` during `refineSource`
         // (HS's `runReduction proofStep ctxt se fs` returns Disj.empty),
-        // so the saturated list can be SHORTER than `full_sources`.  A
-        // positional `zip` here was a bug: it wrote saturated[0] (e.g.
-        // KU(t:Fresh)'s cases) onto full_sources[0] (Premise(A)),
-        // corrupting unrelated sources.  HS keeps `cdGoal` stable across
-        // saturate iters (only `cdCases` changes), so `cdGoal` is the
-        // join key.
+        // so the saturated list can be SHORTER than `full_sources`.  HS
+        // keeps `cdGoal` stable across saturate iters (only `cdCases`
+        // changes), so `cdGoal` is the join key.
         for orig in &self.full_sources {
             let sat = refined.iter().find(|s| s.goal == orig.goal);
             // HS-faithful: `saturateSources` (Sources.hs:498) keeps ONE
@@ -469,34 +465,28 @@ impl ProofContext {
         Self::new_with_restrictions_pool_forced(maude, maude_pool, rules, restrictions, &[])
     }
 
-    /// Like [`new_with_restrictions_and_pool`] but also unions the FORCED
-    /// injective fact tags into `injective_fact_insts` BEFORE source
-    /// precomputation — mirroring HS `closeRuleCache` (Rule.hs:147-157), where
-    /// `injFactInstances` (forced ∪ simple) seeds `ctxt0`, which then drives
-    /// `precomputeSources`.  Used for the SAPIC state-channel optimisation
-    /// (`setforcedInjectiveFacts {L_PureState, L_CellLocked}`, Sapic.hs:84).
-    pub fn new_with_restrictions_pool_forced(
-        maude: MaudeHandle,
-        maude_pool: Option<std::sync::Arc<MaudePool>>,
-        mut rules: Vec<OpenProtoRule>,
-        restrictions: Vec<crate::guarded::Guarded>,
-        forced_injective_facts: &[crate::fact::FactTag],
-    ) -> Self {
-        // Inherit the maude signature from the handle so we can
-        // synthesise per-symbol construction rules.
-        let sig = maude.maude_sig();
-        // Order: subterm rules FIRST, then special rules.  Mirrors
-        // Haskell's `addMessageDeductionRuleVariants` (TheoryLoader.hs:784-789):
-        //     rules = subtermIntruderRules False msig
-        //          ++ specialIntruderRules False
-        //          ++ ...
-        // The ORDER MATTERS for solveAction's `disjunctionOfList rules` —
-        // a `KU(aenc(t1,t2))` goal is matched against c_aenc BEFORE
-        // coerce, producing cdCases = [c_aenc, coerce] instead of
-        // [coerce, c_aenc].  This downstream determines which case
-        // applies first in the proof renderer (e.g. NSPK3 injective_agree
-        // picks `case c_aenc` like Haskell does).
-        let mut intruder_rules = crate::intruder_rules::subterm_intruder_rules(false, &sig);
+    /// HS-faithful assembly of the intruder-rule cache
+    /// (`addMessageDeductionRuleVariants`, TheoryLoader.hs:776-791): subterm
+    /// rules, per-rule `closeIntrRule`, special rules, then the theory-specific
+    /// Nat/MSet/Xor/DH/BP variants — all in HS order.  Depends only on `sig`
+    /// and `maude`.
+    ///
+    /// Order: subterm rules FIRST, then special rules.  Mirrors
+    /// Haskell's `addMessageDeductionRuleVariants` (TheoryLoader.hs:784-789):
+    ///     rules = subtermIntruderRules False msig
+    ///          ++ specialIntruderRules False
+    ///          ++ ...
+    /// The ORDER MATTERS for solveAction's `disjunctionOfList rules` —
+    /// a `KU(aenc(t1,t2))` goal is matched against c_aenc BEFORE
+    /// coerce, producing cdCases = [c_aenc, coerce] instead of
+    /// [coerce, c_aenc].  This downstream determines which case
+    /// applies first in the proof renderer (e.g. NSPK3 injective_agree
+    /// picks `case c_aenc` like Haskell does).
+    fn assemble_intruder_rules(
+        sig: &tamarin_term::maude_sig::MaudeSig,
+        maude: &MaudeHandle,
+    ) -> Vec<IntrRuleAC> {
+        let mut intruder_rules = crate::intruder_rules::subterm_intruder_rules(false, sig);
         // HS-faithful: run `closeIntrRule` over EACH intr rule BEFORE
         // `special_intruder_rules` are appended.  Mirrors Haskell
         // `Rule.closeRuleCache` (lib/theory/src/Rule.hs:160):
@@ -518,7 +508,7 @@ impl ProofContext {
         // `special_intruder_rules` append (since HS appends specials
         // separately in `addMessageDeductionRuleVariants`).
         intruder_rules = intruder_rules.into_iter()
-            .flat_map(|ir| crate::intruder_rules::close_intr_rule(&maude, &ir))
+            .flat_map(|ir| crate::intruder_rules::close_intr_rule(maude, &ir))
             .collect();
         intruder_rules.extend(crate::intruder_rules::special_intruder_rules(false));
         // HS-faithful: theory-specific intruder rules (Nat, MSet, Xor) —
@@ -602,16 +592,36 @@ impl ProofContext {
         // — TheoryLoader.hs:777).
         if sig.enable_bp {
             intruder_rules.extend(
-                crate::intruder_variants::mk_dh_intruder_variants(&sig)
+                crate::intruder_variants::mk_dh_intruder_variants(sig)
             );
             intruder_rules.extend(
-                crate::intruder_variants::mk_bp_intruder_variants(&sig)
+                crate::intruder_variants::mk_bp_intruder_variants(sig)
             );
         } else if sig.enable_dh {
             intruder_rules.extend(
-                crate::intruder_variants::mk_dh_intruder_variants(&sig)
+                crate::intruder_variants::mk_dh_intruder_variants(sig)
             );
         }
+        intruder_rules
+    }
+
+    /// Like [`new_with_restrictions_and_pool`] but also unions the FORCED
+    /// injective fact tags into `injective_fact_insts` BEFORE source
+    /// precomputation — mirroring HS `closeRuleCache` (Rule.hs:147-157), where
+    /// `injFactInstances` (forced ∪ simple) seeds `ctxt0`, which then drives
+    /// `precomputeSources`.  Used for the SAPIC state-channel optimisation
+    /// (`setforcedInjectiveFacts {L_PureState, L_CellLocked}`, Sapic.hs:84).
+    pub fn new_with_restrictions_pool_forced(
+        maude: MaudeHandle,
+        maude_pool: Option<std::sync::Arc<MaudePool>>,
+        mut rules: Vec<OpenProtoRule>,
+        restrictions: Vec<crate::guarded::Guarded>,
+        forced_injective_facts: &[crate::fact::FactTag],
+    ) -> Self {
+        // Inherit the maude signature from the handle so we can
+        // synthesise per-symbol construction rules.
+        let sig = maude.maude_sig();
+        let intruder_rules = Self::assemble_intruder_rules(&sig, &maude);
         // Detect injective fact instances ahead of time — mirrors
         // Haskell's `pcInjectiveFactInsts` precomputation.
         let proto_rules: Vec<crate::rule::ProtoRuleE> = rules.iter()
@@ -730,14 +740,12 @@ impl ProofContext {
         // smart-rank tie-breaker then resolved differently.
         for (idx, o) in rules.iter().enumerate() {
             if !o.variants.is_empty() { continue; }
-            // The pre-applied variant *rules* (the old variant-expansion path
-            // that fed `o.variants`) are DEAD for the constraint solver:
-            // the SplitG-based solving path reads only `abstracted_rule` +
-            // `variant_substs` (`canonical_rule_inst` / `rule_insts_with_constrs`,
-            // reduction.rs:2868,2895).  Their RAW `get variants` Maude query
-            // (over the un-abstracted rule structure) is the single biggest
-            // Maude cost on bilinear protocols, and its output is never read,
-            // so it is no longer computed at all.
+            // The constraint solver reads only `abstracted_rule` +
+            // `variant_substs` (`canonical_rule_inst` /
+            // `rule_insts_with_constrs`, reduction.rs:2868,2895); it never
+            // reads `o.variants`.  We therefore skip the RAW `get variants`
+            // Maude query (the single biggest Maude cost on bilinear
+            // protocols) and compute only the abstracted form + substs.
             //
             // The variant substitutions and the abstracted rule are computed
             // ONCE, HS-faithfully, by `abstract_rule_and_variants` (the

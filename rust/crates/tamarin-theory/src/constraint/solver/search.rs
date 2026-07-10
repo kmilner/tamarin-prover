@@ -702,11 +702,8 @@ fn expand_inner(
     // Disj-monad explores each branch using as many steps as needed —
     // there is no step-count cap on individual branches.  The ID-DFS
     // depth limit (above) prevents infinite recursion; deadline catches
-    // runaway Maude calls.  Earlier fair-budget split divided `budget`
-    // by `n_cases`, which caused deeply-branching paths to exhaust
-    // their per-branch share before reaching a Solved leaf, even when
-    // total budget was generous.  Each child sees the same shared
-    // `budget` counter, decremented as it explores.
+    // runaway Maude calls.  Each child sees the same shared `budget`
+    // counter, decremented as it explores.
     //
     // Per-child parallelism (env-opt: `TAM_RS_DISABLE_PARALLEL_EXPAND=1`
     // disables; default ON).  Mirrors HS's `parTraversable nfProofMethod`
@@ -839,10 +836,9 @@ fn expand_inner(
         let any_hit = results.iter().any(|(_, _, hit)| *hit);
         DEPTH_LIMIT_HIT.with(|f| f.set(parent_depth_limit_hit || any_hit));
         // Restore the parent's per-search thread-locals that the closures
-        // may have clobbered while running on this same thread (B1).  Pre-B1
-        // these ran on distinct worker threads and were already isolated, so
-        // this restore is a no-op there; under B1 it makes the search see its
-        // own MAX_DEPTH / DEADLINE / case_path after the fan-out.
+        // may have clobbered while running on this same thread under
+        // lemma-level parallelism, so the search sees its own MAX_DEPTH /
+        // DEADLINE / case_path after the fan-out.
         MAX_DEPTH.with(|m| m.set(mp_snapshot));
         DEADLINE.with(|d| d.set(Some(deadline_snapshot)));
         crate::constraint::solver::trace::case_path_set(&path_snapshot);
@@ -948,7 +944,7 @@ fn insert_induction_at<T>(
     mk: impl Fn() -> T,
 ) {
     use crate::constraint::solver::context::UseInduction;
-    if !is_initial_system(sys) {
+    if !sys.is_initial() {
         return;
     }
     let can_induct = sys
@@ -1069,20 +1065,6 @@ pub fn candidate_methods_with_expl(
     out
 }
 
-/// Mirror of Haskell's `isInitialSystem` (System.hs:828-829):
-///
-///   isInitialSystem sys =
-///     null (L.get sSolvedFormulas sys) && not (S.member bot (L.get sFormulas sys))
-///
-/// where `bot = GDisj (Disj [])` (our `gfalse()` = `Guarded::Disj(vec![])`).
-/// This is the exact gate the automatic-search path (`rankProofMethods`,
-/// ProofMethod.hs:527) uses to decide whether `insertInduction` runs — NOT
-/// the stricter replay-only `canApplyInduction` (ProofMethod.hs:264-270).
-fn is_initial_system(sys: &System) -> bool {
-    sys.solved_formulas.is_empty()
-        && !sys.formulas.contains(&crate::guarded::gfalse())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1122,7 +1104,7 @@ mod tests {
         // Mark non-initial via a solved formula (Haskell's
         // `isInitialSystem` uses solved_formulas emptiness, not the
         // node/edge count).
-        sys.solved_formulas.push(crate::guarded::gtrue());
+        sys.solved_formulas.push(std::sync::Arc::new(crate::guarded::gtrue()));
         sys.add_node(tamarin_term::lterm::LVar::new(
             "i", tamarin_term::lterm::LSort::Node, 0), rule);
         let root = run_proof_search(&ctx, sys, 10);
@@ -1144,7 +1126,7 @@ mod tests {
         // also how Haskell signals contradictoryness — `openGoals`
         // filters `DisjG (Disj [])` and `FormulasFalse` fires from
         // `contradictions`.  We mirror exactly that here.
-        sys.formulas.push(crate::guarded::gfalse());
+        sys.formulas.push(std::sync::Arc::new(crate::guarded::gfalse()));
         sys.add_goal(crate::constraint::constraints::Goal::Disj(
             crate::constraint::constraints::Disj::new(Vec::new()),
         ));
@@ -1192,8 +1174,8 @@ mod tests {
         ));
         // Two duplicate gtrue formulas — `dedupe_formulas_pass` must
         // drop one and `drop_trivially_true_formulas_pass` drops both.
-        sys.formulas.push(crate::guarded::gtrue());
-        sys.formulas.push(crate::guarded::gtrue());
+        sys.formulas.push(std::sync::Arc::new(crate::guarded::gtrue()));
+        sys.formulas.push(std::sync::Arc::new(crate::guarded::gtrue()));
         let root = run_proof_search(&ctx, sys, 5);
         assert_eq!(root.status, NodeStatus::Solved);
     }

@@ -159,7 +159,7 @@ fn mentioned_in_unsolved_chains(v: &NodeId, sys: &System) -> bool {
     })
 }
 
-fn mentioned_in_formulas(v: &NodeId, formulas: &[tamarin_theory::guarded::Guarded]) -> bool {
+fn mentioned_in_formulas(v: &NodeId, formulas: &[std::sync::Arc<tamarin_theory::guarded::Guarded>]) -> bool {
     formulas.iter().any(|g| guarded_mentions_node(v, g))
 }
 
@@ -275,16 +275,10 @@ fn try_hide_action(v: &NodeId, sys: System) -> Result<System, System> {
 /// Mirror Haskell `eligibleTerm`:
 ///   isPair m  || isInverse m  || sortOfLNTerm m == LSortPub  || == LSortNat
 fn eligible_term(t: &LNTerm) -> bool {
-    is_pair(t)
+    tamarin_term::term::is_pair(t)
         || is_inverse(t)
         || sort_of_lnterm(t) == LSort::Pub
         || sort_of_lnterm(t) == LSort::Nat
-}
-
-fn is_pair(t: &LNTerm) -> bool {
-    if let Term::App(FunSym::NoEq(sym), args) = t {
-        sym.name == b"pair" && args.len() == 2
-    } else { false }
 }
 
 fn is_inverse(t: &LNTerm) -> bool {
@@ -335,8 +329,8 @@ fn try_hide_rule(v: &NodeId, ru: RuleACInst, sys: System) -> Result<System, Syst
         }
     }
     // Node removal can LOWER the node-component max, so invalidate the
-    // node cache (the full cache is not maintained on this display-only
-    // simplify path, matching pre-existing behaviour — leave it as-is).
+    // node cache.  The full cache is not maintained on this display-only
+    // simplify path.
     new_sys.invalidate_node_max_cache();
     new_sys.nodes_mut().retain(|(id, _)| id != v);
     Ok(new_sys)

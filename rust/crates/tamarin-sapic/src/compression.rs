@@ -14,6 +14,8 @@ use std::collections::BTreeSet;
 use tamarin_theory::fact::{FactTag, LNFact, Multiplicity};
 use tamarin_theory::rule::{ProtoRuleEInfo, ProtoRuleName, Rule, RuleAttributes};
 
+use crate::base_translation::list_union;
+
 type ERule = Rule<ProtoRuleEInfo>;
 
 const NO_COMPRESS_KEYWORDS: &[&str] = &[
@@ -161,18 +163,6 @@ fn can_merge(comp_events: bool, r1: &ERule, r2: &ERule) -> bool {
         return false;
     }
     true
-}
-
-/// `List.union` semantics: `xs ++ filter (`notElem` xs) ys` (preserves xs order,
-/// appends new elements of ys, dedups within ys too via HS `nub`-like `union`).
-fn list_union(xs: &[LNFact], ys: &[LNFact]) -> Vec<LNFact> {
-    let mut out = xs.to_vec();
-    for y in ys {
-        if !out.contains(y) {
-            out.push(y.clone());
-        }
-    }
-    out
 }
 
 /// `merge compEvents rule1 rule2 ruleset` (Compression.hs:87-96).

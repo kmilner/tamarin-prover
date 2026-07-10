@@ -626,7 +626,7 @@ impl DotBuilder {
         // `showAttr`, Text/Dot.hs:346-353); the record metacharacters
         // `{ } | < >` are LITERAL, so a tuple `<A, B, …>` in a goal fact must
         // stay `<…>` and NOT be `\<…\>`-escaped (only the `SystemNode`/
-        // `D.record` path escapes them — task #17 family B).
+        // `D.record` path escapes them).
         let _ = writeln!(self.buf,
             "  {} [shape=ellipse,label=\"{}\",color=\"{}\"];",
             id, escape_dot_label(&s), color);
@@ -635,7 +635,7 @@ impl DotBuilder {
         // HS `LastActionAtom -> mkSimpleNode (show v) []` (Dot.hs:273): the
         // label is `show v`, rendered via `Display for LVar` (`#i` / `#i.2`),
         // via plain `D.node` (see `action_node`), so use the plain-label escaper.
-        // `dot_id` is the collision-disambiguated id (see `last_dot_id`).
+        // `dot_id` is the collision-disambiguated id (see `ellipse_dot_ids`).
         let _ = writeln!(self.buf,
             "  {} [shape=ellipse,label=\"{}\"];",
             dot_id, escape_dot_label(&nid.to_string()));
@@ -1442,8 +1442,7 @@ fn escape_record_field(s: &str) -> String {
 /// left-justified line break) are escaped.  This is the LAST escaping pass
 /// for every label — plain ellipse labels (where record metacharacters
 /// `{ } | < >` must stay literal) and record labels (whose field text was
-/// already record-escaped by `escape_record_field`) alike.  Emitting `\n`
-/// instead of `\l` here was task #20's dominant DOT divergence.
+/// already record-escaped by `escape_record_field`) alike.
 fn escape_dot_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

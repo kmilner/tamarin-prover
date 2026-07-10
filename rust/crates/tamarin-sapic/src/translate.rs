@@ -348,7 +348,8 @@ pub struct Translation {
 }
 
 /// Translation options threaded from the theory (HS `_thyOptions`).  Defaults
-/// (all-false) reproduce the pre-Phase-7 core linear pipeline.
+/// (all-false) select the core linear pipeline (no progress / reliable / report
+/// / state-channel passes).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TranslateOptions {
     pub trans_progress: bool,

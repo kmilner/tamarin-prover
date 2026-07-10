@@ -463,9 +463,9 @@ fn synthesise_probe_theory(
     // only retypes LSortNat → LSortFresh (everything else stays as-is).
     // So `~ltk` (fresh) and `ltk` (msg) become Fr(~ltk) and Fr(ltk) — two
     // DISTINCT premises; Out(~ltk) makes ~ltk derivable while KU(ltk) is
-    // not.  Forcing every var to Fresh, and keying the rename map on
-    // (name, idx) only, collapsed same-named vars of different sorts into
-    // one (e.g. Register_pk's ~ltk/ltk), corrupting the probe.
+    // not.  Keying the rename map on (name, sort, idx) — not (name, idx)
+    // alone — is required so same-named vars of different sorts (e.g.
+    // Register_pk's `~ltk` vs `ltk`) stay distinct.
     // Each free var gets a UNIQUE probe name (`dvar<k>`) keeping its sort
     // (nat→fresh).  HS distinguishes same-named/different-sort vars (`~ltk`
     // vs `ltk`) via sort-aware LVar identity in de Bruijn conversion; RS's
@@ -703,8 +703,6 @@ fn prove_probe(
         }
     }
 
-    // `_deadline_guard` restores the prior deadline on drop, so the deriv
-    // check doesn't leak into the main prove loop.
     Some(ProbeOutcome { undecidable, prove_time, var_count })
 }
 

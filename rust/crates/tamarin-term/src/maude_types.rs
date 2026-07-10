@@ -259,37 +259,28 @@ pub fn substitute_lookup_var(
     sort: LSort,
     idx: u64,
 ) -> Option<LVar> {
-    // Strict lookup first.
-    if let Some(lv) = ctx.inverse.get(&MaudeLit::MaudeVar(idx, sort))
-        .and_then(|l| if let Lit::Var(lv) = l { Some(lv.clone()) } else { None })
-    {
-        return Some(lv);
-    }
-    // Sort-tolerant fallback: look up by (idx, ANY sort) to recover the
-    // original LVar identity when the strict (idx, sort) key misses.
+    // Delegates to `lookup_canonical_var_lit` (identical strict lookup +
+    // sort-tolerant fallback over the same candidate array) and projects the
+    // hit to its `LVar`.  Every `MaudeVar(idx, sort)` key in `ctx.inverse` is
+    // inserted only against a `Lit::Var` (`import_lit` maps Var->MaudeVar /
+    // Con->MaudeConst, and the fresh-witness path at `mterm_to_lnterm` inserts
+    // `Lit::Var`), so a `MaudeVar` key never resolves to a `Lit::Con`; the
+    // per-candidate `Lit::Var` filter can therefore never skip a Con to find a
+    // later Var, and the delegated form returns the same LVar for every input.
     //
-    // Known Rust-side compensation, NOT yet traced to its upstream cause.
-    // This diverges from HS `msubstToLSubstVFresh`/`VFree`'s `lookupVar s i
-    // = lookupBinding (MaudeVar i s)` (Types.hs:139-143, 159-163), which is
-    // strict in the full `MaudeLit` sort and `error`s on a miss — there is
-    // no any-sort fallback.  The forward encoder (`import_lit`) and the
-    // substitution sort parser (`parse_entry`/`parse_sort`) are
-    // byte-equivalent to HS `exportLit`/`parseEntry`, so given identical
-    // Maude output the strict lookup should always hit and HS never reaches
-    // the error.  When this loop fires it is therefore masking a Rust-side
-    // registration mismatch, not a Maude-side fact.  Kept to preserve
-    // current corpus parity until the upstream cause is traced; do not
-    // delete without a full HS-parity corpus diff (TESLA Scheme1/2 are
-    // sensitive, per project memory).
-    for sort_candidate in &[LSort::Pub, LSort::Fresh, LSort::Nat, LSort::Msg, LSort::Node] {
-        if *sort_candidate == sort { continue; }
-        if let Some(lv) = ctx.inverse.get(&MaudeLit::MaudeVar(idx, *sort_candidate))
-            .and_then(|l| if let Lit::Var(lv) = l { Some(lv.clone()) } else { None })
-        {
-            return Some(lv);
-        }
+    // The sort-tolerant fallback in `lookup_canonical_var_lit` is a known
+    // Rust-side compensation, NOT yet traced to its upstream cause.  It
+    // diverges from HS `msubstToLSubstVFresh`/`VFree`'s `lookupVar s i =
+    // lookupBinding (MaudeVar i s)` (Types.hs:139-143, 159-163), which is
+    // strict in the full `MaudeLit` sort and `error`s on a miss — there is no
+    // any-sort fallback.  Kept to preserve current corpus parity until the
+    // upstream cause is traced; do not change the fallback without a full
+    // HS-parity corpus diff (TESLA Scheme1/2 are sensitive, per project
+    // memory).
+    match lookup_canonical_var_lit(ctx, sort, idx) {
+        Some(Lit::Var(lv)) => Some(lv),
+        _ => None,
     }
-    None
 }
 
 /// Like `substitute_lookup_var` but for term-reconstruction: returns

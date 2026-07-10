@@ -420,7 +420,7 @@ fn ln_fact_to_doc(fa: &crate::fact::LNFact) -> crate::pretty_hpj::Doc {
         .map(|t| Doc::text(tamarin_term::pretty::pretty_lnterm(t)))
         .collect();
     let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
-    nest_short_doc(&lead, ")", body)
+    hpj::nest_short_doc(&lead, ")", body)
 }
 
 /// `[ f, … ]` fact-list for runtime `LNFact`s (HS `ppFactsList`).
@@ -990,10 +990,8 @@ fn binop_to_doc(
 }
 
 // =============================================================================
-// HS HughesPJ ribbon + fit constants (used by the guarded-formula
-// wrap-aware renderer below).  The full-formula path now goes through
-// the `pretty_hpj::Doc` engine; the guarded path retains a focused
-// string-based fit check.
+// HS HughesPJ ribbon + fit constants, used by the Doc-engine
+// `render_at` layout for both the full-formula and guarded wrapped paths.
 // =============================================================================
 
 /// HS ribbon width.  HS sets `lineWidth = 110` (`Main/Console.hs:236`)
@@ -1285,15 +1283,7 @@ pub fn term_to_doc(t: &p::Term, scope: &[Bind]) -> crate::pretty_hpj::Doc {
         Pair(items) => {
             // Flatten right-associative pairs exactly as HS `split` does
             // (Term/Term.hs:292-293), splicing a trailing Pair.
-            let mut flat: Vec<&p::Term> = Vec::with_capacity(items.len());
-            let mut cur: &[p::Term] = items;
-            loop {
-                let n = cur.len();
-                if n == 0 { break; }
-                for it in &cur[..n - 1] { flat.push(it); }
-                let last = &cur[n - 1];
-                if let Pair(inner) = last { cur = inner; } else { flat.push(last); break; }
-            }
+            let flat = flatten_pair_terms(items);
             pair_doc(&flat, scope)
         }
         App(name, args) => {
@@ -1348,22 +1338,72 @@ pub fn term_to_doc(t: &p::Term, scope: &[Bind]) -> crate::pretty_hpj::Doc {
             } else {
                 // Flatten same-op children to the n-ary chain HS's `viewTerm`
                 // exposes for AC symbols.
-                fn flatten<'a>(op: p::BinOp, t: &'a p::Term, out: &mut Vec<&'a p::Term>) {
-                    match t {
-                        p::Term::BinOp(inner, l, r) if *inner == op => {
-                            flatten(op, l, out);
-                            flatten(op, r, out);
-                        }
-                        _ => out.push(t),
-                    }
-                }
                 let mut flat: Vec<&p::Term> = Vec::new();
-                flatten(*op, l, &mut flat);
-                flatten(*op, r, &mut flat);
+                flatten_ac_terms(*op, l, &mut flat);
+                flatten_ac_terms(*op, r, &mut flat);
                 ac_op_doc(binop_symbol(*op), &flat, scope)
             }
         }
     }
+}
+
+/// Flatten a same-op `BinOp` chain into the n-ary arg vector HS's `viewTerm`
+/// exposes for AC symbols (Term/Term.hs).  Parser-AST variant.
+fn flatten_ac_terms<'a>(op: p::BinOp, t: &'a p::Term, out: &mut Vec<&'a p::Term>) {
+    match t {
+        p::Term::BinOp(inner, l, r) if *inner == op => {
+            flatten_ac_terms(op, l, out);
+            flatten_ac_terms(op, r, out);
+        }
+        _ => out.push(t),
+    }
+}
+
+/// `flatten_ac_terms` over `GTerm` (the guarded-formula term AST).
+fn flatten_ac_gterms<'a>(
+    op: p::BinOp,
+    t: &'a crate::guarded::GTerm,
+    out: &mut Vec<&'a crate::guarded::GTerm>,
+) {
+    match t {
+        crate::guarded::GTerm::BinOp(inner, l, r) if *inner == op => {
+            flatten_ac_gterms(op, l, out);
+            flatten_ac_gterms(op, r, out);
+        }
+        _ => out.push(t),
+    }
+}
+
+/// Flatten a right-associative pair tree into a flat arg slice exactly as HS
+/// `split` does (Term/Term.hs:292-293): splice a trailing `Pair`.  Parser-AST
+/// variant.
+fn flatten_pair_terms(items: &[p::Term]) -> Vec<&p::Term> {
+    let mut flat: Vec<&p::Term> = Vec::with_capacity(items.len());
+    let mut cur: &[p::Term] = items;
+    loop {
+        let n = cur.len();
+        if n == 0 { break; }
+        for it in &cur[..n - 1] { flat.push(it); }
+        let last = &cur[n - 1];
+        if let p::Term::Pair(inner) = last { cur = inner; } else { flat.push(last); break; }
+    }
+    flat
+}
+
+/// `flatten_pair_terms` over `GTerm` (the guarded-formula term AST).
+fn flatten_pair_gterms(
+    items: &[crate::guarded::GTerm],
+) -> Vec<&crate::guarded::GTerm> {
+    let mut flat: Vec<&crate::guarded::GTerm> = Vec::with_capacity(items.len());
+    let mut cur: &[crate::guarded::GTerm] = items;
+    loop {
+        let n = cur.len();
+        if n == 0 { break; }
+        for it in &cur[..n - 1] { flat.push(it); }
+        let last = &cur[n - 1];
+        if let crate::guarded::GTerm::Pair(inner) = last { cur = inner; } else { flat.push(last); break; }
+    }
+    flat
 }
 
 /// HS `ppTerms (ppACOp o) 1 "(" ")" ts` (Term/Term.hs:273,288-290) — a fcat
@@ -1423,7 +1463,7 @@ pub fn fact_to_doc(fa: &p::Fact, scope: &[Bind]) -> crate::pretty_hpj::Doc {
     };
     let arg_docs: Vec<Doc> = fa.args.iter().map(|a| term_to_doc(a, scope)).collect();
     let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
-    let mut d = nest_short_doc(&lead, ")", body);
+    let mut d = hpj::nest_short_doc(&lead, ")", body);
     // Fact annotations: `<> ppAnn an = brackets . fsep . punctuate comma` in
     // `FactAnnotation` Ord order (see `fact_annotations_suffix`).
     if let Some(ann) = fact_annotations_suffix(&fa.annotations) {
@@ -1462,15 +1502,7 @@ fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty
         }
         Pair(items) => {
             // HS `split` flattens right-associative pairs (Term/Term.hs:292-293).
-            let mut flat: Vec<&crate::guarded::GTerm> = Vec::with_capacity(items.len());
-            let mut cur: &[crate::guarded::GTerm] = items;
-            loop {
-                let n = cur.len();
-                if n == 0 { break; }
-                for it in &cur[..n - 1] { flat.push(it); }
-                let last = &cur[n - 1];
-                if let Pair(inner) = last { cur = inner; } else { flat.push(last); break; }
-            }
+            let flat = flatten_pair_gterms(items);
             gpair_doc(&flat, scope)
         }
         App(name, args) => {
@@ -1509,22 +1541,9 @@ fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty
                     .beside(Doc::text("^"))
                     .beside(gterm_to_doc(r, scope))
             } else {
-                fn flatten<'a>(
-                    op: p::BinOp,
-                    t: &'a crate::guarded::GTerm,
-                    out: &mut Vec<&'a crate::guarded::GTerm>,
-                ) {
-                    match t {
-                        crate::guarded::GTerm::BinOp(inner, l, r) if *inner == op => {
-                            flatten(op, l, out);
-                            flatten(op, r, out);
-                        }
-                        _ => out.push(t),
-                    }
-                }
                 let mut flat: Vec<&crate::guarded::GTerm> = Vec::new();
-                flatten(*op, l, &mut flat);
-                flatten(*op, r, &mut flat);
+                flatten_ac_gterms(*op, l, &mut flat);
+                flatten_ac_gterms(*op, r, &mut flat);
                 // HS re-sorts AC args after opening the binder (see
                 // `sort_ac_args_for_display` / Guarded.hs:846-849,290).
                 sort_ac_args_for_display(&mut flat, scope);
@@ -1581,7 +1600,7 @@ fn gfact_to_doc(fa: &crate::guarded::GFact, scope: &[Vec<Bind>]) -> crate::prett
     };
     let arg_docs: Vec<Doc> = fa.args.iter().map(|a| gterm_to_doc(a, scope)).collect();
     let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
-    let mut d = nest_short_doc(&lead, ")", body);
+    let mut d = hpj::nest_short_doc(&lead, ")", body);
     // Annotations rendered in `FactAnnotation` Ord order (see
     // `fact_annotations_suffix`); mirrors HS `ppAnn`'s `S.toList`.
     if let Some(ann) = fact_annotations_suffix(&fa.annotations) {
@@ -1658,17 +1677,6 @@ fn gatom_to_doc(a: &crate::guarded::GAtom, scope: &[Vec<Bind>]) -> crate::pretty
     }
 }
 
-/// HS `nestShort' lead finish body =
-///   nestShort (length lead + 1) (text lead) (text finish) body
-///   = sep [ text lead $$ nest n (text finish-less body), text finish ]`
-/// where `$$` is HughesPJ `above` (Class.hs:218-223).
-fn nest_short_doc(lead: &str, finish: &str, body: crate::pretty_hpj::Doc) -> crate::pretty_hpj::Doc {
-    use crate::pretty_hpj::{self as hpj, Doc};
-    let n = lead.chars().count() as isize + 1;
-    let above = Doc::text(lead).above(body.nest(n));
-    hpj::sep(vec![above, Doc::text(finish)])
-}
-
 fn pp_term(t: &p::Term, scope: &[Bind], out: &mut String) {
     use p::Term::*;
     match t {
@@ -1716,20 +1724,7 @@ fn pp_term(t: &p::Term, scope: &[Bind], out: &mut String) {
             // walks the rightmost child and emits a flat
             // `<a, b, c, d>`. Mirror that here: splice the last item
             // when it's a Pair.
-            let mut flat: Vec<&p::Term> = Vec::with_capacity(items.len());
-            let mut cur: &[p::Term] = items;
-            loop {
-                let n = cur.len();
-                if n == 0 { break; }
-                for it in &cur[..n - 1] { flat.push(it); }
-                let last = &cur[n - 1];
-                if let Pair(inner) = last {
-                    cur = inner;
-                } else {
-                    flat.push(last);
-                    break;
-                }
-            }
+            let flat = flatten_pair_terms(items);
             out.push('<');
             for (i, it) in flat.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
@@ -1793,18 +1788,9 @@ fn pp_term(t: &p::Term, scope: &[Bind], out: &mut String) {
             let is_ac = matches!(op,
                 p::BinOp::Mult | p::BinOp::Union | p::BinOp::Xor | p::BinOp::NatPlus);
             if is_ac {
-                fn flatten<'a>(op: p::BinOp, t: &'a p::Term, out: &mut Vec<&'a p::Term>) {
-                    match t {
-                        p::Term::BinOp(inner, l, r) if *inner == op => {
-                            flatten(op, l, out);
-                            flatten(op, r, out);
-                        }
-                        _ => out.push(t),
-                    }
-                }
                 let mut flat: Vec<&p::Term> = Vec::new();
-                flatten(*op, l, &mut flat);
-                flatten(*op, r, &mut flat);
+                flatten_ac_terms(*op, l, &mut flat);
+                flatten_ac_terms(*op, r, &mut flat);
                 out.push('(');
                 let sym = binop_symbol(*op);
                 for (i, child) in flat.iter().enumerate() {
@@ -2407,22 +2393,9 @@ fn pp_gterm(t: &crate::guarded::GTerm, scope: &[Vec<Bind>], out: &mut String) {
                 pp_gterm(r, scope, out);
                 return;
             }
-            fn flatten<'a>(
-                op: p::BinOp,
-                t: &'a crate::guarded::GTerm,
-                out: &mut Vec<&'a crate::guarded::GTerm>,
-            ) {
-                match t {
-                    crate::guarded::GTerm::BinOp(inner, l, r) if *inner == op => {
-                        flatten(op, l, out);
-                        flatten(op, r, out);
-                    }
-                    _ => out.push(t),
-                }
-            }
             let mut flat: Vec<&crate::guarded::GTerm> = Vec::new();
-            flatten(*op, l, &mut flat);
-            flatten(*op, r, &mut flat);
+            flatten_ac_gterms(*op, l, &mut flat);
+            flatten_ac_gterms(*op, r, &mut flat);
             // HS re-sorts AC args after opening the binder (see
             // `sort_ac_args_for_display` / Guarded.hs:846-849,290).
             sort_ac_args_for_display(&mut flat, scope);
@@ -2498,7 +2471,7 @@ mod tests {
         // */` exceeds the ribbon (73), `sep` drops the comment to its OWN
         // line at the step's base indent (here base_indent = 2).  The
         // method's own (single-line) text stays put; only the comment
-        // moves.  Mirrors Reproducer A.
+        // moves.
         use crate::pretty_hpj::Doc;
         let long = "solve( (last(#k))  \u{2225} (something quite long here indeed yes) )";
         assert!(long.chars().count() + " /* unannotated */".chars().count() > 73);

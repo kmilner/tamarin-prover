@@ -970,16 +970,22 @@ impl<'a> Parser<'a> {
 
     // -------------------- Builtins / options / heuristic / tactic --------------------
 
-    fn builtins(&mut self) -> Result<TheoryItem, ParseError> {
-        self.require_kw("builtins")?;
+    /// `<kw>: ident-with-hyphens (, ident-with-hyphens)*` (no trailing comma).
+    /// Shared by the `builtins` and `options` declarations, which are identical
+    /// modulo the keyword and the wrapping `TheoryItem` variant.
+    fn comma_sep_hyphen_idents(&mut self, kw: &str) -> Result<Vec<String>, ParseError> {
+        self.require_kw(kw)?;
         self.require_punct(":")?;
         let mut names = Vec::new();
         loop {
-            let n = self.hyphen_identifier()?;
-            names.push(n);
+            names.push(self.hyphen_identifier()?);
             if !self.try_punct(",") { break; }
         }
-        Ok(TheoryItem::Builtins(names))
+        Ok(names)
+    }
+
+    fn builtins(&mut self) -> Result<TheoryItem, ParseError> {
+        Ok(TheoryItem::Builtins(self.comma_sep_hyphen_idents("builtins")?))
     }
 
     /// Identifier that may contain hyphens (e.g. `asymmetric-encryption`,
@@ -1007,15 +1013,7 @@ impl<'a> Parser<'a> {
     }
 
     fn options(&mut self) -> Result<TheoryItem, ParseError> {
-        self.require_kw("options")?;
-        self.require_punct(":")?;
-        let mut opts = Vec::new();
-        loop {
-            let n = self.hyphen_identifier()?;
-            opts.push(n);
-            if !self.try_punct(",") { break; }
-        }
-        Ok(TheoryItem::Options(opts))
+        Ok(TheoryItem::Options(self.comma_sep_hyphen_idents("options")?))
     }
 
     fn heuristic(&mut self) -> Result<TheoryItem, ParseError> {
@@ -1219,6 +1217,27 @@ impl<'a> Parser<'a> {
         Ok(TheoryItem::Functions(decls))
     }
 
+    /// Parse `elem (, elem)* ,?` up to (and consuming) the `close` token,
+    /// assuming the opening token has already been consumed. Mirrors HS
+    /// `commaSep = sepEndBy comma` (Token.hs): the list may be empty and a
+    /// single trailing comma before `close` is permitted.
+    fn sep_end_by<T>(
+        &mut self,
+        close: &str,
+        mut elem: impl FnMut(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<Vec<T>, ParseError> {
+        let mut v = Vec::new();
+        if !self.try_punct(close) {
+            loop {
+                v.push(elem(self)?);
+                if !self.try_punct(",") { break; }
+                if self.peek_punct(close) { break; }
+            }
+            self.require_punct(close)?;
+        }
+        Ok(v)
+    }
+
     fn function_decl(&mut self) -> Result<FunctionDecl, ParseError> {
         let name = self.ident()?;
         let (arg_types, out_type);
@@ -1228,18 +1247,9 @@ impl<'a> Parser<'a> {
             out_type = None;
         } else {
             self.require_punct("(")?;
-            let mut args = Vec::new();
-            if !self.try_punct(")") {
-                loop {
-                    let t = self.type_p()?;
-                    args.push(t);
-                    // HS `parens (commaSep typep)` (Signature.hs:156): `sepEndBy`
-                    // permits a trailing comma before `)`.
-                    if !self.try_punct(",") { break; }
-                    if self.peek_punct(")") { break; }
-                }
-                self.require_punct(")")?;
-            }
+            // HS `parens (commaSep typep)` (Signature.hs:156): `sepEndBy`
+            // permits a trailing comma before `)`.
+            let args = self.sep_end_by(")", |p| p.type_p())?;
             self.require_punct(":")?;
             out_type = self.type_p()?;
             arg_types = args.into_iter().collect();
@@ -1318,17 +1328,8 @@ impl<'a> Parser<'a> {
         loop {
             let name = self.ident()?;
             self.require_punct("(")?;
-            let mut args = Vec::new();
-            if !self.try_punct(")") {
-                loop {
-                    let v = self.var_spec()?;
-                    args.push(v);
-                    // HS `parens $ commaSep lvar` (Macro.hs:38): trailing comma OK.
-                    if !self.try_punct(",") { break; }
-                    if self.peek_punct(")") { break; }
-                }
-                self.require_punct(")")?;
-            }
+            // HS `parens $ commaSep lvar` (Macro.hs:38): trailing comma OK.
+            let args = self.sep_end_by(")", |p| p.var_spec())?;
             self.require_punct("=")?;
             let body = self.term(false)?;
             ms.push(Macro { name, args, body });
@@ -1420,12 +1421,19 @@ impl<'a> Parser<'a> {
             return Ok((vec![], vec![]));
         }
         self.require_punct("--[")?;
+        self.parse_action_restr_list()
+    }
+
+    /// Parse the `--[ ... ]->` action/restriction body up to (and consuming)
+    /// the `]->` terminator, assuming `--[` has already been consumed. Facts
+    /// become actions and `_restrict(..)` become restrictions; a trailing comma
+    /// before `]->` is permitted (HS `commaSep`, Rule.hs:186).
+    fn parse_action_restr_list(&mut self) -> Result<(Vec<Fact>, Vec<Formula>), ParseError> {
         let mut acts = Vec::new();
         let mut rstrs = Vec::new();
         if !self.try_punct("]->") {
             loop {
-                let item = self.fact_or_restr()?;
-                match item {
+                match self.fact_or_restr()? {
                     FactOrRestr::Fact(f) => acts.push(f),
                     FactOrRestr::Restr(phi) => rstrs.push(phi),
                 }
@@ -1650,19 +1658,10 @@ impl<'a> Parser<'a> {
 
     fn fact_list(&mut self) -> Result<Vec<Fact>, ParseError> {
         self.require_punct("[")?;
-        let mut fs = Vec::new();
-        if self.try_punct("]") { return Ok(fs); }
-        loop {
-            let f = self.fact()?;
-            fs.push(f);
-            // HS `list (fact ...)` (Rule.hs:183/188) = `brackets . commaSep`
-            // (Token.hs:362-363) with `commaSep = sepEndBy comma`: the list may
-            // be empty (handled above) and a trailing comma before `]` is OK.
-            if !self.try_punct(",") { break; }
-            if self.peek_punct("]") { break; }
-        }
-        self.require_punct("]")?;
-        Ok(fs)
+        // HS `list (fact ...)` (Rule.hs:183/188) = `brackets . commaSep`
+        // (Token.hs:362-363) with `commaSep = sepEndBy comma`: the list may
+        // be empty and a trailing comma before `]` is OK.
+        self.sep_end_by("]", |p| p.fact())
     }
 
     fn fact_or_restr(&mut self) -> Result<FactOrRestr, ParseError> {
@@ -1800,18 +1799,9 @@ impl<'a> Parser<'a> {
             else if self.try_kw("output") {
                 self.require_punct("=")?;
                 self.require_punct("[")?;
-                let mut outs = Vec::new();
-                if !self.try_punct("]") {
-                    loop {
-                        let id = self.ident()?;
-                        outs.push(id);
-                        // HS `list constructorp` (Lemma.hs:49) = `brackets . commaSep`:
-                        // trailing comma before `]` is permitted.
-                        if !self.try_punct(",") { break; }
-                        if self.peek_punct("]") { break; }
-                    }
-                    self.require_punct("]")?;
-                }
+                // HS `list constructorp` (Lemma.hs:49) = `brackets . commaSep`:
+                // trailing comma before `]` is permitted.
+                let outs = self.sep_end_by("]", |p| p.ident())?;
                 attrs.push(LemmaAttr::Output(outs));
             }
             else if self.try_kw("left") { attrs.push(LemmaAttr::Left); }
@@ -1956,18 +1946,8 @@ impl<'a> Parser<'a> {
         self.require_kw("let")?;
         let name = self.ident()?;
         let vars = if self.try_punct("(") {
-            let mut vs = Vec::new();
-            if !self.try_punct(")") {
-                loop {
-                    let v = self.var_spec()?;
-                    vs.push(v);
-                    // HS `parens $ commaSep sapicvar` (Sapic.hs:69): trailing comma OK.
-                    if !self.try_punct(",") { break; }
-                    if self.peek_punct(")") { break; }
-                }
-                self.require_punct(")")?;
-            }
-            Some(vs)
+            // HS `parens $ commaSep sapicvar` (Sapic.hs:69): trailing comma OK.
+            Some(self.sep_end_by(")", |p| p.var_spec())?)
         } else { None };
         self.require_punct("=")?;
         let body = self.process()?;
@@ -2077,8 +2057,7 @@ impl<'a> Parser<'a> {
             // is no separator between bindings; `many1` greedily reparses a
             // `definition` and backtracks when one fails to parse. We mirror that
             // by attempting another `(pat = val)` binding and restoring on
-            // failure — this avoids a fixed first-char heuristic that missed
-            // patterns starting with `=` (PatternMatch) or `'` (public name).
+            // failure.
             let mut bindings: Vec<(Term, Term)> = Vec::new();
             // First binding is required.
             {
@@ -2150,19 +2129,9 @@ impl<'a> Parser<'a> {
         if let Some(id) = self.lx.identifier() {
             // Heuristic: if followed by `(`, parse as call args.
             let args = if self.try_punct("(") {
-                let mut ts = Vec::new();
-                if !self.try_punct(")") {
-                    loop {
-                        let t = self.term(false)?;
-                        ts.push(t);
-                        // HS `parens $ commaSep (msetterm ...)` (Sapic.hs:296):
-                        // trailing comma before `)` is permitted.
-                        if !self.try_punct(",") { break; }
-                        if self.peek_punct(")") { break; }
-                    }
-                    self.require_punct(")")?;
-                }
-                ts
+                // HS `parens $ commaSep (msetterm ...)` (Sapic.hs:296):
+                // trailing comma before `)` is permitted.
+                self.sep_end_by(")", |p| p.term(false))?
             } else { vec![] };
             return Ok(Process::Call { name: id, args });
         }
@@ -2219,22 +2188,7 @@ impl<'a> Parser<'a> {
             let (acts, restrs) = if self.try_punct("-->") {
                 (vec![], vec![])
             } else if self.try_punct("--[") {
-                let mut acts = Vec::new();
-                let mut rs = Vec::new();
-                if !self.try_punct("]->") {
-                    loop {
-                        let item = self.fact_or_restr()?;
-                        match item {
-                            FactOrRestr::Fact(f) => acts.push(f),
-                            FactOrRestr::Restr(p) => rs.push(p),
-                        }
-                        // HS `commaSep` action facts (Rule.hs:186): trailing comma OK.
-                        if !self.try_punct(",") { break; }
-                        if self.peek_punct("]->") { break; }
-                    }
-                    self.require_punct("]->")?;
-                }
-                (acts, rs)
+                self.parse_action_restr_list()?
             } else {
                 self.restore(save);
                 return Ok(None);
@@ -2260,17 +2214,8 @@ impl<'a> Parser<'a> {
             return Err(self.err(format!("fact name `{}` must start with uppercase", name)));
         }
         self.require_punct("(")?;
-        let mut args = Vec::new();
-        if !self.try_punct(")") {
-            loop {
-                let t = self.term(false)?;
-                args.push(t);
-                // HS `parens (commaSep pterm)` (Fact.hs:47): trailing comma OK.
-                if !self.try_punct(",") { break; }
-                if self.peek_punct(")") { break; }
-            }
-            self.require_punct(")")?;
-        }
+        // HS `parens (commaSep pterm)` (Fact.hs:47): trailing comma OK.
+        let args = self.sep_end_by(")", |p| p.term(false))?;
         let mut annotations = Vec::new();
         if self.try_punct("[")
             && !self.try_punct("]") {

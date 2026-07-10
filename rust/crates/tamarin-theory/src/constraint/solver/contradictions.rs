@@ -149,6 +149,20 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     // tag-matching) so HS's `contradictions` never sees these systems. See
     // the per-check notes below.
 
+    // The `rawLessRel` adjacency (`build_always_before_adj`) is the SAME
+    // relation used by all four ordering-dependent checks below —
+    // `has_forbidden_exp`, `has_forbidden_chain` (both via
+    // `always_before_with`), and `non_injective_fact_instances` /
+    // `node_after_last` (both via direct `.map()` walks). `contradictions`
+    // holds `sys` immutable for its whole body with no early return, so the
+    // relation is invariant across all four; build it ONCE and thread it
+    // down. Never worse than before: `has_forbidden_chain` (line below,
+    // unconditional) already built it on every call. This is a distinct
+    // relation from the substituted `all_less` used for the cyclic check
+    // above (that one applies the eq-store subst; this one does not), so it
+    // is built separately.
+    let ab_adj = sys.build_always_before_adj();
+
     // 2. SubtermCyclic — `isContradictory subtermStore`.
     if sys.subterm_store.is_false() { out.push(Contradiction::SubtermCyclic); }
     if has_subterm_cycle_contra(_ctxt, sys) { out.push(Contradiction::SubtermCyclic); }
@@ -161,7 +175,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     // 6. ForbiddenExp (Contradictions.hs `hasForbiddenExp`).  Drops Exp-down rule
     //    instances whose g is simple, whose MsgVar args are KU-known earlier,
     //    and whose exponent factors are already in the up-premise.  enableDH.
-    if _ctxt.maude.maude_sig().enable_dh && has_forbidden_exp(sys) {
+    if _ctxt.maude.maude_sig().enable_dh && has_forbidden_exp(sys, &ab_adj) {
         out.push(Contradiction::ForbiddenExp);
     }
     // 7. ForbiddenBP (Contradictions.hs `hasForbiddenBP`).  Drops Pmult-down /
@@ -172,7 +186,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
         out.push(Contradiction::ForbiddenBP);
     }
     // 8. ForbiddenChain.
-    if has_forbidden_chain(sys) { out.push(Contradiction::ForbiddenChain); }
+    if has_forbidden_chain(sys, &ab_adj) { out.push(Contradiction::ForbiddenChain); }
     // 9. IncompatibleEqs — HS-faithful: `eqsIsFalse sEqStore`
     //    (Contradictions.hs `contradictions`). The three preceding probes are RS-only
     //    soundness backstops, NOT a port of the eqsIsFalse check: each fires
@@ -196,9 +210,9 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     if has_false_formula(sys) { out.push(Contradiction::FormulasFalse); }
     // 11. NonInjectiveFactInstance (×n) — BEFORE NodeAfterLast, matching HS's
     //     list concatenation order in `contradictions` (Contradictions.hs).
-    out.extend(non_injective_fact_instances(_ctxt, sys));
+    out.extend(non_injective_fact_instances(_ctxt, sys, ab_adj.map()));
     // 12. NodeAfterLast (×n).
-    out.extend(node_after_last(sys));
+    out.extend(node_after_last(sys, ab_adj.map()));
     out
 }
 
@@ -288,7 +302,7 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
 /// into args; anything else (variables OR reducible-headed apps)
 /// is returned as a candidate.
 ///
-/// Variables MUST be included — for `subst_creates_non_normal_terms`,
+/// Variables MUST be included — for `SubstNfChecker`'s nf check,
 /// a variable `z` becomes a reducible term after the variant subst
 /// (e.g. `{z → verify(s,m,pkA)}`).  Without including vars we miss
 /// the SplitG variant filter and the picked variant pulls the
@@ -670,7 +684,10 @@ fn never_contains_fresh_priv(t: &tamarin_term::lterm::LNTerm) -> bool {
 /// shouldn't be deconstructing it (KD chain) afterwards.  Hits an
 /// otherwise-undetected contradiction earlier than the search
 /// would, pruning a search branch.
-fn has_forbidden_chain(sys: &System) -> bool {
+fn has_forbidden_chain(
+    sys: &System,
+    ab_adj: &crate::constraint::system::PrebuiltAdj,
+) -> bool {
     use crate::constraint::constraints::Goal;
     use crate::fact::FactTag;
     use tamarin_term::lterm::is_msg_var;
@@ -740,11 +757,9 @@ fn has_forbidden_chain(sys: &System) -> bool {
         }
     }
 
-    // The `alwaysBefore` adjacency is invariant across the chain/node/goal
-    // loops below (`sys` is read-only here), so build it once and query it
-    // with `always_before_with` instead of rebuilding the full relation per
-    // `always_before` call.
-    let ab_adj = sys.build_always_before_adj();
+    // The `alwaysBefore` adjacency (`ab_adj`) is built once by the caller
+    // (`contradictions`) and shared across all ordering checks; queried here
+    // via `always_before_with` in the chain/node/goal loops below.
     for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         let Goal::Chain(c, p) = g else { continue };
@@ -811,7 +826,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
                 let t_ku = match fa.terms.first() { Some(t) => t, None => continue };
                 if !candidate_terms.contains(t_ku) { continue; }
                 if id == &c.0 { continue; }
-                if sys.always_before_with(&ab_adj, id, &c.0) {
+                if sys.always_before_with(ab_adj, id, &c.0) {
                     return true;
                 }
             }
@@ -824,7 +839,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
             let t_ku = match fa.terms.first() { Some(t) => t, None => continue };
             if !candidate_terms.contains(t_ku) { continue; }
             if id == &c.0 { continue; }
-            if sys.always_before_with(&ab_adj, id, &c.0) {
+            if sys.always_before_with(ab_adj, id, &c.0) {
                 return true;
             }
         }
@@ -856,10 +871,11 @@ fn has_forbidden_chain(sys: &System) -> bool {
 /// from the original KU premise — at the saturate step for
 /// `KU(exp(t.1,t.2))`, RS produces 16 cases vs HS's 3, because each
 /// of the 4 surviving d_exp chain-extend variants would be dropped
-/// by ForbiddenExp in HS (verified in agent #11 trace: HS_SAS_CONTRA
-/// shows `[ForbiddenExp]` for 3 of 4 d_exp branches with
-/// cn=["...","d_exp"]).
-fn has_forbidden_exp(sys: &System) -> bool {
+/// by ForbiddenExp in HS.
+fn has_forbidden_exp(
+    sys: &System,
+    ab_adj: &crate::constraint::system::PrebuiltAdj,
+) -> bool {
     use crate::fact::FactTag;
     use crate::rule::{IntrRuleACInfo, RuleInfo};
     use tamarin_term::function_symbols::{EXP_SYM_STRING, FunSym};
@@ -931,10 +947,10 @@ fn has_forbidden_exp(sys: &System) -> bool {
         }
     }
 
-    // The `alwaysBefore` adjacency is invariant across the node loop and
-    // the `earlier_msg_vars` scan below (`sys` is read-only), so build it
-    // once and query it with `always_before_with`.
-    let ab_adj = sys.build_always_before_adj();
+    // The `alwaysBefore` adjacency (`ab_adj`) is built once by the caller
+    // (`contradictions`) and shared across all ordering checks; queried here
+    // via `always_before_with` in the node loop and the `earlier_msg_vars`
+    // scan below.
     // Mirror HS `forbiddenDExp` exactly.
     for (i, ru) in sys.nodes.iter() {
         // Only intruder DestrRules can be exp-down; cheap pre-filter.
@@ -962,7 +978,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
             let mut out = Vec::new();
             for (j, t) in &all_ku {
                 if !is_msg_var(t) { continue; }
-                if sys.always_before_with(&ab_adj, j, i) {
+                if sys.always_before_with(ab_adj, j, i) {
                     out.push(t.clone());
                 }
             }
@@ -1307,30 +1323,18 @@ fn bp_over_complicated(scalar: &tamarin_term::lterm::LNTerm,
     ni_factors_subset(scalar, ke) && never_contains_fresh_priv(point)
 }
 
-/// Build the raw less-relation adjacency `rawLessRel se` as a map from each
-/// node to its successors (System.hs:1613-1622):
-/// `rawLessRel = getLessRel sLessAtoms ++ rawEdgeRel` where
-/// `rawEdgeRel = sEdges ++ unsolvedChains`.  Each `LessAtom` gives
-/// `smaller → larger`, each edge gives `src.0 → tgt.0`, and each unsolved
-/// `ChainG c p` gives `c.0 → p.0` (without the chain edges reachability
-/// through an open chain is lost).  Matches `build_always_before_adj`
-/// (system.rs:660-667).  Shared by `non_injective_fact_instances` and
-/// `node_after_last`.
-fn raw_less_adj(sys: &System) -> BTreeMap<NodeId, Vec<NodeId>> {
-    let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-    for l in &sys.less_atoms {
-        adj.entry(l.smaller.clone()).or_default().push(l.larger.clone());
+/// Build the read-only `NodeId → &RuleACInst` index the contradiction
+/// checks use for `.get()` lookups, replacing a per-lookup linear
+/// `sys.nodes.iter().find` (O(edges*nodes)).  `or_insert` keeps the FIRST
+/// rule for a given id, matching `find`'s / `node_rule_safe`'s first-match
+/// semantics; `sys.nodes` is unique-keyed, so the map returns the identical
+/// rule the linear scan found.
+fn node_rule_map(sys: &System) -> tamarin_utils::FastMap<&NodeId, &crate::rule::RuleACInst> {
+    let mut m = tamarin_utils::FastMap::default();
+    for (n, r) in sys.nodes.iter() {
+        m.entry(n).or_insert(r);
     }
-    for e in &sys.edges {
-        adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
-    }
-    for (g, st) in sys.goals.iter() {
-        if st.solved { continue; }
-        if let crate::constraint::constraints::Goal::Chain(c, p) = g {
-            adj.entry(c.0.clone()).or_default().push(p.0.clone());
-        }
-    }
-    adj
+    m
 }
 
 /// Direct port of Haskell's `nonInjectiveFactInstances`
@@ -1347,17 +1351,17 @@ fn raw_less_adj(sys: &System) -> BTreeMap<NodeId, Vec<NodeId>> {
 fn non_injective_fact_instances(
     ctxt: &ProofContext,
     sys: &System,
+    adj: &BTreeMap<NodeId, Vec<NodeId>>,
 ) -> Vec<Contradiction> {
     let mut out = Vec::new();
     let inj_tags: BTreeSet<&crate::fact::FactTag> =
         ctxt.injective_fact_insts.iter().map(|(t, _)| t).collect();
     if inj_tags.is_empty() { return out; }
 
-    // Build reverse adjacency: who can reach whom via the raw less-relation
-    // (less + edges + unsolved chains — see `raw_less_adj`).  We enumerate
-    // reachable sets here rather than reuse always_before, which only
-    // queries a single pair.
-    let adj = raw_less_adj(sys);
+    // `adj` is the raw less-relation (`rawLessRel`: less + edges + unsolved
+    // chains), built once by the caller (`contradictions`) and shared. We
+    // enumerate reachable sets here rather than reuse always_before, which
+    // only queries a single pair.
     // `adj` is invariant across this function, so memoize each node's
     // reachable set: `reachable(i)` is taken once per edge and `reachable(j)`
     // once per reachable `j`, with the same `j` recurring across edges.
@@ -1369,28 +1373,14 @@ fn non_injective_fact_instances(
         if let Some(cached) = reach_cache.borrow().get(from) {
             return cached.clone();
         }
-        let mut out = BTreeSet::new();
-        let mut stack = vec![from.clone()];
-        while let Some(n) = stack.pop() {
-            if !out.insert(n.clone()) { continue; }
-            if let Some(succs) = adj.get(&n) {
-                for s in succs { stack.push(s.clone()); }
-            }
-        }
-        out.remove(from);
+        // Strictly-reachable set (seed removed) via the shared routine.
+        let out = crate::constraint::solver::goals::reachable_set_adj(adj, from, false);
         reach_cache.borrow_mut().insert(from.clone(), out.clone());
         out
     };
     // Resolve node-id → rule via a once-built map instead of a linear
-    // `nodes.iter().find` per `i`/`j`.  `or_insert` keeps the FIRST rule
-    // for a given id, matching `find`'s first-match semantics.
-    let node_rule_map: tamarin_utils::FastMap<&NodeId, &crate::rule::RuleACInst> = {
-        let mut m = tamarin_utils::FastMap::default();
-        for (n, r) in sys.nodes.iter() {
-            m.entry(n).or_insert(r);
-        }
-        m
-    };
+    // `nodes.iter().find` per `i`/`j`.
+    let node_rule_map = node_rule_map(sys);
     let lookup_node = |id: &NodeId| -> Option<&crate::rule::RuleACInst> {
         node_rule_map.get(id).copied()
     };
@@ -1505,7 +1495,7 @@ fn has_sort_conflated_lvars(sys: &System) -> bool {
 /// Has the system's formula list been forced to ⊥?
 fn has_false_formula(sys: &System) -> bool {
     use crate::guarded::Guarded;
-    sys.formulas.iter().any(|f| matches!(f, Guarded::Disj(v) if v.is_empty()))
+    sys.formulas.iter().any(|f| matches!(f.as_ref(), Guarded::Disj(v) if v.is_empty()))
 }
 
 /// `Fr(t)` requires `t` to be a Fresh-sorted variable. Maude's
@@ -1556,13 +1546,8 @@ fn has_fresh_fact_sort_violation(sys: &System) -> bool {
 /// connects incompatible facts.  Such a system has no model.
 fn has_incompatible_edge_facts(sys: &System) -> bool {
     // One node-id → rule map (instead of two linear `nodes.iter().find`
-    // scans per edge → O(edges*nodes)).  `or_insert` keeps the FIRST rule
-    // for a given id, matching `find`'s first-match semantics.
-    let mut node_rule_map: tamarin_utils::FastMap<&NodeId, &crate::rule::RuleACInst> =
-        tamarin_utils::FastMap::default();
-    for (id, r) in sys.nodes.iter() {
-        node_rule_map.entry(id).or_insert(r);
-    }
+    // scans per edge → O(edges*nodes)).
+    let node_rule_map = node_rule_map(sys);
     for e in &sys.edges {
         let src_rule = node_rule_map.get(&e.src.0).copied();
         let tgt_rule = node_rule_map.get(&e.tgt.0).copied();
@@ -1618,12 +1603,6 @@ pub fn cyclic(less: &[LessAtom]) -> bool {
 /// detects a Cyclic contradiction at some cn but RS doesn't, comparing
 /// HS's cycle path against RS's available less_atoms shows EXACTLY
 /// which less_atom is missing in RS.
-///
-/// **Instrumentation that would have caught H14.x earlier**: add a
-/// `TAM_RS_DBG_CYCLE_PATH=1` env-gated trace at every contradiction
-/// check that calls this function (or a HS-side equivalent) and dumps
-/// the cycle path.  Diffing HS's path against RS's less_atom set
-/// identifies the missing edge immediately.
 ///
 /// Returns the cycle as a `Vec<NodeId>` where the first and last
 /// entries are equal (the back-edge node).  Empty if no cycle.
@@ -1681,7 +1660,10 @@ pub fn cyclic_with_path(less: &[LessAtom]) -> Vec<NodeId> {
 /// at a node that has chain successors via edges (but no explicit
 /// `LessAtom`) would survive — losing the contradiction Haskell uses
 /// to prune typing-class source cases at precompute.
-fn node_after_last(sys: &System) -> Vec<Contradiction> {
+fn node_after_last(
+    sys: &System,
+    adj: &BTreeMap<NodeId, Vec<NodeId>>,
+) -> Vec<Contradiction> {
     let last = match &sys.last_atom { Some(l) => l.clone(), None => return Vec::new() };
     // Port of Haskell `Theory.Constraint.Solver.Contradictions.nodesAfterLast`:
     //
@@ -1694,13 +1676,14 @@ fn node_after_last(sys: &System) -> Vec<Contradiction> {
     //                    any ((i ==) . fst) (unsolvedActionAtoms sys)`.
     //
     // Walk the raw less-relation (less_atoms ∪ edges ∪ unsolved chains —
-    // see `raw_less_adj`).  Without edges the typing-case `Last(#vr_inner)`
+    // see `build_always_before_adj`).  Without edges the typing-case `Last(#vr_inner)`
     // branch never contradicts even when `vr_inner` has a chain-edge
     // successor that pins down the ordering.  Filter by `isInTrace`: a
     // successor only counts if it's a rule instance in `sNodes`, the
     // system's last, or carries an unsolved Action goal — otherwise
     // abstract precompute-time node-ids spuriously trip the contradiction.
-    let adj = raw_less_adj(sys);
+    // `adj` is the raw less-relation, built once by the caller
+    // (`contradictions`) and shared.
     // isInTrace: collect every node-id that is "in the trace".
     let mut in_trace: BTreeSet<NodeId> = BTreeSet::new();
     for (id, _) in sys.nodes.iter() {
@@ -1713,15 +1696,8 @@ fn node_after_last(sys: &System) -> Vec<Contradiction> {
             in_trace.insert(id.clone());
         }
     }
-    let mut visited: BTreeSet<NodeId> = BTreeSet::new();
-    let mut stack = vec![last.clone()];
-    while let Some(n) = stack.pop() {
-        if !visited.insert(n.clone()) { continue; }
-        if let Some(s) = adj.get(&n) {
-            for x in s { stack.push(x.clone()); }
-        }
-    }
-    visited.remove(&last);
+    // Strictly-reachable set from `last` (seed removed) via the shared routine.
+    let visited = crate::constraint::solver::goals::reachable_set_adj(adj, &last, false);
     visited.into_iter()
         .filter(|n| in_trace.contains(n))
         .map(|after| Contradiction::NodeAfterLast(last.clone(), after))
@@ -1730,16 +1706,31 @@ fn node_after_last(sys: &System) -> Vec<Contradiction> {
 
 /// `maybeNonNormalTerms`: walk all node facts + new_vars in `sys`,
 /// returning every subterm that could be non-normal under some
-/// substitution.  Used by `subst_creates_non_normal_terms` below.
+/// substitution.  Used by [`SubstNfChecker`] below.
 /// Mirrors Haskell's `Contradictions.maybeNonNormalTerms`
 /// (Contradictions.hs).
 pub fn maybe_non_normal_terms(
     sys: &System,
     irreducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
 ) -> Vec<tamarin_term::lterm::LNTerm> {
+    // Reads ONLY `sys.nodes`; delegate to the slice form so a shared
+    // [`SubstNfChecker`] can pin an O(1) `Arc` snapshot of the nodes and
+    // force the identical walk lazily.
+    maybe_non_normal_terms_nodes(&sys.nodes, irreducible)
+}
+
+/// Nodes-slice form of [`maybe_non_normal_terms`].  The walk reads only
+/// the system's `nodes`, so pinning an `Arc<Vec<(NodeId, RuleACInst)>>`
+/// snapshot and calling this yields exactly the candidate set the eager
+/// whole-`System` walk produces.  The `BTreeSet` dedup is load-bearing
+/// for workload downstream — it must stay.
+pub fn maybe_non_normal_terms_nodes(
+    nodes: &[(NodeId, crate::rule::RuleACInst)],
+    irreducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
+) -> Vec<tamarin_term::lterm::LNTerm> {
     let mut candidates: std::collections::BTreeSet<tamarin_term::lterm::LNTerm>
         = std::collections::BTreeSet::new();
-    for (_, rule) in sys.nodes.iter() {
+    for (_, rule) in nodes.iter() {
         for f in rule.premises.iter().chain(&rule.conclusions).chain(&rule.actions) {
             for t in &f.terms {
                 maybe_not_nf_subterms(irreducible, t, &mut candidates);
@@ -1752,12 +1743,11 @@ pub fn maybe_non_normal_terms(
     candidates.into_iter().collect()
 }
 
-/// `substCreatesNonNormalTerms`: returns `true` if applying
-/// `vfresh_subst` to the system's `maybe-non-normal` terms (already
-/// substituted by `fsubst`) creates a non-normal-form term.  Used by
-/// `simp_minimize` to filter SplitG variants that would violate the
-/// nf-respecting trace semantics.  Mirrors Haskell's
-/// `Contradictions.substCreatesNonNormalTerms` (Contradictions.hs):
+/// Shared-state port of Haskell's `Contradictions.substCreatesNonNormalTerms`
+/// (Contradictions.hs): `true` if applying `vfresh_subst` to the system's
+/// `maybe-non-normal` terms (already substituted by `fsubst`) creates a
+/// non-normal-form term.  Used by `simp_minimize` to filter SplitG variants
+/// that would violate the nf-respecting trace semantics.
 ///
 /// ```haskell
 /// substCreatesNonNormalTerms hnd sys fsubst =
@@ -1769,53 +1759,67 @@ pub fn maybe_non_normal_terms(
 ///                 t'    = apply (freshToFreeAvoidingFast subst tvars) t
 /// ```
 ///
-/// NOTE the HS definition is CURRIED: `substCreatesNonNormalTerms hnd
-/// sys` shares the `maybeNonNormalTerms hnd sys` whole-system walk
-/// across every `fsubst`/`subst` probe (GHC full laziness floats it
-/// out of the `fsubst` lambda), and `terms` — the fsubst-applied list
-/// — is shared across every candidate `subst` that `simpMinimize`
-/// probes within one `simp1` iteration (`isContr (get eqsSubst eqs)`,
-/// EquationStore.hs).  Use [`SubstNfChecker`] to get that sharing; this
-/// free function recomputes everything per call and exists for tests /
-/// one-shot callers.
-pub fn subst_creates_non_normal_terms(
-    maude: &tamarin_term::maude_proc::MaudeHandle,
-    sys: &System,
-    fsubst: &crate::tools::equation_store::LNSubst,
-    vfresh_subst: &crate::tools::equation_store::LNSubstVFresh,
-) -> bool {
-    SubstNfChecker::new(maude, sys).check(fsubst, vfresh_subst)
-}
-
-/// Shared-state port of the curried `substCreatesNonNormalTerms hnd
-/// sys` shape (see the NOTE on [`subst_creates_non_normal_terms`]).
+/// The HS definition is CURRIED: `substCreatesNonNormalTerms hnd sys` shares
+/// the `maybeNonNormalTerms hnd sys` whole-system walk across every
+/// `fsubst`/`subst` probe (GHC full laziness floats it out of the `fsubst`
+/// lambda), and `terms` — the fsubst-applied list — is shared across every
+/// candidate `subst` that `simpMinimize` probes within one `simp1` iteration
+/// (`isContr (get eqsSubst eqs)`, EquationStore.hs).  This type provides that
+/// sharing (production code constructs it directly, e.g. in `reduction.rs`).
 ///
-/// `base` — the `maybeNonNormalTerms hnd sys` walk — is computed once
-/// at construction.  The fsubst application is recomputed only when
+/// `base` — the `maybeNonNormalTerms hnd sys` walk — is pinned as an
+/// O(1) `Arc` node snapshot at construction and forced lazily on the
+/// first `check()` that reaches a probe (mirroring HS's unforced
+/// thunk).  The fsubst application is recomputed only when
 /// the free-subst VALUE changes (at most once per `simp1` iteration:
 /// `simp_with_fresh_avoiding` snapshots `self.subst` per iteration and
-/// probes every candidate against that same snapshot).  The previous
-/// per-call recompute turned post-autoprove eCK-class web proof pages
-/// (TAK1) into a 20+ minute spin that HS serves in under a minute:
-/// `simp_minimize` probes each disj subst, and every probe re-walked
-/// every node of the system.  Pure predicate — no fresh-counter
-/// movement, no output impact.
+/// probes every candidate against that same snapshot).  Without this
+/// sharing, `simp_minimize` probes each disj subst and every probe
+/// re-walks every node of the system — a 20+ minute spin on
+/// post-autoprove eCK-class web proof pages (TAK1) that HS serves in
+/// under a minute.  Pure predicate — no fresh-counter movement, no
+/// output impact.
 pub struct SubstNfChecker {
     maude: tamarin_term::maude_proc::MaudeHandle,
-    base: Vec<tamarin_term::lterm::LNTerm>,
+    /// O(1) `Arc` snapshot of `sys.nodes`, pinned at construction.
+    /// `System.nodes` is `Arc`-COW (mutations go through `Arc::make_mut`
+    /// or wholesale replacement), so this snapshot cannot change under
+    /// the lazy `base` force below: forcing walks exactly the nodes the
+    /// construction-time system held.
+    nodes: std::sync::Arc<Vec<(NodeId, crate::rule::RuleACInst)>>,
+    /// `maybeNonNormalTerms hnd sys` — forced lazily on the first
+    /// `check()` that reaches a candidate probe.  HS keeps this an
+    /// unforced thunk (curried `substCreatesNonNormalTerms hnd sys`, only
+    /// forced when `simpMinimize` actually probes a subst); the common
+    /// empty-conj steady state never probes, so the whole-system walk is
+    /// dead there.  Pure predicate — deferral moves no fresh-counter idx
+    /// and changes no output byte.  `OnceCell` keeps the checker `Send` +
+    /// `!Sync` (matching `applied`'s `RefCell`), so the compiler still
+    /// rejects any cross-thread `&`-sharing under the web rayon fan-out;
+    /// each thread forces its own pinned snapshot independently.
+    base: std::cell::OnceCell<Vec<tamarin_term::lterm::LNTerm>>,
+    /// Per-snapshot cache keyed by the free subst.  Holds, for each
+    /// `base` term, the `fsubst`-applied term `t` together with the pure
+    /// per-term quantities `check()` needs for every probe: `tvars =
+    /// freesList t` and `fresh_start = succ (maxIdx tvars)`.  `terms` is
+    /// fixed between `fsubst` refreshes, so these are computed once here
+    /// instead of once per candidate probe.
     applied: std::cell::RefCell<Option<(
         crate::tools::equation_store::LNSubst,
-        Vec<tamarin_term::lterm::LNTerm>,
+        Vec<(
+            tamarin_term::lterm::LNTerm,
+            Vec<tamarin_term::lterm::LVar>,
+            u64,
+        )>,
     )>>,
 }
 
 impl SubstNfChecker {
     pub fn new(maude: &tamarin_term::maude_proc::MaudeHandle, sys: &System) -> Self {
-        let sig = maude.maude_sig();
-        let irreducible = &sig.irreducible_fun_syms_fast;
         SubstNfChecker {
             maude: maude.clone(),
-            base: maybe_non_normal_terms(sys, irreducible),
+            nodes: sys.nodes.clone(),
+            base: std::cell::OnceCell::new(),
             applied: std::cell::RefCell::new(None),
         }
     }
@@ -1829,7 +1833,19 @@ impl SubstNfChecker {
     ) -> bool {
         use tamarin_term::subst::apply_vterm;
         use tamarin_term::vterm::vars_vterm;
-        if self.base.is_empty() { return false; }
+        // Force the `maybeNonNormalTerms` walk lazily over the pinned node
+        // snapshot (see field docs).  Reads only `self.nodes` plus the
+        // fixed signature's irreducible set, so the forced base equals the
+        // construction-time eager walk.
+        let base = {
+            let nodes = &self.nodes;
+            let maude = &self.maude;
+            self.base.get_or_init(|| {
+                let sig = maude.maude_sig();
+                maybe_non_normal_terms_nodes(nodes, &sig.irreducible_fun_syms_fast)
+            })
+        };
+        if base.is_empty() { return false; }
         let sig = self.maude.maude_sig();
         let mut applied = self.applied.borrow_mut();
         let stale = match applied.as_ref() {
@@ -1837,27 +1853,42 @@ impl SubstNfChecker {
             None => true,
         };
         if stale {
-            let terms: Vec<tamarin_term::lterm::LNTerm> = self.base.iter()
-                .map(|t| apply_vterm(fsubst, t.clone()))
+            // Precompute per snapshot: apply `fsubst`, then the pure
+            // per-term `tvars`/`fresh_start` every probe consumes.
+            let terms: Vec<(
+                tamarin_term::lterm::LNTerm,
+                Vec<tamarin_term::lterm::LVar>,
+                u64,
+            )> = base.iter()
+                .map(|t| {
+                    let t = apply_vterm(fsubst, t.clone());
+                    let tvars: Vec<tamarin_term::lterm::LVar> = vars_vterm(&t);
+                    let fresh_start = tvars.iter().map(|v| v.idx).max().unwrap_or(0)
+                        .saturating_add(1);
+                    (t, tvars, fresh_start)
+                })
                 .collect();
             *applied = Some((fsubst.clone(), terms));
         }
         let terms = &applied.as_ref().unwrap().1;
-        for t in terms {
-            let tvars: Vec<tamarin_term::lterm::LVar> = vars_vterm(t);
+        for (t, tvars, fresh_start) in terms {
             if tvars.is_empty() { continue; }
-            let restricted = vfresh_subst.restrict(&tvars);
-            if restricted.dom().count() == 0 { continue; }
+            // `dom(restrictVFresh tvars subst) == ∅` ⟺ no `tvar` is in the
+            // subst's domain; test that directly (`image_of` = domain map
+            // lookup) and build the restricted map only on overlap.  Same
+            // `continue` condition as `restrict(tvars).dom().count() == 0`,
+            // without the empty-map alloc on the common no-overlap probe.
+            if !tvars.iter().any(|v| vfresh_subst.image_of(v).is_some()) { continue; }
+            let restricted = vfresh_subst.restrict(tvars);
             // HS `freshToFreeAvoidingFast subst tvars` (Substitution.hs:77-81):
             // a PURE uniform-shift rename of the range vars avoiding `tvars`
             // (`rename (map snd l) \`evalFreshAvoiding\` tvars`).  It consumes
             // NO fresh-counter state — the probe subst is local to this
             // predicate.  Drawing real idxs from the shared counter here would
             // advance it on every variant probed, shifting every later
-            // persisted mint above HS.
-            let fresh_start = tvars.iter().map(|v| v.idx).max().unwrap_or(0)
-                .saturating_add(1);
-            let free_subst = restricted.fresh_to_free_uniform_shift(fresh_start);
+            // persisted mint above HS.  `fresh_start` is the per-term
+            // `succ (maxIdx tvars)` precomputed in the snapshot cache.
+            let free_subst = restricted.fresh_to_free_uniform_shift(*fresh_start);
             let t_prime = apply_vterm(&free_subst, t.clone());
             // Fast path: if subst doesn't change the term, it's still NF.
             if &t_prime == t { continue; }

@@ -28,7 +28,7 @@ use tamarin_utils::fresh::PreciseFreshState;
 
 use crate::constraint::constraints::Goal;
 use crate::constraint::system::System;
-use crate::guarded::{subst_guarded, VarSubst};
+use crate::guarded::{subst_guarded_cow, VarSubst};
 
 /// Canonicalise the free `LVar`s of `sys` so that two systems differing
 /// only by variable numbering compare equal.
@@ -36,11 +36,13 @@ use crate::guarded::{subst_guarded, VarSubst};
 /// Mirrors Haskell's `renamePrecise` over the `System` record.
 pub fn rename_precise_system(sys: &mut System) {
     // Rewrites every free LVar through a deterministic alpha-rename;
-    // the resulting max-var-idx is almost always smaller.  Invalidate
-    // BOTH caches — the node rewrite below (`sys.nodes = ...`) alpha-
-    // renames node ids + rule vars, so the node component drops too.
+    // the resulting max-var-idx is almost always smaller.  Invalidate the
+    // full cache unconditionally — non-node fields (edges, goals, formulas,
+    // eq-store, ...) are always rewritten.  The node-component cache is
+    // invalidated ONLY on the real node rewrite in Phase 2 step 1: an
+    // all-identity node rename leaves the nodes byte-identical, so the
+    // node-component max is unchanged and its cache stays valid.
     sys.invalidate_max_var_idx_cache();
-    sys.invalidate_node_max_cache();
     let mut state = RenameState::new();
 
     // ----------------------------------------------------------------------
@@ -77,6 +79,11 @@ pub fn rename_precise_system(sys: &mut System) {
         state.import(id);
         rule.for_each_free(&mut |v| { state.import(v); });
     }
+    // Nodes are the FIRST field walked, so `!state.changed` here means every
+    // node var (ids + rule vars) was bound to its own idx — the node rename
+    // is the identity.  Snapshotted before any later field can flip the flag,
+    // enabling the Phase 2 step-1 identity fast path.
+    let nodes_identity = !state.changed;
     // HS-faithful: `instance HasFrees (S.Set a)` (Term/LTerm.hs:824-827)
     // walks the set via `foldMap (foldFrees f)` — i.e. ascending Ord
     // order.  HS's `_sEdges` / `_sLessAtoms` / `_sSubtermStore` fields
@@ -168,15 +175,15 @@ pub fn rename_precise_system(sys: &mut System) {
     // `cmp_guarded` helper (guarded.rs:67) which mirrors HS's derived
     // `Ord Guarded` (Guarded.hs:121-129).
     let mut formulas_sorted: Vec<&crate::guarded::Guarded>
-        = sys.formulas.iter().collect();
+        = sys.formulas.iter().map(|f| f.as_ref()).collect();
     formulas_sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
     for f in formulas_sorted { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
     let mut solved_formulas_sorted: Vec<&crate::guarded::Guarded>
-        = sys.solved_formulas.iter().collect();
+        = sys.solved_formulas.iter().map(|f| f.as_ref()).collect();
     solved_formulas_sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
     for f in solved_formulas_sorted { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
     let mut lemmas_sorted: Vec<&crate::guarded::Guarded>
-        = sys.lemmas.iter().collect();
+        = sys.lemmas.iter().map(|f| f.as_ref()).collect();
     lemmas_sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
     for f in lemmas_sorted { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
     // HS-faithful: `_sGoals` is `M.Map Goal GoalStatus` (System.hs:393),
@@ -212,7 +219,8 @@ pub fn rename_precise_system(sys: &mut System) {
     let formula_subst: VarSubst = map.iter().map(|(old, new)| {
         let sort = lvar_sort_to_sort_hint(new.sort);
         (
-            (old.name.to_string(), old.idx),
+            // `old.name` is an interned `&'static str` — zero-alloc key.
+            (old.name, old.idx),
             tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
                 name: new.name.to_string(),
                 idx: new.idx,
@@ -236,15 +244,46 @@ pub fn rename_precise_system(sys: &mut System) {
     // diverges from HS for any downstream consumer that walks `sys.nodes`
     // in storage order rather than re-sorting (most do their own sort, but
     // some iterate directly).  Mirror HS by sorting here.
-    let nodes = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.nodes));
-    let mut renamed: Vec<(crate::constraint::constraints::NodeId, crate::rule::RuleACInst)>
-        = nodes.into_iter().map(|(id, rule)| {
-            let new_id = map_var(id);
-            let new_rule = rule.map_free(&mut |v| map_var(v));
-            (new_id, new_rule)
-        }).collect();
-    renamed.sort_by(|a, b| a.0.cmp(&b.0));
-    sys.nodes = std::sync::Arc::new(renamed);
+    //
+    // Identity fast path: when the node rename is the identity
+    // (`nodes_identity`), `map_var` maps every node id + rule var to itself,
+    // so the per-rule `map_free` re-walk is a value no-op.  `map_free` is the
+    // non-monotone (`Arbitrary`) map, which AC-re-sorts on rebuild, but a
+    // stored node term is always `f_app`-normal (every term is built through
+    // `f_app`; the monotone paths preserve normal form), so re-sorting under
+    // an identity var-map reproduces the same normal form.  The only
+    // remaining effect is the ascending-NodeId re-sort; if `sys.nodes` is
+    // already so sorted the whole step is a no-op and the `Arc` stays shared
+    // with the parent (no deep clone, no rebuild), and — since the nodes are
+    // byte-identical — the node-component max cache stays valid.
+    if nodes_identity {
+        // `is_sorted` by NodeId (O(n)); `windows` sidesteps any is_sorted_by
+        // API-version dependency.  A stable `sort_by(NodeId)` over an
+        // already-non-decreasing Vec is a no-op, so the sort may be skipped.
+        let already_sorted = sys.nodes.windows(2).all(|w| w[0].0 <= w[1].0);
+        if !already_sorted {
+            // Identity rename ⇒ the (id, rule) multiset is unchanged; only the
+            // HS `M.fromList` ascending-NodeId storage order needs restoring.
+            // Node-component max is unchanged, so its cache stays valid.
+            let mut nodes = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.nodes));
+            nodes.sort_by(|a, b| a.0.cmp(&b.0));
+            sys.nodes = std::sync::Arc::new(nodes);
+        }
+    } else {
+        // Real rename: node var idxs are remapped (almost always lower), so
+        // the node-component max can drop — invalidate its cache here (the
+        // one site that actually rewrites nodes).
+        sys.invalidate_node_max_cache();
+        let nodes = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.nodes));
+        let mut renamed: Vec<(crate::constraint::constraints::NodeId, crate::rule::RuleACInst)>
+            = nodes.into_iter().map(|(id, rule)| {
+                let new_id = map_var(id);
+                let new_rule = rule.map_free(&mut |v| map_var(v));
+                (new_id, new_rule)
+            }).collect();
+        renamed.sort_by(|a, b| a.0.cmp(&b.0));
+        sys.nodes = std::sync::Arc::new(renamed);
+    }
 
     // 2. Edges.
     for e in sys.edges.iter_mut() {
@@ -308,8 +347,11 @@ pub fn rename_precise_system(sys: &mut System) {
                 (map_var(p.0), p.1),
             ),
             Goal::Disj(d) => {
+                // COW: an identity rename (or one that touches no Disj leaf)
+                // reuses the owned `g` with zero rebuild; `Some` is byte-
+                // identical to the eager `subst_guarded`.
                 let items: Vec<crate::guarded::Guarded> = d.0.into_iter()
-                    .map(|g| subst_guarded(&g, &formula_subst))
+                    .map(|g| subst_guarded_cow(&g, &formula_subst).unwrap_or(g))
                     .collect();
                 Goal::Disj(crate::constraint::constraints::Disj(items))
             }
@@ -341,11 +383,17 @@ pub fn rename_precise_system(sys: &mut System) {
     // collision-deduped.  Mirror by sorting+deduping after the in-place
     // rename: post-rename two formulas that became equal collapse.
     if !formula_subst.is_empty() {
-        let sort_dedup_guarded = |v: &mut Vec<crate::guarded::Guarded>, sub: &VarSubst| {
+        let sort_dedup_guarded = |v: &mut Vec<std::sync::Arc<crate::guarded::Guarded>>, sub: &VarSubst| {
+            // COW: only the formulas whose leaves actually change are rebuilt;
+            // `Some(nf)` is byte-identical to the eager `subst_guarded`, and a
+            // no-effect (identity) rename leaves `*f` untouched.  The
+            // sort+dedup below stays UNCONDITIONAL — HS's `S.fromList` rebuild
+            // runs even under an identity rename, and intervening passes may
+            // have left the Vec unsorted.
             for f in v.iter_mut() {
-                *f = subst_guarded(f, sub);
+                if let Some(nf) = subst_guarded_cow(f, sub) { *f = std::sync::Arc::new(nf); }
             }
-            v.sort_by(crate::guarded::cmp_guarded);
+            v.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
             v.dedup_by(|a, b| crate::guarded::cmp_guarded(a, b)
                 == std::cmp::Ordering::Equal);
         };
@@ -444,17 +492,30 @@ struct RenameState {
     // distinct-key `VarSubst` applied by lookup — so iteration order is
     // never observed.
     map: FastMap<LVar, LVar>,
+    /// Set the first time a var is bound to a DIFFERENT idx than its
+    /// original.  `import` always preserves name+sort, so a fresh binding
+    /// is the identity exactly when its allocated idx equals the original;
+    /// `!changed` after a field's walk means the rename is the identity over
+    /// every var seen so far (used for the nodes-first fast path).
+    changed: bool,
 }
 
 impl RenameState {
     fn new() -> Self {
-        RenameState { fresh: PreciseFreshState::nothing_used(), map: FastMap::default() }
+        RenameState {
+            fresh: PreciseFreshState::nothing_used(),
+            map: FastMap::default(),
+            changed: false,
+        }
     }
     /// `importBinding`: idempotent — first call for `v` allocates a fresh
     /// LVar keyed by `v.name`; later calls return the same binding.
     fn import(&mut self, v: &LVar) {
         if self.map.contains_key(v) { return; }
         let idx = self.fresh.fresh_ident(v.name);
+        // Record whether this first binding remaps the idx (name+sort are
+        // always preserved), so an all-identity prefix leaves `changed` false.
+        if idx != v.idx { self.changed = true; }
         let new_v = LVar { name: v.name, sort: v.sort, idx };
         self.map.insert(v.clone(), new_v);
     }

@@ -873,8 +873,7 @@ pub fn fcat(ds: Vec<Doc>) -> Doc { fill(false, ds) }
 /// `sep`-suffixed), and `text finish`.  Shared by the pair (`<`/`, `/`>`)
 /// and AC-op (`(`/op/`)`) builders across the parser-AST, GTerm and SAPIC
 /// term renderers — they differ only in these three strings and the
-/// per-element `render` fn, so extracting the common Doc shape keeps every
-/// caller byte-identical while removing the copy-paste.
+/// per-element `render` fn, so every caller stays byte-identical.
 pub fn fcat_bracketed<T>(
     lead: &str,
     sep: &str,
@@ -905,6 +904,17 @@ pub fn fun_app_doc<T>(name: &str, args: &[&T], render: impl Fn(&T) -> Doc) -> Do
     let arg_docs: Vec<Doc> = args.iter().map(|a| render(a)).collect();
     let body = fsep(punctuate(Doc::char(','), arg_docs));
     Doc::text(format!("{}(", name)).beside(body).beside(Doc::text(")"))
+}
+
+/// HS `nestShort' lead finish body =
+///   nestShort (length lead + 1) (text lead) (text finish) body
+///   = sep [ text lead $$ nest n body, text finish ]`
+/// where `$$` is HughesPJ `above` and `n = length lead + 1`
+/// (Class.hs:218-223).  Shared by the formula, fact and SAPIC renderers.
+pub fn nest_short_doc(lead: &str, finish: &str, body: Doc) -> Doc {
+    let n = lead.chars().count() as isize + 1;
+    let above = Doc::text(lead).above(body.nest(n));
+    sep(vec![above, Doc::text(finish)])
 }
 
 /// HS `hsep = foldr (\p q -> Beside p True q) empty` then reduce

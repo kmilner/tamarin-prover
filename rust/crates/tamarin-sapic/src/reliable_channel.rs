@@ -12,14 +12,14 @@
 use std::collections::BTreeSet;
 
 use tamarin_parser::ast as p;
-use tamarin_term::lterm::{LNTerm, LVar, NameTag};
+use tamarin_term::lterm::{LVar, NameTag};
 use tamarin_term::vterm::{Lit, VTerm};
 use tamarin_theory::sapic::{
     process_contains, Process, ProcessPosition, SapicAction, SapicLVar, SapicTerm,
 };
 
 use crate::annotation::ProcessAnnotation;
-use crate::base_translation::{to_ln_term, RuleBody};
+use crate::base_translation::{ln_term_vars as freeset, to_ln_term, RuleBody};
 use crate::facts::{StateKind, TransAction, TransFact};
 
 type AProc = Process<ProcessAnnotation<LVar>, SapicLVar>;
@@ -30,11 +30,6 @@ fn pub_name_is(t: &SapicTerm, id: &str) -> bool {
         t,
         VTerm::Lit(Lit::Con(n)) if n.tag == NameTag::Pub && n.id.0 == id
     )
-}
-
-/// `freeset = fromList . frees` over an `LNTerm`.
-fn freeset(t: &LNTerm) -> BTreeSet<LVar> {
-    tamarin_term::vterm::vars_vterm(t).into_iter().collect()
 }
 
 /// `reliableChannelInit anP (initrules, initTx)` (ReliableChannelTranslation.hs:27-35):

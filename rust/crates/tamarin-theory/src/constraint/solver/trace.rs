@@ -170,9 +170,14 @@ pub fn form_flag() -> bool {
     *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_FORM").is_ok())
 }
 
-pub fn trace_form(kind: &str, repr: &str) {
+/// `repr` is a thunk so the (recursive, allocating) `guarded_repr` dump is
+/// built only when `TAM_RS_TRACE_FORM` is set — unset in every
+/// production/gate/bench run.  When the flag is set, the closure runs and
+/// produces the same `[FORMULA_ADD]` line as an eagerly-built string, so
+/// the trace stream is byte-identical.
+pub fn trace_form(kind: &str, repr: impl FnOnce() -> String) {
     if form_flag() {
-        eprintln!("[FORMULA_ADD] path={} kind={} {}", case_path_string(), kind, repr);
+        eprintln!("[FORMULA_ADD] path={} kind={} {}", case_path_string(), kind, repr());
     }
 }
 

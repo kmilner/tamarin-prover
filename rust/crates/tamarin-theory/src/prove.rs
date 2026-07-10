@@ -560,6 +560,101 @@ impl ProverSession {
             source_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
+
+    /// Build the per-lemma `ProofContext` shared verbatim by both session
+    /// entry points (`prove_lemma_in_session_mode` and
+    /// `prove_system_in_session`): clone the template ctx, give it its own
+    /// fresh-counter floored at the shared `setup_counter_before` base (B1
+    /// lemma-level parallelism), then stamp `is_exists_trace` / `heuristic`
+    /// / `lemma_name` / `theory_file` and fold in the `[sources]`-lemma
+    /// typing assumptions.  Returns the ctx plus its source-cache key.
+    fn setup_per_lemma_ctx(
+        &self,
+        lemma: &crate::theory::Lemma,
+        lemma_name: &str,
+        lemma_source_kind: SourceKind,
+    ) -> Result<(ProofContext, Vec<String>), ProveError> {
+        let theory = &self.theory;
+        let mut ctx = self.template_ctx.clone();
+        ctx.maude = ctx.maude.with_fresh_counter_from(0);
+        ctx.maude.ensure_above(self.setup_counter_before.saturating_sub(1));
+        ctx.is_exists_trace = matches!(
+            lemma.trace_quantifier,
+            crate::theory::TraceQuantifier::ExistsTrace,
+        );
+        let session_in_file = &theory.in_file;
+        ctx.heuristic = resolve_heuristic(
+            &self.cli_heuristic, lemma, theory.heuristic.first().map(|s| s.as_str()),
+            &theory.tactic, session_in_file);
+        ctx.lemma_name = lemma_name.to_string();
+        ctx.theory_file = session_in_file.clone();
+        let (typing_assumptions, source_key) =
+            gather_typing_assumptions(theory, lemma_name, lemma_source_kind)?;
+        ctx.typing_assumptions = typing_assumptions;
+        Ok((ctx, source_key))
+    }
+
+    /// Restore the refined source cases for `source_key` from the session
+    /// cache, or saturate them and (when the fresh-counter delta is 0) write
+    /// them back.  Returns whether the cache was hit.  Shared by both session
+    /// entry points; the `TAM_DBG_SAT_COUNTER` diagnostics live here.  The
+    /// caller must have already gated out the `will_emit_bare_sorry` case
+    /// (which forces no source and must skip this entirely).
+    fn restore_or_saturate_sources(
+        &self,
+        ctx: &mut ProofContext,
+        source_key: Vec<String>,
+        cache_disabled: bool,
+    ) -> bool {
+        let mut cache_hit = false;
+        if !cache_disabled {
+            let guard = self.source_cache.lock().unwrap();
+            if let Some(entry) = guard.get(&source_key) {
+                // Restore cached cases onto this clone's lazy sources by goal,
+                // then mark saturation Done so `cases(ctx)` reads them directly
+                // and the expensive `ensure_saturated` pass is skipped.
+                // `ctx` is a fresh `template_ctx.clone()` (deep copy), so its
+                // shared bundle is uniquely owned; `Arc::get_mut` succeeds and
+                // the `src.incomplete = …` write cannot reach a sibling lemma.
+                let shared = std::sync::Arc::get_mut(&mut ctx.shared)
+                    .expect("per-lemma ctx uniquely owns its source bundle before search");
+                for src in &mut shared.full_sources {
+                    if let Some((_, cases, incomplete)) =
+                        entry.sources.iter().find(|(g, _, _)| *g == src.goal)
+                    {
+                        src.cases_set_list(cases.clone());
+                        src.incomplete = *incomplete;
+                    }
+                }
+                ctx.mark_saturated_done();
+                cache_hit = true;
+            }
+        }
+        if !cache_hit {
+            let cnt_before = ctx.maude.fresh_counter_peek();
+            ctx.ensure_saturated();
+            let delta = ctx.maude.fresh_counter_peek().saturating_sub(cnt_before);
+            if tamarin_utils::env_gate!("TAM_DBG_SAT_COUNTER") {
+                eprintln!("[SAT_COUNTER] lemma={} key={:?} delta={} (computed)",
+                    ctx.lemma_name, source_key, delta);
+            }
+            // Only cache results that allocated NO fresh vars — those are the
+            // ones safe to replay byte-identically (counter unperturbed, cases
+            // carry only template-sourced var indices).  Sources lemmas (delta
+            // > 0) keep recomputing.
+            if !cache_disabled && delta == 0 {
+                let snapshot: Vec<_> = ctx.full_sources.iter()
+                    .map(|s| (s.goal.clone(), s.cases_or_empty_list(), s.incomplete))
+                    .collect();
+                self.source_cache.lock().unwrap()
+                    .entry(source_key)
+                    .or_insert(CachedSources { sources: snapshot });
+            }
+        } else if tamarin_utils::env_gate!("TAM_DBG_SAT_COUNTER") {
+            eprintln!("[SAT_COUNTER] lemma={} key={:?} (cache hit)", ctx.lemma_name, source_key);
+        }
+        cache_hit
+    }
 }
 
 /// Prove a single lemma using a pre-built `ProverSession`.  Skips the
@@ -632,66 +727,17 @@ pub fn prove_system_in_session(
 
     // --- Per-lemma ProofContext, mirroring `prove_lemma_in_session_mode`
     // step for step (see the comments there for the HS citations). ------
-    let mut ctx = session.template_ctx.clone();
-    ctx.maude = ctx.maude.with_fresh_counter_from(0);
-    ctx.maude.ensure_above(session.setup_counter_before.saturating_sub(1));
-    ctx.is_exists_trace = matches!(
-        lemma.trace_quantifier,
-        crate::theory::TraceQuantifier::ExistsTrace,
-    );
-    let session_in_file = &theory.in_file;
-    ctx.heuristic = resolve_heuristic(
-        &session.cli_heuristic, lemma, theory.heuristic.first().map(|s| s.as_str()),
-        &theory.tactic, session_in_file);
-    ctx.lemma_name = lemma_name.to_string();
-    ctx.theory_file = session_in_file.clone();
-    // `[sources]` lemmas prove against RAW sources (no typing
-    // assumptions); all others fold in every prior `[sources]` lemma —
-    // identical gate to `prove_lemma_in_session_mode`.
-    let (typing_assumptions, source_key) =
-        gather_typing_assumptions(theory, lemma_name, lemma_source_kind)?;
-    ctx.typing_assumptions = typing_assumptions;
-    // Saturate (or restore from the session's refined-source cache) —
-    // the search below always consults source cases, so this is the
-    // `will_emit_bare_sorry == false` arm of `prove_lemma_in_session_mode`,
+    // `[sources]` lemmas prove against RAW sources (no typing assumptions);
+    // all others fold in every prior `[sources]` lemma — the `source_key`
+    // gate is inside `setup_per_lemma_ctx`.
+    let (mut ctx, source_key) =
+        session.setup_per_lemma_ctx(lemma, lemma_name, lemma_source_kind)?;
+    // Saturate (or restore from the session's refined-source cache) — the
+    // search below always consults source cases, so this is unconditionally
+    // the `will_emit_bare_sorry == false` arm of `prove_lemma_in_session_mode`,
     // including the delta==0 cache-write gate.
     let cache_disabled = tamarin_utils::env_gate!("TAM_RS_NO_SOURCE_CACHE");
-    let mut cache_hit = false;
-    if !cache_disabled {
-        let guard = session.source_cache.lock().unwrap();
-        if let Some(entry) = guard.get(&source_key) {
-            // `ctx` is a fresh `template_ctx.clone()` (deep copy), so its
-            // shared bundle is uniquely owned — `Arc::get_mut` succeeds and
-            // this per-lemma restore cannot touch any sibling lemma's
-            // sources.  `cases_set_list` alone is interior-mutable, but
-            // `src.incomplete = …` needs `&mut`, hence `get_mut` here.
-            let shared = std::sync::Arc::get_mut(&mut ctx.shared)
-                .expect("per-lemma ctx uniquely owns its source bundle before search");
-            for src in &mut shared.full_sources {
-                if let Some((_, cases, incomplete)) =
-                    entry.sources.iter().find(|(g, _, _)| *g == src.goal)
-                {
-                    src.cases_set_list(cases.clone());
-                    src.incomplete = *incomplete;
-                }
-            }
-            ctx.mark_saturated_done();
-            cache_hit = true;
-        }
-    }
-    if !cache_hit {
-        let cnt_before = ctx.maude.fresh_counter_peek();
-        ctx.ensure_saturated();
-        let delta = ctx.maude.fresh_counter_peek().saturating_sub(cnt_before);
-        if !cache_disabled && delta == 0 {
-            let snapshot: Vec<_> = ctx.full_sources.iter()
-                .map(|s| (s.goal.clone(), s.cases_or_empty_list(), s.incomplete))
-                .collect();
-            session.source_cache.lock().unwrap()
-                .entry(source_key)
-                .or_insert(CachedSources { sources: snapshot });
-        }
-    }
+    let _cache_hit = session.restore_or_saturate_sources(&mut ctx, source_key, cache_disabled);
     let force_induction = lemma.attributes.iter().any(|a| matches!(a,
         crate::theory::LemmaAttr::UseInduction | crate::theory::LemmaAttr::Sources));
     if force_induction {
@@ -741,7 +787,7 @@ fn prove_lemma_in_session_mode(
     let lemma_source_kind = lemma_source_kind(lemma);
 
     // `[reuse]` lemmas declared BEFORE this one.  Same gather logic as
-    // the pre-session prove_lemma_with_pool path.
+    // the pre-session prove_lemma_with_pool_file_heuristic path.
     let reuse_lemmas =
         gather_reusable_lemmas(theory, lemma_name, lemma_source_kind)?;
 
@@ -762,35 +808,19 @@ fn prove_lemma_in_session_mode(
         t_phase.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
     let t_ctx: Option<std::time::Instant> =
         if trace { Some(std::time::Instant::now()) } else { None };
-    // Clone the template ProofContext.  The template was built once at
-    // session-construction time with raw (unsaturated) `full_sources`
-    // (each source's `cases_cell = None`).  Cloning copies those
-    // unsaturated cells, so each lemma's `ensure_saturated` populates
-    // ITS OWN clone's cells with refinements driven by ITS OWN
-    // `typing_assumptions` — no cross-lemma contamination.
-    let mut ctx = session.template_ctx.clone();
-    // The template build is counter-neutral, so every lemma starts from the
-    // same `setup_counter_before` base.  B1 (lemma-level parallelism): give
-    // each lemma its OWN fresh-counter Arc (still sharing the template's Maude
-    // subprocess) so concurrently proving lemmas don't race on a shared
-    // counter, then floor it at the shared base.
-    ctx.maude = ctx.maude.with_fresh_counter_from(0);
-    ctx.maude.ensure_above(session.setup_counter_before.saturating_sub(1));
+    // Per-lemma ProofContext: clone the template (built once at session
+    // construction with raw, unsaturated `full_sources` — each source's
+    // `cases_cell = None`), give it its OWN fresh-counter Arc floored at the
+    // shared `setup_counter_before` base (B1 lemma-level parallelism: still
+    // sharing the template's Maude subprocess, but concurrently proving
+    // lemmas must not race on a shared counter), and stamp the per-lemma
+    // fields.  See `setup_per_lemma_ctx`.  Each clone's `ensure_saturated`
+    // populates ITS OWN cells from ITS OWN `typing_assumptions`, so there is
+    // no cross-lemma contamination.
+    let (mut ctx, source_key) =
+        session.setup_per_lemma_ctx(lemma, lemma_name, lemma_source_kind)?;
     if trace { eprintln!("[phase] (session) ProofContext clone dt={:.3}s",
         t_ctx.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
-    ctx.is_exists_trace = matches!(
-        lemma.trace_quantifier,
-        crate::theory::TraceQuantifier::ExistsTrace,
-    );
-    let session_in_file = &theory.in_file;
-    ctx.heuristic = resolve_heuristic(
-        &session.cli_heuristic, lemma, theory.heuristic.first().map(|s| s.as_str()),
-        &theory.tactic, session_in_file);
-    ctx.lemma_name = lemma_name.to_string();
-    ctx.theory_file = session_in_file.clone();
-    let (typing_assumptions, source_key) =
-        gather_typing_assumptions(theory, lemma_name, lemma_source_kind)?;
-    ctx.typing_assumptions = typing_assumptions;
     let t_sat: Option<std::time::Instant> =
         if trace { Some(std::time::Instant::now()) } else { None };
     // HS-faithful laziness: refined sources are a lazy `where`-bound thunk
@@ -819,63 +849,19 @@ fn prove_lemma_in_session_mode(
     // exists for this exact `source_key`.  See [`CachedSources`] for why a
     // hit is byte-identical (only delta==0 results are ever cached).
     let cache_disabled = tamarin_utils::env_gate!("TAM_RS_NO_SOURCE_CACHE");
-    let mut cache_hit = false;
-    if will_emit_bare_sorry {
+    let cache_hit = if will_emit_bare_sorry {
         // Skip the eager saturate + cache entirely — this lemma forces no
         // source case (matches HS's lazy `pcSources`).  Leave the lazy
         // `cases(ctx)` hook in place in case some future path consults a
         // source; for the bare-sorry early return it never fires.
-    } else if !cache_disabled {
-        let guard = session.source_cache.lock().unwrap();
-        if let Some(entry) = guard.get(&source_key) {
-            // Restore cached cases onto this clone's lazy sources by goal,
-            // then mark saturation Done so `cases(ctx)` reads them directly
-            // and the expensive `ensure_saturated` pass is skipped.
-            // `ctx` is a fresh `template_ctx.clone()` (deep copy), so its
-            // shared bundle is uniquely owned; `Arc::get_mut` succeeds and
-            // the `src.incomplete = …` write cannot reach a sibling lemma.
-            let shared = std::sync::Arc::get_mut(&mut ctx.shared)
-                .expect("per-lemma ctx uniquely owns its source bundle before search");
-            for src in &mut shared.full_sources {
-                if let Some((_, cases, incomplete)) =
-                    entry.sources.iter().find(|(g, _, _)| *g == src.goal)
-                {
-                    src.cases_set_list(cases.clone());
-                    src.incomplete = *incomplete;
-                }
-            }
-            ctx.mark_saturated_done();
-            cache_hit = true;
-        }
-    }
-    if will_emit_bare_sorry {
         if tamarin_utils::env_gate!("TAM_DBG_SAT_COUNTER") {
             eprintln!("[SAT_COUNTER] lemma={} key={:?} (bare-sorry, saturation deferred)",
                 lemma_name, source_key);
         }
-    } else if !cache_hit {
-        let cnt_before = ctx.maude.fresh_counter_peek();
-        ctx.ensure_saturated();
-        let delta = ctx.maude.fresh_counter_peek().saturating_sub(cnt_before);
-        if tamarin_utils::env_gate!("TAM_DBG_SAT_COUNTER") {
-            eprintln!("[SAT_COUNTER] lemma={} key={:?} delta={} (computed)",
-                lemma_name, source_key, delta);
-        }
-        // Only cache results that allocated NO fresh vars — those are the
-        // ones safe to replay byte-identically (counter unperturbed, cases
-        // carry only template-sourced var indices).  Sources lemmas (delta
-        // > 0) keep recomputing.
-        if !cache_disabled && delta == 0 {
-            let snapshot: Vec<_> = ctx.full_sources.iter()
-                .map(|s| (s.goal.clone(), s.cases_or_empty_list(), s.incomplete))
-                .collect();
-            session.source_cache.lock().unwrap()
-                .entry(source_key)
-                .or_insert(CachedSources { sources: snapshot });
-        }
-    } else if tamarin_utils::env_gate!("TAM_DBG_SAT_COUNTER") {
-        eprintln!("[SAT_COUNTER] lemma={} key={:?} (cache hit)", lemma_name, source_key);
-    }
+        false
+    } else {
+        session.restore_or_saturate_sources(&mut ctx, source_key, cache_disabled)
+    };
     if trace { eprintln!("[phase] (session) ensure_saturated dt={:.3}s hit={}",
         t_sat.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64()), cache_hit); }
     if tamarin_utils::env_gate!("TAM_RS_DBG_PHASE") {
@@ -886,7 +872,7 @@ fn prove_lemma_in_session_mode(
     if force_induction {
         ctx.use_induction = crate::constraint::solver::context::UseInduction::UseInduction;
     }
-    // Skeleton replay: same logic as in `prove_lemma_with_pool`.
+    // Skeleton replay: same logic as in `prove_lemma_with_pool_file_heuristic`.
     if let Some(tree) = lemma.proof.tree.clone() {
         if auto_prove {
             return Ok(crate::replay::replace_sorry_prove(&ctx, sys, &tree, max_steps));
@@ -925,44 +911,16 @@ pub fn prove_lemma(
     maude: tamarin_term::maude_proc::MaudeHandle,
     max_steps: usize,
 ) -> Result<ProofNode, ProveError> {
-    prove_lemma_with_pool(parser_theory, lemma_name, maude, None, max_steps)
-}
-
-/// Variant of [`prove_lemma`] that also accepts a `MaudePool` to be
-/// installed on the `ProofContext` for use at rayon parallel sites
-/// (saturate refinement).  Sequential code paths still use the
-/// single `maude` handle; the pool is consulted ONLY inside
-/// `par_iter` closures (see `sources.rs::saturate_sources_with_simp_opt`).
-///
-/// `None` for `pool` is equivalent to calling `prove_lemma` — workers
-/// share `maude`, same as before the pool feature landed.
-pub fn prove_lemma_with_pool(
-    parser_theory: &p::Theory,
-    lemma_name: &str,
-    maude: tamarin_term::maude_proc::MaudeHandle,
-    pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
-    max_steps: usize,
-) -> Result<ProofNode, ProveError> {
-    prove_lemma_with_pool_and_file(parser_theory, lemma_name, maude, pool, max_steps, "")
-}
-
-/// Like [`prove_lemma_with_pool`] but also provides the source file path
-/// for oracle path resolution (HS `oraclePath oracle = takeDirectory inFile
-/// </> normalise relPath`, System.hs:574-575, Parser.hs:304).
-pub fn prove_lemma_with_pool_and_file(
-    parser_theory: &p::Theory,
-    lemma_name: &str,
-    maude: tamarin_term::maude_proc::MaudeHandle,
-    pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
-    max_steps: usize,
-    in_file: &str,
-) -> Result<ProofNode, ProveError> {
     prove_lemma_with_pool_file_heuristic(
-        parser_theory, lemma_name, maude, pool, max_steps, in_file,
+        parser_theory, lemma_name, maude, None, max_steps, "",
         &CliHeuristic::default())
 }
 
-/// Like [`prove_lemma_with_pool_and_file`] but also carries the CLI
+/// Like [`prove_lemma`] but accepts a `MaudePool` (consulted ONLY inside
+/// `par_iter` closures — see `sources.rs::saturate_sources_with_simp_opt`),
+/// the source file path (oracle path resolution, HS `oraclePath oracle =
+/// takeDirectory inFile </> normalise relPath`, System.hs:574-575,
+/// Parser.hs:304), and the CLI
 /// `--heuristic`/`--oraclename`/`--oracle-only` (HS `AutoProver`).  This is
 /// the per-lemma (non-session) fallback path; when `cli_heuristic.raw` is
 /// `Some` it OVERRIDES the per-lemma / theory heuristic (HS `selectHeuristic`,

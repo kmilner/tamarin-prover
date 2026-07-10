@@ -125,9 +125,9 @@ pub(crate) fn impure_dbg_enabled() -> bool {
 // preserved exactly (`.is_ok()` opt-in, `.is_err()` opt-out, and the
 // `== "substantive"` value match).
 /// Declarative accessor for a process-constant opt-IN env flag, cached
-/// behind a `OnceLock<bool>` (see the note above).  Expands to exactly the
-/// hand-written `.is_ok()` accessor body, so each flag returns the same
-/// bool as before; deliberately the cached shape (not `env_gate!`).
+/// behind a `OnceLock<bool>` (see the note above).  Expands to the same
+/// `.is_ok()` accessor body used by hand; the cached shape is deliberate
+/// (not `env_gate!`).
 macro_rules! cached_env_flag {
     ($(#[$m:meta])* $name:ident, $var:literal) => {
         $(#[$m])*
@@ -233,6 +233,15 @@ pub type LNSubst = Subst<Name, LVar>;
 /// Convenient alias for the fresh-range substitutions stored in
 /// disjunctions.
 pub type LNSubstVFresh = SubstVFresh<Name, LVar>;
+
+/// The domain/range pairs of `s` with the mapping for `v` dropped,
+/// in `to_list` order. Shared head of the `simp_abstract_*` /
+/// `simp_identify` passes, which each rebuild a disjunct's substs
+/// after removing the abstracted domain key and appending their own
+/// pass-specific mappings.
+fn without_key(s: &LNSubstVFresh, v: &LVar) -> Vec<(LVar, LNTerm)> {
+    s.to_list().into_iter().filter(|(x, _)| x != v).collect()
+}
 
 /// One entry in the disjunctive part of the store: a `SplitId`
 /// alongside the set of substitutions making up that disjunction.
@@ -1089,9 +1098,7 @@ impl EquationStore {
         let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs
             .iter()
             .map(|s| {
-                let kept: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
-                    .filter(|(x, _)| x != &v)
-                    .collect();
+                let kept = without_key(s, &v);
                 LNSubstVFresh::from_list(kept)
             })
             .collect();
@@ -1217,9 +1224,7 @@ impl EquationStore {
         let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs
             .iter()
             .map(|s| {
-                let kept: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
-                    .filter(|(x, _)| x != &keep)
-                    .collect();
+                let kept = without_key(s, &keep);
                 LNSubstVFresh::from_list(kept)
             })
             .collect();
@@ -1326,9 +1331,7 @@ impl EquationStore {
         let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs.iter()
             .zip(lvs.iter())
             .map(|(s, lv)| {
-                let mut kept: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
-                    .filter(|(x, _)| x != &v)
-                    .collect();
+                let mut kept = without_key(s, &v);
                 kept.push((fv.clone(), Term::Lit(Lit::Var(lv.clone()))));
                 LNSubstVFresh::from_list(kept)
             })
@@ -1452,9 +1455,7 @@ impl EquationStore {
             let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs.iter()
                 .zip(argss.iter())
                 .map(|(s, args)| {
-                    let mut kept: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
-                        .filter(|(x, _)| x != &v)
-                        .collect();
+                    let mut kept = without_key(s, &v);
                     for (fv, a) in fvars.iter().zip(args.iter()) {
                         kept.push((fv.clone(), a.clone()));
                     }
@@ -1489,9 +1490,7 @@ impl EquationStore {
             let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs.iter()
                 .zip(argss.iter())
                 .map(|(s, args)| {
-                    let mut kept: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
-                        .filter(|(x, _)| x != &v)
-                        .collect();
+                    let mut kept = without_key(s, &v);
                     // HS-faithful `abstractTwo`/`newMappings` (EquationStore.hs:
                     // 436-444): `newMappings []` ERRORS ("AC symbols must have
                     // arity >= 2"); silently bailing here would leave a
@@ -1818,8 +1817,8 @@ impl EquationStore {
         // apply_factor_or_compose does: compose new_subst into self.subst +
         // re-unify all remaining conj disjs when a Maude handle is present.
         // On Err (e.g. dom/range overlap), or on the no-handle test-only
-        // path, fall back to direct compose (no re-unify) to preserve old
-        // behaviour for malformed factors.
+        // path, fall back to direct compose (no re-unify) for malformed
+        // factors.
         self.apply_factor_or_compose(&new_subst, maude);
         true
     }
@@ -1895,7 +1894,7 @@ impl EquationStore {
         let range_vars: BTreeSet<LVar> = asubst.range()
             .flat_map(tamarin_term::vterm::vars_vterm)
             .collect();
-        if dom.intersection(&range_vars).count() > 0 {
+        if dom.intersection(&range_vars).next().is_some() {
             return Err(AddEqsError::Maude(
                 "applyEqStore: dom and vrange not disjoint".into()));
         }
@@ -2173,10 +2172,24 @@ impl EquationStore {
                 }
                 // For each unifier, build the new vfresh subst.  Restrict
                 // its domain to `varsRange(new_subst) ∪ dom(s)` so we
-                // don't leak Maude witnesses.
-                let restrict_set: BTreeSet<LVar> = new_subst.range()
-                    .flat_map(tamarin_term::vterm::vars_vterm)
-                    .chain(bindings.iter().map(|(v, _)| v.clone()))
+                // don't leak Maude witnesses.  `varsRange(new_subst)` is
+                // already materialized once per call as
+                // `new_subst_range_vars`; `dom(s)` (this variant's original
+                // domain keys) is loop-invariant across the unifier loop,
+                // so hoist it here as `orig_dom`.  The restrict predicate at
+                // the filter below is then the two-set membership
+                // `new_subst_range_vars ∪ orig_dom` — identical to
+                // `restrict_set.contains`, with no per-subst set build.
+                //
+                // `orig_dom` also serves the system-var lift inside the
+                // unifier loop: when restrict drops a (witness, system_var)
+                // entry due to LARGER-idx orient, the system_var ends up
+                // orphaned in OTHER entries' range values.  Without lifting
+                // it, the next aes call's uniform RHS shift treats it as a
+                // witness and renames it, breaking the binding to the
+                // rule's premise (Client_auth Ltk vs In ltkS desync).
+                let orig_dom: BTreeSet<LVar> = bindings.iter()
+                    .map(|(k, _)| k.clone())
                     .collect();
                 for raw in unifiers {
                     // TAM_DBG_RAW_UNIFIER=1: dump Maude's raw output.
@@ -2235,18 +2248,10 @@ impl EquationStore {
                     let current_dom: BTreeSet<LVar> = raw.iter()
                         .map(|(k, _)| k.clone())
                         .collect();
-                    // Also collect this variant's ORIGINAL bindings.keys
-                    // — these are the variant's system vars from its
-                    // domain.  When restrict drops a (witness, system_var)
-                    // entry due to LARGER-idx orient, the system_var ends
-                    // up orphaned in OTHER entries' range values.  Without
-                    // lifting it, the next aes call's uniform RHS shift
-                    // treats it as a witness and renames it, breaking the
-                    // binding to the rule's premise (Client_auth Ltk vs In
-                    // ltkS desync).
-                    let orig_dom: BTreeSet<LVar> = bindings.iter()
-                        .map(|(k, _)| k.clone())
-                        .collect();
+                    // `orig_dom` (this variant's ORIGINAL bindings.keys —
+                    // the variant's system vars from its domain) is hoisted
+                    // above the unifier loop; it participates in the
+                    // system-var detection below.
                     // Find system vars in any range value that aren't
                     // in the current domain.  These are the ones to
                     // lift.
@@ -2319,7 +2324,8 @@ impl EquationStore {
                     // them at conj=1 [1:1], so the cases survive
                     // perform_split as bonus split_case_N branches.
                     let pairs: Vec<(LVar, LNTerm)> = lifted.into_iter()
-                        .filter(|(v, _)| restrict_set.contains(v))
+                        .filter(|(v, _)| new_subst_range_vars.contains(v)
+                            || orig_dom.contains(v))
                         .collect();
                     let out_subst = LNSubstVFresh::from_list(pairs);
                     if dbg_in.is_some() {

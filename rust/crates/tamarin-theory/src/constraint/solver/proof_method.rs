@@ -60,7 +60,7 @@ pub enum ProofMethod {
 /// `isFinished`: returns the appropriate `Result` if the system is in
 /// a terminal state — solved, contradictory, or unfinishable.
 pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
-    if is_initial_system(sys) { return None; }
+    if sys.is_initial() { return None; }
     let cs = contradictions(ctx, sys);
     if let Some(c) = cs.into_iter().next() {
         // Mirror Haskell `contradictorySystem`: any contradiction
@@ -91,15 +91,6 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     }
     else if no_open_goals && !sub_finished { Some(Result::Unfinishable) }
     else { None }
-}
-
-/// Direct port of Haskell `isInitialSystem`:
-///   isInitialSystem sys = null (get sSolvedFormulas sys) && not (member bot (get sFormulas sys))
-/// (`System.hs:828`).  Just two conditions: no solved formulas yet,
-/// and no gfalse in the formula set.
-fn is_initial_system(sys: &System) -> bool {
-    let bot = crate::guarded::gfalse();
-    sys.solved_formulas.is_empty() && !sys.formulas.contains(&bot)
 }
 
 /// Direct port of Haskell `finishedSubterms`
@@ -223,6 +214,34 @@ fn distinguish_case_names(cases: Vec<(String, System)>) -> Vec<(String, System)>
     out
 }
 
+/// HS-faithful `removeRedundantCases ctxt [] <get_sys>` wrapper: captures the
+/// `maude_sig()`/`enable_bp`/`enable_mset`/empty-`stable_vars` boilerplate the
+/// three arms of [`exec_proof_method`] share.  HS passes `[]` for stable_vars
+/// and gates the whole dedup on BP/MSet inside `remove_redundant_cases`.
+fn remove_redundant_cases_ctx<T>(
+    ctx: &ProofContext,
+    get_sys: impl Fn(&T) -> &System,
+    cases: Vec<T>,
+) -> Vec<T> {
+    let msig = ctx.maude.maude_sig();
+    let empty_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar>
+        = std::collections::BTreeSet::new();
+    crate::constraint::solver::sources::remove_redundant_cases(
+        msig.enable_bp,
+        msig.enable_mset,
+        &empty_stable,
+        get_sys,
+        cases,
+    )
+}
+
+/// HS `process` tail shared by the `SolveGoal` and `Induction` arms:
+/// BP/MSet-gated structural dedup (`removeRedundantCases ctxt [] snd`)
+/// followed by `uniqueListBy (comparing fst) id distinguish` naming.
+fn process_cases(ctx: &ProofContext, cases: Vec<(String, System)>) -> Vec<(String, System)> {
+    distinguish_case_names(remove_redundant_cases_ctx(ctx, |p: &(String, System)| &p.1, cases))
+}
+
 pub fn exec_proof_method(
     ctx: &ProofContext,
     method: &ProofMethod,
@@ -334,7 +353,20 @@ pub fn exec_proof_method(
             // reasons surface as explicit Finished(Contradictory) leaves.)
             let cleaned: Vec<System> = case_systems.into_iter()
                 .filter(|s| !s.eq_store.is_false())
-                .map(|s| cleanup(&s))
+                .map(|mut s| {
+                    // HS-faithful `cleanup` (ProofMethod.hs) applied in
+                    // place: `case_systems` is owned here (from
+                    // `simplify_system_with_fanout`'s into_iter), so we
+                    // rename and clear the subst on the owned System
+                    // directly.  Value-identical to `cleanup(&s)`; that
+                    // closure only clones because its callers hand it a
+                    // `&System` (the borrowed `cleanup(sys)` site below).
+                    crate::constraint::solver::rename_precise::rename_precise_system(
+                        &mut s);
+                    s.eq_store_mut().subst =
+                        tamarin_term::subst::Subst::from_list(Vec::new());
+                    s
+                })
                 .collect();
             // HS-faithful `removeRedundantCases ctxt [] snd`
             // (ProofMethod.hs `process`): applies it to EVERY proof
@@ -352,18 +384,8 @@ pub fn exec_proof_method(
             // empty stable_vars (HS passes `[]`).  Runs BEFORE the
             // single-case `sys' /= cleanup sys` check, matching HS's order
             // (the check inspects the post-dedup `M.toList cases`).
-            let cleaned: Vec<System> = {
-                let msig = ctx.maude.maude_sig();
-                let empty_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar>
-                    = std::collections::BTreeSet::new();
-                crate::constraint::solver::sources::remove_redundant_cases(
-                    msig.enable_bp,
-                    msig.enable_mset,
-                    &empty_stable,
-                    |s: &System| s,
-                    cleaned,
-                )
-            };
+            let cleaned: Vec<System> =
+                remove_redundant_cases_ctx(ctx, |s: &System| s, cleaned);
             if cleaned.is_empty() { return None; }
             let cleaned_input = cleanup(sys);
             if cleaned.len() == 1 {
@@ -489,17 +511,15 @@ pub fn exec_proof_method(
             // (`_case_1`/`_case_2`/...).  A `Linear`/`LinearNamed` outcome is
             // therefore NOT special: it is simply a single-element case list
             // whose post-`simplify` fan-out must run through the very same
-            // dedup+distinguish pipeline as `Cases`.  Treating it specially
-            // (pushing each fanned-out system with a bare, un-`distinguish`ed
-            // name) dropped the `_case_N` suffixes whenever a lone source-case
-            // fanned out at simplify time — e.g. Yubikey's
-            // `eventInitStuff...` premise, whose `Smaller` restriction
-            // `∃z. tc = z++otc` splits the ground counter
-            // `('one'++'one'++'zero')` into multiple AC subset arms.  RS then
-            // exposed 4 identically-named siblings and the exists-trace DFS
-            // committed to the first (`otc=('one'++'zero')`, 14 steps) instead
-            // of HS's `_case_2` (`otc='zero'`, 10 steps).  Normalise all three
-            // outcomes to a `Vec<(name, System)>` and share the pipeline.
+            // dedup+distinguish pipeline as `Cases`.  Normalise all three
+            // outcomes to a `Vec<(name, System)>` and share the
+            // dedup+distinguish pipeline.  Pushing each fanned-out system
+            // with a bare, un-`distinguish`ed name would drop the `_case_N`
+            // suffixes when a lone source-case fans out at simplify time —
+            // e.g. Yubikey's `eventInitStuff...` premise, where 4
+            // identically-named siblings would let the exists-trace DFS
+            // commit to `otc=('one'++'zero')` (14 steps) instead of HS's
+            // `_case_2` (`otc='zero'`, 10 steps).
             let cases: Vec<(String, System, u64)> = match outcome {
                 GoalCases::Linear => vec![("".to_string(), r.sys, adopted_counter)],
                 GoalCases::LinearNamed(name) => vec![(name, r.sys, adopted_counter)],
@@ -555,21 +575,9 @@ pub fn exec_proof_method(
                     // so each distinct variant arrives as its own
                     // RuleACInst case here.  Empty stable_vars (HS passes
                     // `[]`); the helper is a no-op outside BP/MSet.
-                    let kept: Vec<(String, System)> = {
-                        let msig = ctx.maude.maude_sig();
-                        let empty_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar>
-                            = std::collections::BTreeSet::new();
-                        crate::constraint::solver::sources::remove_redundant_cases(
-                            msig.enable_bp,
-                            msig.enable_mset,
-                            &empty_stable,
-                            |c| &c.1,
-                            kept_raw,
-                        )
-                    };
                     // HS `uniqueListBy ... distinguish` — rename duplicate
                     // case names to `name_case_N`.
-                    Some(distinguish_case_names(kept))
+                    Some(process_cases(ctx, kept_raw))
             }
         }
         ProofMethod::Induction => {
@@ -609,12 +617,11 @@ pub fn exec_proof_method(
             // unique-action goals (e.g. eCK lemmas whose formula carries
             // several `Accept(...)` atoms, TAK1_eCK_like) makes
             // `solveUniqueActions` fan out over the AC unifiers of each
-            // action.  The former in-place `simplify_system` here DISCARDED
+            // action.  An in-place `simplify_system` here would discard
             // that `Cases` outcome without marking the goal solved, so the
-            // simplify fixpoint re-solved the same action forever — the
-            // TAK1 web proof-page ≥20-min spin (write_applicable_methods
-            // execs Induction; the batch search never does, since Simplify
-            // succeeds first and the lemma doesn't use induction).
+            // simplify fixpoint would re-solve the same action forever (the
+            // TAK1 web proof-page spin, since `write_applicable_methods`
+            // execs Induction while the batch search does not).
             // Route through `simplify_system_with_fanout` exactly like the
             // `Simplify` and `SolveGoal` arms.
             let cleanup = |s: &mut System| {
@@ -636,7 +643,7 @@ pub fn exec_proof_method(
                 let mut case_sys = sys.clone();
                 case_sys.invalidate_max_var_idx_cache();
                 case_sys.formulas.clear();
-                case_sys.formulas.push(fm_case);
+                case_sys.formulas.push(std::sync::Arc::new(fm_case));
                 let sub_systems: Vec<System> =
                     crate::constraint::solver::simplify::simplify_system_with_fanout(
                         ctx, case_sys);
@@ -653,26 +660,14 @@ pub fn exec_proof_method(
                     named.push((name.to_string(), s));
                 }
             }
-            // HS `removeRedundantCases ctxt [] snd` (in `process`) —
-            // BP/MSet-gated structural dedup, before naming.
-            let named: Vec<(String, System)> = {
-                let msig = ctx.maude.maude_sig();
-                let empty_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar>
-                    = std::collections::BTreeSet::new();
-                crate::constraint::solver::sources::remove_redundant_cases(
-                    msig.enable_bp,
-                    msig.enable_mset,
-                    &empty_stable,
-                    |p: &(String, System)| &p.1,
-                    named,
-                )
-            };
-            // HS `uniqueListBy (comparing fst) id distinguish`
+            // HS `process` tail: `removeRedundantCases ctxt [] snd`
+            // (BP/MSet-gated structural dedup, before naming) followed by
+            // `uniqueListBy (comparing fst) id distinguish`
             // (ProofMethod.hs:465, 527-532): singleton names stay bare;
             // duplicate groups get `<name>_case_<i>`.  (The empty-name
             // branch of `distinguish` is unreachable here — both
             // induction case names are non-empty.)
-            Some(distinguish_case_names(named))
+            Some(process_cases(ctx, named))
         }
     }
 }
@@ -763,7 +758,7 @@ mod tests {
         // solved formula (Haskell `isInitialSystem` checks
         // `solved_formulas.is_empty() && no_gfalse`; setting one to
         // gtrue makes the system non-initial).
-        s.solved_formulas.push(crate::guarded::gtrue());
+        s.solved_formulas.push(std::sync::Arc::new(crate::guarded::gtrue()));
         // Add a placeholder node too so the structure is non-trivial.
         let nid = tamarin_term::lterm::LVar::new("i", tamarin_term::lterm::LSort::Node, 0);
         use crate::rule::{
@@ -799,7 +794,7 @@ mod tests {
         let mut s = System::empty();
         // gfalse in formulas makes the system non-initial AND yields a
         // `FormulasFalse` contradiction.
-        s.formulas.push(crate::guarded::gfalse());
+        s.formulas.push(std::sync::Arc::new(crate::guarded::gfalse()));
         match is_finished(&ctx, &s) {
             Some(Result::Contradictory(Some(Contradiction::FormulasFalse))) => {}
             r => panic!("expected Contradictory(FormulasFalse), got {:?}", r),
@@ -855,7 +850,7 @@ mod tests {
             body,
         );
         let mut s = System::empty();
-        s.formulas.push(fm);
+        s.formulas.push(std::sync::Arc::new(fm));
         let r = exec_proof_method(&ctx, &ProofMethod::Induction, &s).expect("induction");
         // Two case names: empty_trace and non_empty_trace.
         assert_eq!(r.len(), 2);

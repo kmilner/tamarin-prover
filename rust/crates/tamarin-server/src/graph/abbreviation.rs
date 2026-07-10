@@ -553,18 +553,18 @@ pub fn compute_abbreviations(
             );
         }
         // Decrement subterm counts in legend_occs for every other term.
-        let mut new_term_occs: BTreeMap<LNTerm, (i64, Vec<i64>)> = BTreeMap::new();
-        for (term, (occs, legend_occs)) in term_occs {
-            if term == candidate { continue; }
+        // Drop the chosen candidate, then push one sub-count onto each
+        // surviving entry in place — `iter_mut` visits keys in the same
+        // ascending BTreeMap order the rebuild did, so the state the next
+        // best-candidate scan sees is byte-identical.
+        term_occs.remove(&candidate);
+        for (term, (_occs, legend_occs)) in term_occs.iter_mut() {
             // Haskell: `countProperSubterms term candidate` — occurrences of
             // `term` (needle) inside `candidate` (haystack).  Shared generic
             // helper (term.rs, Raw.hs port); usize→i64 is exact here.
-            let sub_count = tamarin_term::term::count_proper_subterms(&term, &candidate) as i64;
-            let mut new_legend_occs = legend_occs;
-            new_legend_occs.push(sub_count);
-            new_term_occs.insert(term, (occs, new_legend_occs));
+            let sub_count = tamarin_term::term::count_proper_subterms(term, &candidate) as i64;
+            legend_occs.push(sub_count);
         }
-        term_occs = new_term_occs;
         abbrevs.insert(candidate, abbrev_name);
     }
     // Step 2: make abbreviations recursive --

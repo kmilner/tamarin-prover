@@ -2,7 +2,7 @@
 //!
 //! Intentionally retained: faithful HS port. Currently has no live caller —
 //! the two subscript call sites in `tamarin-theory` use their own digit-only
-//! helpers (`pretty_system::subscript`, `pretty_theory::goal_subscript`), which
+//! helpers (`pretty_theory::goal_subscript` at both call sites), which
 //! cannot reuse this directly because those only ever receive digits whereas
 //! `subscript_char` also maps `+ - = ( )`.
 

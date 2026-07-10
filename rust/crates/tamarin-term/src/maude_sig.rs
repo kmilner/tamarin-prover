@@ -55,6 +55,15 @@ pub struct MaudeSig {
 
 
 impl MaudeSig {
+    /// True when the signature declares NO associative-commutative operators
+    /// (DH / BP / multiset / nat / XOR).  The local Robinson unifier and the
+    /// `reduce` identity fast-path are complete only for such signatures; this
+    /// is the single source of truth for that "no AC theory" predicate.
+    pub fn has_no_ac_operators(&self) -> bool {
+        !self.enable_dh && !self.enable_bp && !self.enable_mset
+            && !self.enable_nat && !self.enable_xor
+    }
+
     /// Refresh the cached `fun_syms` / `irreducible_fun_syms` /
     /// `reducible_fun_syms` from the source-of-truth flags.
     pub fn refresh(mut self) -> Self {

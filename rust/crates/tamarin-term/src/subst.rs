@@ -10,6 +10,8 @@
 
 use std::collections::BTreeMap;
 
+use tamarin_utils::cow::cow_map_vec;
+
 use crate::function_symbols::FunSym;
 use crate::term::{f_app_ac, f_app_c, f_app_list, f_app_no_eq, lit, Term};
 use crate::vterm::{Lit, VTerm};
@@ -197,16 +199,10 @@ fn apply_vterm_map_changed<C: Ord + Clone, V: Ord + Clone>(
     match t {
         Term::Lit(l) => apply_lit_map_changed(map, l),
         Term::App(fsym, args) => {
-            // Allocate the rebuilt argument vector lazily: only once the first
-            // child changes.  Until then every child is left shared.
-            let mut new_args: Option<Vec<VTerm<C, V>>> = None;
-            for (i, a) in args.iter().enumerate() {
-                if let Some(changed) = apply_vterm_map_changed(map, a) {
-                    new_args
-                        .get_or_insert_with(|| args.to_vec())[i] = changed;
-                }
-            }
-            new_args.map(|mapped| match fsym {
+            // COW-rebuild the argument vector: the shared `cow_map_vec` helper
+            // clones only the unchanged prefix on the first change and returns
+            // `None` when every child is left structurally unchanged.
+            cow_map_vec(&args[..], |a| apply_vterm_map_changed(map, a)).map(|mapped| match fsym {
                 FunSym::Ac(o) => f_app_ac(*o, mapped),
                 FunSym::C(o) => f_app_c(*o, mapped),
                 FunSym::NoEq(o) => f_app_no_eq(o.clone(), mapped),

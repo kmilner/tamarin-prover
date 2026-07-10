@@ -1,7 +1,6 @@
 //! Integration tests for the STUBBED routes.
 //!
-//! Many routes that were stubbed in the original Rust port have been
-//! lifted to live implementations — this file now mixes:
+//! This file mixes:
 //!   - Live route assertions (compared against Haskell fixtures)
 //!   - Genuine stubs that still return {alert} or 501
 //!

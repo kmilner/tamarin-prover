@@ -28,7 +28,6 @@ pub use crate::guarded_types::{
     subst_free_atom_at_depth, subst_free_fact_at_depth, subst_free_term_at_depth,
     subst_bound_atom_at_depth, subst_bound_fact_at_depth, subst_bound_term_at_depth,
     close_subst, open_subst, lvar_to_binding,
-    collect_free_term, collect_free_atom,
     map_free_term, map_free_fact, map_free_atom,
 };
 
@@ -402,8 +401,8 @@ pub fn cmp_varspec(a: &p::VarSpec, b: &p::VarSpec) -> std::cmp::Ordering {
 
 /// HS-faithful Ord for GGuarded *binding* entries.  In LNGuarded, the
 /// binding type is `(String, LSort)` — Guarded.hs:279,389.  So bindings
-/// sort by `(name, sort)` lex.  After the DeBruijn migration our
-/// `GBinding` already carries only those two fields.
+/// sort by `(name, sort)` lex.  Our `GBinding` carries only those
+/// two fields.
 pub fn cmp_binding(a: &GBinding, b: &GBinding) -> std::cmp::Ordering {
     a.name.cmp(&b.name)
         .then_with(|| cmp_sort_hint(&a.sort, &b.sort))
@@ -532,6 +531,16 @@ pub enum Guarded {
 pub fn gtrue() -> Guarded { Guarded::Conj(vec![]) }
 pub fn gfalse() -> Guarded { Guarded::Disj(vec![]) }
 pub fn gtf(b: bool) -> Guarded { if b { gtrue() } else { gfalse() } }
+
+/// Content-membership test for the `Arc`-wrapped formula stores
+/// (`System::formulas` / `solved_formulas` / `lemmas` /
+/// `sources_lemma_universals`).  The per-element `Arc` is transparent:
+/// the comparison dereferences to the underlying `Guarded` value (via
+/// `Arc`'s `Deref`), so this is identical to a plain
+/// `Vec<Guarded>::contains` — content equality, never pointer identity.
+pub fn stores_contains(store: &[std::sync::Arc<Guarded>], g: &Guarded) -> bool {
+    store.iter().any(|f| f.as_ref() == g)
+}
 
 /// `True` iff the guarded formula can be reduced by the constraint
 /// solver's `insertFormula` decomposition rules. Mirrors
@@ -878,27 +887,8 @@ pub fn is_safety_formula(g: &Guarded) -> bool {
 /// no name (their "name" is positional).  We collect VarSpec names from
 /// every `BVar::Free` leaf.
 pub fn free_vars(g: &Guarded) -> BTreeSet<String> {
-    fn rec(g: &Guarded, out: &mut BTreeSet<String>) {
-        match g {
-            Guarded::Atom(a) => {
-                let mut free = Vec::new();
-                collect_free_atom(a, &mut free);
-                for v in free { out.insert(v.name); }
-            }
-            Guarded::Disj(items) | Guarded::Conj(items) =>
-                for it in items { rec(it, out); },
-            Guarded::GGuarded { guards, body, .. } => {
-                for a in guards {
-                    let mut free = Vec::new();
-                    collect_free_atom(a, &mut free);
-                    for v in free { out.insert(v.name); }
-                }
-                rec(body, out);
-            }
-        }
-    }
     let mut out = BTreeSet::new();
-    rec(g, &mut out);
+    for_each_free_var_in_guarded(g, &mut |v| { out.insert(v.name.clone()); });
     out
 }
 
@@ -920,33 +910,42 @@ fn term_var_names(t: &p::Term, out: &mut Vec<String>) {
 // Walking Guarded with DeBruijn-aware substitution
 // =============================================================================
 
+/// Port of HS `mapGuardedAtoms :: (Integer -> a -> b) -> LGuarded a ->
+/// LGuarded b`: the single depth-tracking recursor shared by every eager
+/// per-atom rewrite over `Guarded`.  `f` receives the scope depth (number
+/// of binders crossed) and each atom; the rebuilt tree preserves structure,
+/// quantifier blocks, and traversal order.  Guards of a `GGuarded` are
+/// mapped — and the body recursed — at `depth + vars.len()`, so an atom
+/// under `n` binders is always handed `depth == n`.
+fn map_guarded_atoms<F: FnMut(u32, &GAtom) -> GAtom>(g: &Guarded, f: &mut F) -> Guarded {
+    fn rec<F: FnMut(u32, &GAtom) -> GAtom>(g: &Guarded, depth: u32, f: &mut F) -> Guarded {
+        match g {
+            Guarded::Atom(a) => Guarded::Atom(f(depth, a)),
+            Guarded::Disj(items) =>
+                Guarded::Disj(items.iter().map(|i| rec(i, depth, f)).collect()),
+            Guarded::Conj(items) =>
+                Guarded::Conj(items.iter().map(|i| rec(i, depth, f)).collect()),
+            Guarded::GGuarded { qua, vars, guards, body } => {
+                let new_depth = depth + vars.len() as u32;
+                Guarded::GGuarded {
+                    qua: qua.clone(),
+                    vars: vars.clone(),
+                    guards: guards.iter().map(|a| f(new_depth, a)).collect(),
+                    body: Box::new(rec(body, new_depth, f)),
+                }
+            }
+        }
+    }
+    rec(g, 0, f)
+}
+
 /// Mirror HS `substFree :: [(LVar, Integer)] -> LGuarded c -> LGuarded c`.
 ///
 /// Walks the Guarded tracking scope depth (number of binders crossed).
 /// At each atom, replaces each `Free(v)` matching some `(v, db)` in `s`
 /// with `Bound(db + depth)`.
 pub fn subst_free_guarded(g: &Guarded, s: &[(p::VarSpec, u32)]) -> Guarded {
-    fn rec(g: &Guarded, s: &[(p::VarSpec, u32)], depth: u32) -> Guarded {
-        match g {
-            Guarded::Atom(a) => Guarded::Atom(subst_free_atom_at_depth(a, s, depth)),
-            Guarded::Disj(items) =>
-                Guarded::Disj(items.iter().map(|i| rec(i, s, depth)).collect()),
-            Guarded::Conj(items) =>
-                Guarded::Conj(items.iter().map(|i| rec(i, s, depth)).collect()),
-            Guarded::GGuarded { qua, vars, guards, body } => {
-                let new_depth = depth + vars.len() as u32;
-                Guarded::GGuarded {
-                    qua: qua.clone(),
-                    vars: vars.clone(),
-                    guards: guards.iter()
-                        .map(|a| subst_free_atom_at_depth(a, s, new_depth))
-                        .collect(),
-                    body: Box::new(rec(body, s, new_depth)),
-                }
-            }
-        }
-    }
-    rec(g, s, 0)
+    map_guarded_atoms(g, &mut |d, a| subst_free_atom_at_depth(a, s, d))
 }
 
 /// Rebuild a guarded formula bottom-up through the `gconj`/`gdisj` smart
@@ -1138,27 +1137,7 @@ pub fn normalise_stored_formula_owned(g: Guarded) -> Guarded {
 /// `Bound(n)` matching some `(i, v)` in `s` (where `n = i + depth`) with
 /// `Free(v)`.
 pub fn subst_bound_guarded(g: &Guarded, s: &[(u32, p::VarSpec)]) -> Guarded {
-    fn rec(g: &Guarded, s: &[(u32, p::VarSpec)], depth: u32) -> Guarded {
-        match g {
-            Guarded::Atom(a) => Guarded::Atom(subst_bound_atom_at_depth(a, s, depth)),
-            Guarded::Disj(items) =>
-                Guarded::Disj(items.iter().map(|i| rec(i, s, depth)).collect()),
-            Guarded::Conj(items) =>
-                Guarded::Conj(items.iter().map(|i| rec(i, s, depth)).collect()),
-            Guarded::GGuarded { qua, vars, guards, body } => {
-                let new_depth = depth + vars.len() as u32;
-                Guarded::GGuarded {
-                    qua: qua.clone(),
-                    vars: vars.clone(),
-                    guards: guards.iter()
-                        .map(|a| subst_bound_atom_at_depth(a, s, new_depth))
-                        .collect(),
-                    body: Box::new(rec(body, s, new_depth)),
-                }
-            }
-        }
-    }
-    rec(g, s, 0)
+    map_guarded_atoms(g, &mut |d, a| subst_bound_atom_at_depth(a, s, d))
 }
 
 // =============================================================================
@@ -1473,7 +1452,20 @@ fn gnot_atom(a: &GAtom) -> Guarded {
 /// Substitution mapping a free LVar (keyed by `(name, idx)`) to a
 /// replacement parser-AST term.  Applied to `Guarded` formulas via
 /// `subst_guarded` (e.g. witness-LVar canonicalisation below).
-pub type VarSubst = std::collections::HashMap<(String, u64), p::Term>;
+///
+/// Keyed by the *interned* `&'static str` name (see [`tamarin_term::intern`]):
+/// `LVar.name` is already interned, so LVar-sourced builds key with zero alloc,
+/// and parser-`VarSpec`-sourced builds/lookups intern via `intern_str` (a
+/// read-locked pool probe, no allocation).  Key equality is unchanged —
+/// `&str`/`String` both hash/compare by content — so the key set is identical
+/// to a `(String, u64)` map.
+///
+/// Hashed by `FxBuildHasher` rather than the std `RandomState`.  This is
+/// byte-safe: no `VarSubst` is ever iterated toward output — every consumer is a
+/// keyed `get`/`insert`/`is_empty`/`len` (the `subst_*` fns, `collect_witness_vars`,
+/// `match_atom_via_maude`), and the sole iteration (`combine_substs`' union) is
+/// order-independent in both its `Some`/`None` outcome and its resulting map.
+pub type VarSubst = tamarin_utils::FastMap<(&'static str, u64), p::Term>;
 
 /// Rewrite every Maude-witness LVar named `x` (any idx) to its canonical
 /// `idx == 0` form.  Used to dedup implied formulas in
@@ -1488,10 +1480,19 @@ pub type VarSubst = std::collections::HashMap<(String, u64), p::Term>;
 /// distinct named fresh values) keeps its identity, so the dedup doesn't
 /// over-merge legitimately-distinct implications.
 pub fn normalize_witness_lvars(g: &Guarded) -> Guarded {
-    let mut subst: VarSubst = std::collections::HashMap::new();
+    normalize_witness_lvars_cow(g).unwrap_or_else(|| g.clone())
+}
+
+/// Copy-on-write core of [`normalize_witness_lvars`]: returns `None` when `g`
+/// carries no `~mw` witness var (the common case — `collect_witness_vars` finds
+/// nothing) OR when the witness substitution touches no leaf
+/// (`subst_guarded_cow` returns `None`), so a caller can reuse `g` by move/borrow
+/// instead of deep-cloning.  `Some(_)` is byte-identical to the eager rebuild.
+pub fn normalize_witness_lvars_cow(g: &Guarded) -> Option<Guarded> {
+    let mut subst: VarSubst = VarSubst::default();
     collect_witness_vars(g, &mut subst);
-    if subst.is_empty() { return g.clone(); }
-    subst_guarded(g, &subst)
+    if subst.is_empty() { return None; }
+    subst_guarded_cow(g, &subst)
 }
 
 /// Identity no-op on `Guarded`, kept so callers can express the intent of
@@ -1501,7 +1502,7 @@ pub fn normalize_witness_lvars(g: &Guarded) -> Guarded {
 /// `GGuarded { vars: [(j, Node)], body: ... Bound(0) ... }` — so no rewriting is
 /// needed.  Called from `constraint::system` and `solver::reduction` to mark
 /// the spots where HS relied on its DeBruijn invariant.  `solver::simplify`
-/// deliberately skips it — see `implied_apply_canon` in simplify.rs, which
+/// deliberately skips it — see `implied_apply_canon_cow` in simplify.rs, which
 /// drops the call to save one full `Guarded` deep clone.
 ///
 /// Intentionally a no-op identity clone: faithful HS port marker.
@@ -1815,62 +1816,23 @@ fn canonicalize_ac_in_guarded_with(g: &Guarded, cmp: GCmp) -> Guarded {
 }
 
 fn collect_witness_vars(g: &Guarded, out: &mut VarSubst) {
-    match g {
-        Guarded::Atom(a) => collect_witness_vars_atom(a, out),
-        Guarded::Disj(items) | Guarded::Conj(items) => {
-            for i in items { collect_witness_vars(i, out); }
+    // The witness set is exactly the Free-leaf set that
+    // `for_each_free_var_in_guarded` enumerates (guards + body, all GAtom
+    // variants); we keep only the "x"-named leaves, canonicalising idx→0.
+    // `out` is keyed by (interned name, idx), so visitation order is
+    // irrelevant to the resulting map.
+    for_each_free_var_in_guarded(g, &mut |v| {
+        if v.name == "x" {
+            let canonical = p::VarSpec {
+                name: v.name.clone(),
+                idx: 0,                  // canonical idx
+                sort: v.sort,
+                typ: v.typ.clone(),
+            };
+            out.insert((tamarin_term::intern::intern_str(&v.name), v.idx),
+                p::Term::Var(canonical));
         }
-        Guarded::GGuarded { guards, body, .. } => {
-            for a in guards { collect_witness_vars_atom(a, out); }
-            collect_witness_vars(body, out);
-        }
-    }
-}
-
-fn collect_witness_vars_atom(a: &GAtom, out: &mut VarSubst) {
-    match a {
-        GAtom::Eq(x, y) | GAtom::Less(x, y) | GAtom::LessMset(x, y)
-        | GAtom::Subterm(x, y) => {
-            collect_witness_vars_term(x, out);
-            collect_witness_vars_term(y, out);
-        }
-        GAtom::Action(f, t) => {
-            for arg in &f.args { collect_witness_vars_term(arg, out); }
-            collect_witness_vars_term(t, out);
-        }
-        GAtom::Last(t) => collect_witness_vars_term(t, out),
-        GAtom::Pred(f) => {
-            for arg in &f.args { collect_witness_vars_term(arg, out); }
-        }
-    }
-}
-
-fn collect_witness_vars_term(t: &GTerm, out: &mut VarSubst) {
-    match t {
-        GTerm::Var(BVar::Free(v)) => {
-            if v.name == "x" {
-                let canonical = p::VarSpec {
-                    name: v.name.clone(),
-                    idx: 0,                  // canonical idx
-                    sort: v.sort,
-                    typ: v.typ.clone(),
-                };
-                out.insert((v.name.clone(), v.idx), p::Term::Var(canonical));
-            }
-        }
-        GTerm::Var(BVar::Bound(_)) => {}  // bound vars have no LVar idx
-        GTerm::App(_, args) | GTerm::Pair(args) => {
-            for a in args.iter() { collect_witness_vars_term(a, out); }
-        }
-        GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
-            collect_witness_vars_term(a, out);
-            collect_witness_vars_term(b, out);
-        }
-        GTerm::PatMatch(t) => collect_witness_vars_term(t, out),
-        GTerm::PubLit(_) | GTerm::FreshLit(_) | GTerm::NatLit(_)
-        | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne
-        | GTerm::DhNeutral => {}
-    }
+    });
 }
 
 /// Convert the eq-store's `Subst<Name, LVar>` to a parser-AST
@@ -1884,10 +1846,11 @@ pub fn var_subst_from_eq_store(
 ) -> VarSubst {
     use tamarin_term::lterm::LVar;
     use crate::elaborate::lnterm_to_term;
-    let mut out: VarSubst = std::collections::HashMap::new();
+    let mut out: VarSubst = VarSubst::default();
     let pairs: Vec<(LVar, _)> = eq_store.subst.to_list();
     for (lv, lt) in pairs {
-        out.insert((lv.name.to_string(), lv.idx), lnterm_to_term(&lt));
+        // `lv.name` is already an interned `&'static str` — zero-alloc key.
+        out.insert((lv.name, lv.idx), lnterm_to_term(&lt));
     }
     out
 }
@@ -1896,7 +1859,7 @@ pub fn subst_term(t: &p::Term, s: &VarSubst) -> p::Term {
     use p::Term;
     match t {
         Term::Var(v) => {
-            let key = (v.name.clone(), v.idx);
+            let key = (tamarin_term::intern::intern_str(&v.name), v.idx);
             if let Some(target) = s.get(&key) {
                 target.clone()
             } else {
@@ -2042,8 +2005,29 @@ fn subst_gfact_cow(f: &GFact, s: &VarSubst) -> Option<GFact> {
 fn subst_gterm_cow(t: &GTerm, s: &VarSubst) -> Option<GTerm> {
     match t {
         GTerm::Var(BVar::Free(v)) => {
-            let key = (v.name.clone(), v.idx);
-            s.get(&key).map(term_to_gterm_free)
+            // Intern the leaf name to the shared pool key (read-locked probe,
+            // no allocation) instead of cloning a fresh `String` per lookup.
+            let key = (tamarin_term::intern::intern_str(&v.name), v.idx);
+            match s.get(&key) {
+                None => None,
+                // Value-equality COW, mirroring the term side's compare-based
+                // COW (`map_free_term_cow`, lterm.rs:547-549 `if &nl != l`):
+                // a hit whose replacement reproduces THIS exact leaf reports
+                // `None` so the caller reuses the input instead of rebuilding.
+                // `term_to_gterm_free(t) == GTerm::Var(BVar::Free(v))` holds
+                // iff `t` is a `Var(spec)` with `spec == v` AND the nullary-fun
+                // guard does not fire (that guard lifts the leaf to `App`).  A
+                // replacement that normalises spelling (Untagged→Msg sort, or
+                // `typ` dropped) compares unequal and rebuilds, so the leaf
+                // canonicalisation of `term_to_gterm_free` is preserved.
+                Some(p::Term::Var(spec))
+                    if spec == v
+                        && !(matches!(spec.sort, p::SortHint::Untagged)
+                            && spec.idx == 0
+                            && crate::elaborate::is_user_nullary_fun(&spec.name)) =>
+                    None,
+                Some(t) => Some(term_to_gterm_free(t)),
+            }
         }
         GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_) | GTerm::NatLit(_)
         | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne | GTerm::DhNeutral => None,
@@ -2277,9 +2261,6 @@ pub fn to_induction_hypothesis(g: &Guarded) -> Result<Guarded, String> {
             // Mirrors Haskell's
             //   lastAtos = [ Last (varTerm (Bound j))
             //              | (j, (_, LSortNode)) <- zip [0..] (reverse ss) ]
-            // We use named vars, so no de-Bruijn shifting is needed: the
-            // body2 refers to the same `vars` by name, and we just emit
-            // `Last(Var(v))` for each node-sorted v in `vars`.
             // Haskell `reverse ss` (Guarded.hs:613) — node-sorted binders
             // emitted in REVERSE quantifier order.  For `∀ k #i #j`, ss
             // reversed = [#j, #i, k] → lastAtos = [Last(#j), Last(#i)].
@@ -2368,23 +2349,9 @@ where F: FnMut(&p::VarSpec) -> p::VarSpec,
 {
     // With DeBruijn bindings, only `BVar::Free` leaves carry an LVar
     // identity — `Bound` is positional and skipped automatically.
-    // No bound-set tracking needed.
-    fn rec<G: FnMut(&p::VarSpec) -> p::VarSpec>(g: &Guarded, f: &mut G) -> Guarded {
-        match g {
-            Guarded::Atom(a) => Guarded::Atom(map_free_atom(a, f)),
-            Guarded::Disj(items) =>
-                Guarded::Disj(items.iter().map(|i| rec(i, f)).collect()),
-            Guarded::Conj(items) =>
-                Guarded::Conj(items.iter().map(|i| rec(i, f)).collect()),
-            Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
-                qua: qua.clone(),
-                vars: vars.clone(),
-                guards: guards.iter().map(|a| map_free_atom(a, f)).collect(),
-                body: Box::new(rec(body, f)),
-            }
-        }
-    }
-    rec(g, &mut f)
+    // No bound-set tracking needed; the depth handed by the combinator is
+    // irrelevant here since `map_free_atom` rewrites Free leaves in place.
+    map_guarded_atoms(g, &mut |_d, a| map_free_atom(a, &mut f))
 }
 
 // =============================================================================
@@ -2613,8 +2580,8 @@ mod tests {
 
     #[test]
     fn varsubst_var_to_var_remap() {
-        let mut s = VarSubst::new();
-        s.insert(("x".into(), 0), var("y", 5));
+        let mut s = VarSubst::default();
+        s.insert(("x", 0), var("y", 5));
         let result = subst_term(&var("x", 0), &s);
         assert_eq!(result, var("y", 5));
     }
@@ -2622,8 +2589,8 @@ mod tests {
     #[test]
     fn varsubst_var_to_non_var_term() {
         // Bind `k` to the public constant 'foo'.
-        let mut s = VarSubst::new();
-        s.insert(("k".into(), 0), pubconst("foo"));
+        let mut s = VarSubst::default();
+        s.insert(("k", 0), pubconst("foo"));
         let result = subst_term(&var("k", 0), &s);
         assert_eq!(result, pubconst("foo"));
     }
@@ -2631,8 +2598,8 @@ mod tests {
     #[test]
     fn varsubst_descends_into_app_args() {
         // `f(k, m)` where `k` is bound to 'foo'.
-        let mut s = VarSubst::new();
-        s.insert(("k".into(), 0), pubconst("foo"));
+        let mut s = VarSubst::default();
+        s.insert(("k", 0), pubconst("foo"));
         let t = p::Term::App("f".into(), vec![var("k", 0), var("m", 0)]);
         let result = subst_term(&t, &s);
         let expected = p::Term::App("f".into(), vec![pubconst("foo"), var("m", 0)]);
@@ -2641,7 +2608,7 @@ mod tests {
 
     #[test]
     fn varsubst_unmapped_var_unchanged() {
-        let s = VarSubst::new();  // empty
+        let s = VarSubst::default();  // empty
         let t = var("k", 0);
         assert_eq!(subst_term(&t, &s), t);
     }
@@ -2650,8 +2617,8 @@ mod tests {
     fn varsubst_idx_aware() {
         // Two vars with same name but different idx — only the
         // matching one is replaced.
-        let mut s = VarSubst::new();
-        s.insert(("x".into(), 5), var("y", 0));
+        let mut s = VarSubst::default();
+        s.insert(("x", 5), var("y", 0));
         // x with idx 5 → y, x with idx 6 unchanged.
         assert_eq!(subst_term(&var("x", 5), &s), var("y", 0));
         assert_eq!(subst_term(&var("x", 6), &s), var("x", 6));
@@ -2659,8 +2626,8 @@ mod tests {
 
     #[test]
     fn varsubst_pair_descent() {
-        let mut s = VarSubst::new();
-        s.insert(("a".into(), 0), pubconst("X"));
+        let mut s = VarSubst::default();
+        s.insert(("a", 0), pubconst("X"));
         let t = p::Term::Pair(vec![var("a", 0), var("b", 0)]);
         let result = subst_term(&t, &s);
         let expected = p::Term::Pair(vec![pubconst("X"), var("b", 0)]);
@@ -2685,8 +2652,8 @@ mod tests {
         // `Ex k. Action(k) @ i` — substituting `k` from outside should
         // NOT rewrite the inner `k` because it's positionally bound
         // (DeBruijn `Bound(0)` in the body, not Free LVar `k:0`).
-        let mut s = VarSubst::new();
-        s.insert(("k".into(), 0), pubconst("OUTER"));
+        let mut s = VarSubst::default();
+        s.insert(("k", 0), pubconst("OUTER"));
         let inner_k = p::VarSpec { name: "k".into(), idx: 0, sort: p::SortHint::Msg, typ: None };
         let mkfact = |t: p::Term| p::Fact {
             persistent: false,
@@ -3321,5 +3288,67 @@ mod tests {
             canonicalize_ac_in_guarded(&mk(&exp_unsorted)),
             canonicalize_ac_in_guarded(&mk(&exp_sorted)),
             "em nested under exp must also have its args sorted");
+    }
+
+    #[test]
+    fn subst_gterm_cow_var_value_equality() {
+        // The value-equality COW in `subst_gterm_cow`'s Var arm must return
+        // `None` ONLY when the replacement reproduces the exact same leaf, and
+        // must still rebuild (`Some`) whenever the hit normalises the leaf's
+        // spelling — otherwise the leaf-canonicalisation of `term_to_gterm_free`
+        // (Untagged→Msg sort, `typ` dropped) would be silently lost.
+        let mut s: VarSubst = VarSubst::default();
+        // Replacement is the canonical Msg-sorted, no-typ leaf.
+        s.insert(
+            ("x", 0),
+            p::Term::Var(p::VarSpec {
+                name: "x".into(), idx: 0, sort: p::SortHint::Msg, typ: None,
+            }),
+        );
+
+        let leaf = |sort: p::SortHint, typ: Option<&str>| GTerm::Var(BVar::Free(p::VarSpec {
+            name: "x".into(), idx: 0, sort, typ: typ.map(str::to_string),
+        }));
+
+        // Exact identity hit: replacement == leaf → reuse the input (`None`).
+        assert_eq!(subst_gterm_cow(&leaf(p::SortHint::Msg, None), &s), None,
+            "an identity hit must report None so the caller reuses the leaf");
+
+        // Spelling-normalising hit — Untagged leaf, canonical Msg replacement:
+        // must rebuild so the Untagged→Msg normalisation is applied.
+        assert_eq!(
+            subst_gterm_cow(&leaf(p::SortHint::Untagged, None), &s),
+            Some(term_to_gterm_free(s.get(&("x", 0)).unwrap())),
+            "an Untagged-sorted leaf must rebuild to the Msg-sorted replacement");
+
+        // Typ-dropping hit — leaf carries a SAPIC `typ`, replacement drops it:
+        // must rebuild so the `typ` is dropped.
+        assert_eq!(
+            subst_gterm_cow(&leaf(p::SortHint::Msg, Some("A")), &s),
+            Some(term_to_gterm_free(s.get(&("x", 0)).unwrap())),
+            "a typ-annotated leaf must rebuild to the typ-dropped replacement");
+
+        // Non-identity idx remap still rebuilds.
+        let mut s2: VarSubst = VarSubst::default();
+        s2.insert(
+            ("x", 0),
+            p::Term::Var(p::VarSpec {
+                name: "x".into(), idx: 7, sort: p::SortHint::Msg, typ: None,
+            }),
+        );
+        assert_eq!(
+            subst_gterm_cow(&leaf(p::SortHint::Msg, None), &s2),
+            Some(term_to_gterm_free(s2.get(&("x", 0)).unwrap())),
+            "a real idx remap must rebuild");
+
+        // A leaf whose (name, idx) is not in the domain returns None (miss).
+        assert_eq!(
+            subst_gterm_cow(
+                &GTerm::Var(BVar::Free(p::VarSpec {
+                    name: "y".into(), idx: 0, sort: p::SortHint::Msg, typ: None,
+                })),
+                &s),
+            None,
+            "a domain miss must report None");
     }
 }

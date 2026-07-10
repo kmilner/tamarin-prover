@@ -276,23 +276,32 @@ impl<'ctx> Reduction<'ctx> {
     /// only flags `Changed` if at least one marker actually toggled.
     pub fn mark_contradictory(&mut self) {
         let bot = crate::guarded::gfalse();
-        let added_bot = if !self.sys.formulas.contains(&bot) {
+        let added_bot = if !crate::guarded::stores_contains(&self.sys.formulas, &bot) {
             self.sys.invalidate_max_var_idx_cache();
-            self.sys.formulas.push(bot);
+            self.sys.formulas.push(std::sync::Arc::new(bot));
             true
         } else {
             false
         };
-        let flipped_eq = if !self.sys.eq_store.is_false() {
+        let flipped_eq = self.set_eq_store_false();
+        if added_bot || flipped_eq {
+            self.changed = ChangeIndicator::Changed;
+        }
+    }
+
+    /// Flip `eq_store` to its `is_false` (mzero-proxy) state: take the
+    /// store out of its `Arc`, invalidate the max-var-idx cache, and
+    /// reinstall the `set_false()` result. Returns `true` iff it actually
+    /// flipped (the store was not already false). Callers decide whether
+    /// the flip also implies a `self.changed` bump.
+    fn set_eq_store_false(&mut self) -> bool {
+        if !self.sys.eq_store.is_false() {
             let s = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
             self.sys.invalidate_max_var_idx_cache();
             self.sys.eq_store = std::sync::Arc::new(s.set_false());
             true
         } else {
             false
-        };
-        if added_bot || flipped_eq {
-            self.changed = ChangeIndicator::Changed;
         }
     }
 
@@ -313,12 +322,6 @@ impl<'ctx> Reduction<'ctx> {
     /// Returns `Ok(Contradictory)` when the fact unification fails so
     /// callers can skip the case cleanly (matches HS Disj-monad mzero
     /// semantics on the caller side).
-    pub fn insert_edge(&mut self, e: Edge)
-        -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError>
-    {
-        self.insert_edge_labeled("unlabeled", e)
-    }
-
     pub fn insert_edge_labeled(&mut self, site: &str, e: Edge)
         -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError>
     {
@@ -339,10 +342,27 @@ impl<'ctx> Reduction<'ctx> {
         let fa_prem = self.sys.nodes.iter()
             .find(|(n, _)| n == &e.tgt.0)
             .and_then(|(_, r)| r.premises.get(e.tgt.1.0).cloned());
-        // HS step 1: solveFactEqs SplitNow on the edge's facts.
-        // Mirrors Reduction.hs:280.  If the facts are already
-        // structurally equal, skip (Maude would just succeed trivially).
-        let res = if let (Some(fa_c), Some(fa_p)) = (&fa_conc, &fa_prem) {
+        // When either fact is missing (rule lookup failed) the tail
+        // does a raw insert — `insert_edge_tail`'s `None` path mirrors
+        // the old fall-through.  Shouldn't happen in practice unless the
+        // caller passes an edge for a node that's not in the system.
+        self.insert_edge_tail(site, e, fa_conc.as_ref(), fa_prem.as_ref())
+    }
+
+    /// Shared tail of `insert_edge_labeled` / `insert_edge_labeled_with_facts`
+    /// once the conclusion/premise facts are in hand.  HS step 1
+    /// (`solveFactEqs SplitNow`, Reduction.hs:280) followed by step 2
+    /// (`modM sEdges`, Reduction.hs:281).  On unification failure it
+    /// mirrors `noContradictoryEqStore` (Reduction.hs:703-704) via
+    /// `mark_contradictory` + early return, so the edge is never added to
+    /// the contradicted state.  Facts equal (or absent) means the Maude
+    /// call would trivially succeed, so we skip straight to the insert.
+    fn insert_edge_tail(
+        &mut self, site: &str, e: Edge,
+        fa_conc: Option<&crate::fact::LNFact>,
+        fa_prem: Option<&crate::fact::LNFact>,
+    ) -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError> {
+        let res = if let (Some(fa_c), Some(fa_p)) = (fa_conc, fa_prem) {
             if fa_c != fa_p {
                 self.solve_fact_eqs(
                     SplitStrategy::SplitNow,
@@ -353,13 +373,8 @@ impl<'ctx> Reduction<'ctx> {
                 Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged))
             }
         } else {
-            // No facts found (rule lookup failed) — fall through to
-            // raw insert.  Shouldn't happen in practice unless the
-            // caller passes an edge for a node that's not in the system.
             Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged))
         };
-        // Mirrors `noContradictoryEqStore` (Reduction.hs:703-704):
-        // mzero-equivalent if eq_store becomes false.
         if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
             if tamarin_utils::env_gate!("TAM_RS_TRACE_INSERT_EDGE_FIRE") {
                 let mode = if crate::constraint::solver::sources::in_precompute_mode() {
@@ -369,7 +384,6 @@ impl<'ctx> Reduction<'ctx> {
             self.mark_contradictory();
             return res;
         }
-        // HS step 2: add to sEdges (Reduction.hs:281).
         let before = self.sys.edges.len();
         self.sys.add_edge(e);
         if self.sys.edges.len() != before { self.changed = ChangeIndicator::Changed; }
@@ -396,23 +410,7 @@ impl<'ctx> Reduction<'ctx> {
                 site, mode, e.src, e.tgt, self.sys.eq_store.is_false());
         }
         crate::constraint::solver::trace::trace_exec("insertEdges n=1");
-        let res = if fa_conc != fa_prem {
-            self.solve_fact_eqs(
-                SplitStrategy::SplitNow,
-                &[tamarin_term::rewriting::Equal {
-                    lhs: fa_conc.clone(), rhs: fa_prem.clone() }],
-            )
-        } else {
-            Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged))
-        };
-        if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
-            self.mark_contradictory();
-            return res;
-        }
-        let before = self.sys.edges.len();
-        self.sys.add_edge(e);
-        if self.sys.edges.len() != before { self.changed = ChangeIndicator::Changed; }
-        res
+        self.insert_edge_tail(site, e, Some(fa_conc), Some(fa_prem))
     }
 
     /// `insertLast` — HS-faithful port of Reduction.hs:402-407:
@@ -520,10 +518,10 @@ impl<'ctx> Reduction<'ctx> {
             || !self.sys.solved_formulas.is_empty()
             || !self.sys.lemmas.is_empty()
             || self.sys.goals.iter().any(|(g, _)| matches!(g, Goal::Disj(_)));
-        let parser_subst = if needs_parser_subst {
+        let parser_subst: crate::guarded::VarSubst = if needs_parser_subst {
             build_parser_subst_from_eq_store(&subst)
         } else {
-            crate::guarded::VarSubst::new()
+            crate::guarded::VarSubst::default()
         };
         let map_var = |v: tamarin_term::lterm::LVar| -> tamarin_term::lterm::LVar {
             let id_term = tamarin_term::term::Term::Lit(
@@ -567,8 +565,7 @@ impl<'ctx> Reduction<'ctx> {
         // (Reduction.hs:752-754: `map (fmap (get rConcs)) eqs ++
         //  map (fmap (get rPrems)) eqs ++ map (fmap (get rActs)) eqs`).
         // Building three separate vectors and concatenating at the end is the
-        // faithful "batch transpose"; the previous per-collision prem/conc/act
-        // interleaving diverged from Haskell on multi-collision passes.
+        // faithful "batch transpose" (all conclusions, then premises, then actions).
         let mut conc_eqs: Vec<tamarin_term::rewriting::Equal<crate::fact::LNFact>> = Vec::new();
         let mut prem_eqs: Vec<tamarin_term::rewriting::Equal<crate::fact::LNFact>> = Vec::new();
         let mut act_eqs: Vec<tamarin_term::rewriting::Equal<crate::fact::LNFact>> = Vec::new();
@@ -783,9 +780,9 @@ impl<'ctx> Reduction<'ctx> {
             // Force a `gfalse` formula so `has_false_formula` picks up
             // the contradiction in the next contradictions check.
             let bot = crate::guarded::gfalse();
-            if !self.sys.formulas.contains(&bot) {
+            if !crate::guarded::stores_contains(&self.sys.formulas, &bot) {
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.formulas.push(bot);
+                self.sys.formulas.push(std::sync::Arc::new(bot));
                 self.changed = ChangeIndicator::Changed;
             }
             // Also flip `eq_store.is_false` so the simplify-time filter
@@ -796,10 +793,7 @@ impl<'ctx> Reduction<'ctx> {
             // mzero on rInfo / fact-shape mismatch, so the case
             // disappears from `runReduction`'s Disj.  Setting is_false
             // here matches that shape on the SolveGoal proof-tree filter.
-            if !self.sys.eq_store.is_false() {
-                let s = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
-                self.sys.invalidate_max_var_idx_cache();
-                self.sys.eq_store = std::sync::Arc::new(s.set_false());
+            if self.set_eq_store_false() {
                 self.changed = ChangeIndicator::Changed;
             }
         }
@@ -971,18 +965,36 @@ impl<'ctx> Reduction<'ctx> {
                     } else {
                         let new_alts: Vec<_> = d.0.into_iter()
                             .map(|alt| {
-                                let mut cur = alt;
-                                for _ in 0..16 {
-                                    let nxt = crate::guarded::subst_guarded(&cur, &parser_subst);
-                                    if nxt == cur { break; }
-                                    cur = nxt;
+                                // COW mirror of the store rewrite's
+                                // `apply_to_fixpoint` (below): `subst_guarded_cow
+                                // == None` ⇔ the fixpoint loop broke immediately
+                                // (`nxt == cur`), so reuse the owned `alt` with
+                                // zero clones when both the subst and the trailing
+                                // AC-canon are no-ops.  Byte-identical to the eager
+                                // 16-round `subst_guarded` + `canonicalize_ac`.
+                                let mut cur = match crate::guarded::subst_guarded_cow(
+                                    &alt, &parser_subst)
+                                {
+                                    None => return crate::guarded::
+                                        canonicalize_ac_in_guarded_cow(&alt)
+                                        .unwrap_or(alt),
+                                    Some(s0) => s0,
+                                };
+                                for _ in 0..15 {
+                                    match crate::guarded::subst_guarded_cow(
+                                        &cur, &parser_subst)
+                                    {
+                                        None => break,
+                                        Some(nxt) => cur = nxt,
+                                    }
                                 }
                                 // Re-canonicalise AC after substitution so the
                                 // substituted Disj-goal body matches the
                                 // flat-sorted re-derived form for the goal-store
                                 // dedup (see the formula-subst comment in
                                 // `subst_system_once`).
-                                crate::guarded::canonicalize_ac_in_guarded(&cur)
+                                crate::guarded::canonicalize_ac_in_guarded_cow(&cur)
+                                    .unwrap_or(cur)
                             })
                             .collect::<Vec<_>>();
                         // Normalise the disjunct LIST in lockstep with the
@@ -1060,7 +1072,7 @@ impl<'ctx> Reduction<'ctx> {
         // insert_implied_formulas) misses contradictions like a
         // surviving `All r. Rev(?key) @ r ==> ⊥` when the trace
         // contains `Rev(~k15) @ vr_14` — that's a soundness gap.
-        let formula_subst = &parser_subst;
+        let formula_subst: &crate::guarded::VarSubst = &parser_subst;
         if !formula_subst.is_empty() {
             // Iterate per-formula until subst_guarded reaches a fixpoint
             // — eq-store entries can form chains (e.g. `x:1 → x:13`,
@@ -1120,17 +1132,17 @@ impl<'ctx> Reduction<'ctx> {
             };
             for f in self.sys.formulas.iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
-                    if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+                    if new_f != **f { *f = std::sync::Arc::new(new_f); self.changed = ChangeIndicator::Changed; }
                 }
             }
             for f in self.sys.solved_formulas.iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
-                    if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+                    if new_f != **f { *f = std::sync::Arc::new(new_f); self.changed = ChangeIndicator::Changed; }
                 }
             }
             for f in self.sys.lemmas.iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
-                    if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+                    if new_f != **f { *f = std::sync::Arc::new(new_f); self.changed = ChangeIndicator::Changed; }
                 }
             }
             // HS-faithful: `substFormulas`/`substSolvedFormulas`/`substLemmas`
@@ -1800,17 +1812,17 @@ impl<'ctx> Reduction<'ctx> {
                 Guarded::GGuarded { qua: crate::guarded::Quant::Ex, .. } => "Ex",
                 Guarded::GGuarded { qua: crate::guarded::Quant::All, .. } => "All",
             };
-            let dup_f = self.sys.formulas.contains(&g);
-            let dup_s = self.sys.solved_formulas.contains(&g);
+            let dup_f = crate::guarded::stores_contains(&self.sys.formulas, &g);
+            let dup_s = crate::guarded::stores_contains(&self.sys.solved_formulas, &g);
             eprintln!("[INSERT_FORM] mark={} head={} dup_f={} dup_s={}",
                 mark, head, dup_f, dup_s);
         }
-        if self.sys.formulas.contains(&g) || self.sys.solved_formulas.contains(&g) {
+        if crate::guarded::stores_contains(&self.sys.formulas, &g) || crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
             return;
         }
         match g.clone() {
             Guarded::Conj(items) => {
-                if mark { self.sys.solved_formulas.push(g); }
+                if mark { self.sys.solved_formulas.push(std::sync::Arc::new(g)); }
                 for it in items { self.insert_formula_inner(it, false); }
                 self.changed = ChangeIndicator::Changed;
             }
@@ -1828,20 +1840,26 @@ impl<'ctx> Reduction<'ctx> {
                 // adding to formulas, AND inserting the empty DisjG goal
                 // alongside.  Both contradictions-check and goal-ranker
                 // can then close the case (HS picks whichever fires first).
-                let already_in = self.sys.formulas.contains(&g);
+                // The `:1808` entry guard returned when `g` was already in
+                // `formulas`/`solved_formulas`, and the only statement since
+                // (`match g.clone()`) does not mutate `self.sys`, so `g` is
+                // provably not yet in `formulas` here: always trace "Disj"
+                // and push.  Mirrors HS `insertFormula` (Reduction.hs:473-482),
+                // which likewise inserts without re-checking membership.
+                debug_assert!(!crate::guarded::stores_contains(&self.sys.formulas, &g),
+                    "insert_formula_inner empty-Disj arm: the :1808 entry \
+                     guard already excludes formulas-membership");
                 crate::constraint::solver::trace::trace_form(
-                    if already_in { "Disj-dedup" } else { "Disj" },
-                    &crate::constraint::solver::trace::guarded_repr(&g));
+                    "Disj",
+                    || crate::constraint::solver::trace::guarded_repr(&g));
                 if tamarin_utils::env_gate!("TAM_RS_TRACE_GFALSE") {
                     eprintln!("[RS_GFALSE] path={} gfalse inserted",
                         crate::constraint::solver::trace::case_path_string());
                 }
-                if !already_in {
-                    // Pure ADD (formula push under !already_in): bump.
-                    self.sys.bump_cache_guarded(&g);
-                    self.sys.formulas.push(g.clone());
-                    self.changed = ChangeIndicator::Changed;
-                }
+                // Pure ADD (formula push): bump.
+                self.sys.bump_cache_guarded(&g);
+                self.sys.formulas.push(std::sync::Arc::new(g.clone()));
+                self.changed = ChangeIndicator::Changed;
                 let goal = Goal::Disj(crate::constraint::constraints::Disj::new(items));
                 self.insert_goal(goal);
             }
@@ -1849,15 +1867,21 @@ impl<'ctx> Reduction<'ctx> {
                 // Store the formula AND insert a corresponding split
                 // goal. The goal itself uses the same vector, allowing
                 // `solve_disj_goal` to resume later.
-                let already_in = self.sys.formulas.contains(&g);
+                // The `:1808` entry guard returned when `g` was already in
+                // `formulas`/`solved_formulas`, and the only statement since
+                // (`match g.clone()`) does not mutate `self.sys`, so `g` is
+                // provably not yet in `formulas` here: always trace "Disj"
+                // and push.  Mirrors HS `insertFormula` (Reduction.hs:473-482),
+                // which likewise inserts without re-checking membership.
+                debug_assert!(!crate::guarded::stores_contains(&self.sys.formulas, &g),
+                    "insert_formula_inner Disj arm: the :1808 entry guard \
+                     already excludes formulas-membership");
                 crate::constraint::solver::trace::trace_form(
-                    if already_in { "Disj-dedup" } else { "Disj" },
-                    &crate::constraint::solver::trace::guarded_repr(&g));
-                if !already_in {
-                    // Pure ADD (formula push under !already_in): bump.
-                    self.sys.bump_cache_guarded(&g);
-                    self.sys.formulas.push(g.clone());
-                }
+                    "Disj",
+                    || crate::constraint::solver::trace::guarded_repr(&g));
+                // Pure ADD (formula push): bump.
+                self.sys.bump_cache_guarded(&g);
+                self.sys.formulas.push(std::sync::Arc::new(g.clone()));
                 let goal = Goal::Disj(crate::constraint::constraints::Disj::new(items));
                 self.insert_goal(goal);
                 self.changed = ChangeIndicator::Changed;
@@ -1892,20 +1916,40 @@ impl<'ctx> Reduction<'ctx> {
                 // GGuarded bound vars).
                 if mark {
                     let eq_vs = crate::guarded::var_subst_from_eq_store(&self.sys.eq_store);
-                    let apply_canon = |f: &crate::guarded::Guarded| {
-                        let f1 = if eq_vs.is_empty() { f.clone() }
-                                 else { crate::guarded::subst_guarded(f, &eq_vs) };
-                        let f2 = crate::guarded::normalize_witness_lvars(&f1);
-                        crate::guarded::normalize_bound_lvars(&f2)
-                    };
-                    let canon = apply_canon(&g);
+                    // COW canon.  `normalize_bound_lvars` is an identity clone
+                    // applied to BOTH sides of the `==`, so it never changes the
+                    // dedup boolean — drop it (matching the `implied_apply_canon`
+                    // twin in simplify.rs, which deliberately skips it).  The two
+                    // remaining stages reuse the borrowed input when they touch no
+                    // leaf, so an already-canonical formula pays zero clones.
+                    // (Nested `fn` with an explicit lifetime so the returned `Cow`
+                    // can borrow the input `f`; a closure cannot express that.)
+                    fn apply_canon<'f>(
+                        f: &'f crate::guarded::Guarded,
+                        eq_vs: &crate::guarded::VarSubst,
+                    ) -> std::borrow::Cow<'f, crate::guarded::Guarded> {
+                        let f1: std::borrow::Cow<crate::guarded::Guarded> =
+                            if eq_vs.is_empty() {
+                                std::borrow::Cow::Borrowed(f)
+                            } else {
+                                match crate::guarded::subst_guarded_cow(f, eq_vs) {
+                                    None => std::borrow::Cow::Borrowed(f),
+                                    Some(g) => std::borrow::Cow::Owned(g),
+                                }
+                            };
+                        match crate::guarded::normalize_witness_lvars_cow(f1.as_ref()) {
+                            None => f1,
+                            Some(g) => std::borrow::Cow::Owned(g),
+                        }
+                    }
+                    let canon = apply_canon(&g, &eq_vs);
                     let already_solved = self.sys.solved_formulas.iter().any(|f|
-                        apply_canon(f) == canon);
+                        apply_canon(f, &eq_vs).as_ref() == canon.as_ref());
                     if !already_solved {
                         // Pure ADD (solved-formula push under
                         // !already_solved): bump.
                         self.sys.bump_cache_guarded(&g);
-                        self.sys.solved_formulas.push(g);
+                        self.sys.solved_formulas.push(std::sync::Arc::new(g));
                         self.changed = ChangeIndicator::Changed;
                     }
                 }
@@ -1926,7 +1970,7 @@ impl<'ctx> Reduction<'ctx> {
                         mark,
                         vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>());
                 }
-                if self.sys.solved_formulas.contains(&outer) {
+                if crate::guarded::stores_contains(&self.sys.solved_formulas, &outer) {
                     if tamarin_utils::env_gate!("TAM_DBG_EX_DECOMP") {
                         eprintln!("[EX-DECOMP] SKIP (already solved) vars={:?}",
                             vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>());
@@ -1936,7 +1980,7 @@ impl<'ctx> Reduction<'ctx> {
                 // Pure ADD (solved-formula push, guarded by the
                 // `contains(&outer)` early-return above): bump.
                 self.sys.bump_cache_guarded(&outer);
-                self.sys.solved_formulas.push(outer);
+                self.sys.solved_formulas.push(std::sync::Arc::new(outer));
                 // HS (Reduction.hs:573) draws `xs <- mapM (uncurry freshLVar) ss`
                 // straight from the ambient MonadFresh counter — no clamp; the
                 // threaded counter is above every system var by construction
@@ -2021,9 +2065,9 @@ impl<'ctx> Reduction<'ctx> {
                         // it to 4 (+ ¬Less, ¬Eq) → IH-Disj reads as
                         // already-solved, skeleton replay picks the
                         // wrong open goal.
-                        if mark && !self.sys.solved_formulas.contains(&g) {
+                        if mark && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.solved_formulas.push(g.clone());
+                            self.sys.solved_formulas.push(std::sync::Arc::new(g.clone()));
                         }
                         let d = crate::guarded::Guarded::Disj(vec![
                             crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&AAtom::Eq(i.clone(), j.clone()))),
@@ -2034,10 +2078,10 @@ impl<'ctx> Reduction<'ctx> {
                     }
                     AAtom::Less(_, _) => {
                         // Less on non-node terms — keep as formula.
-                        if !self.sys.formulas.contains(&g)
-                            && !self.sys.solved_formulas.contains(&g) {
+                        if !crate::guarded::stores_contains(&self.sys.formulas, &g)
+                            && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.formulas.push(g);
+                            self.sys.formulas.push(std::sync::Arc::new(g));
                             self.changed = ChangeIndicator::Changed;
                         }
                     }
@@ -2048,9 +2092,9 @@ impl<'ctx> Reduction<'ctx> {
                         // HS-faithful: only mark when called from top-level
                         // (`mark=True`), mirroring `markAsSolved = when mark
                         // ...` (Reduction.hs:491).
-                        if mark && !self.sys.solved_formulas.contains(&g) {
+                        if mark && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.solved_formulas.push(g.clone());
+                            self.sys.solved_formulas.push(std::sync::Arc::new(g.clone()));
                         }
                         let d = crate::guarded::Guarded::Disj(vec![
                             crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&AAtom::Less(i.clone(), j.clone()))),
@@ -2078,9 +2122,9 @@ impl<'ctx> Reduction<'ctx> {
                         // HS-faithful: only mark when called from top-level
                         // (`mark=True`), mirroring `markAsSolved = when mark
                         // ...` (Reduction.hs:491).
-                        if mark && !self.sys.solved_formulas.contains(&g) {
+                        if mark && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.solved_formulas.push(g.clone());
+                            self.sys.solved_formulas.push(std::sync::Arc::new(g.clone()));
                         }
                         let last_node = match &self.sys.last_atom {
                             Some(j) => j.clone(),
@@ -2122,9 +2166,9 @@ impl<'ctx> Reduction<'ctx> {
                         // HS-faithful: only mark when called from top-level
                         // (`mark=True`), mirroring `markAsSolved = when mark
                         // ...` (Reduction.hs:491).
-                        if mark && !self.sys.solved_formulas.contains(&g) {
+                        if mark && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.solved_formulas.push(g.clone());
+                            self.sys.solved_formulas.push(std::sync::Arc::new(g.clone()));
                         }
                         if let (Some(ts), Some(tb)) = (
                             crate::elaborate::term_to_lnterm(s),
@@ -2134,21 +2178,21 @@ impl<'ctx> Reduction<'ctx> {
                             if self.sys.subterm_store_mut().add_neg(ts, tb) {
                                 self.changed = ChangeIndicator::Changed;
                             }
-                        } else if !self.sys.formulas.contains(&g) {
+                        } else if !crate::guarded::stores_contains(&self.sys.formulas, &g) {
                             // Defensive fallback for terms our LNTerm
                             // conversion can't represent — keep visible
                             // as a formula rather than dropping.
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.formulas.push(g);
+                            self.sys.formulas.push(std::sync::Arc::new(g));
                             self.changed = ChangeIndicator::Changed;
                         }
                     }
                     _ => {
                         // Unhandled single-guard universal: keep in formulas.
-                        if !self.sys.formulas.contains(&g)
-                            && !self.sys.solved_formulas.contains(&g) {
+                        if !crate::guarded::stores_contains(&self.sys.formulas, &g)
+                            && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.formulas.push(g);
+                            self.sys.formulas.push(std::sync::Arc::new(g));
                             self.changed = ChangeIndicator::Changed;
                         }
                     }
@@ -2164,10 +2208,10 @@ impl<'ctx> Reduction<'ctx> {
                 // their universals into a dead store and the body
                 // never fires (Start_before_Loop &c. mistakenly
                 // reach Solved).
-                if !self.sys.formulas.contains(&g)
-                    && !self.sys.solved_formulas.contains(&g) {
+                if !crate::guarded::stores_contains(&self.sys.formulas, &g)
+                    && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                     self.sys.invalidate_max_var_idx_cache();
-                    self.sys.formulas.push(g);
+                    self.sys.formulas.push(std::sync::Arc::new(g));
                     self.changed = ChangeIndicator::Changed;
                 }
             }
@@ -2200,13 +2244,13 @@ impl<'ctx> Reduction<'ctx> {
         if let Goal::Disj(d) = g {
             use crate::guarded::Guarded;
             let f = Guarded::Disj(d.0.clone());
-            let pos = self.sys.formulas.iter().position(|x| x == &f);
+            let pos = self.sys.formulas.iter().position(|x| **x == f);
             if let Some(idx) = pos {
                 self.sys.invalidate_max_var_idx_cache();
                 self.sys.formulas.remove(idx);
-                if !self.sys.solved_formulas.contains(&f) {
+                if !crate::guarded::stores_contains(&self.sys.solved_formulas, &f) {
                     self.sys.invalidate_max_var_idx_cache();
-                    self.sys.solved_formulas.push(f);
+                    self.sys.solved_formulas.push(std::sync::Arc::new(f));
                 }
                 self.changed = ChangeIndicator::Changed;
             }
@@ -2320,8 +2364,10 @@ impl<'ctx> Reduction<'ctx> {
         if pending.is_empty() {
             return Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged));
         }
-        crate::constraint::solver::trace::trace_exec(
-            &format!("solveTermEqs n={}", pending.len()));
+        if crate::constraint::solver::trace::exec_enabled() {
+            crate::constraint::solver::trace::trace_exec(
+                &format!("solveTermEqs n={}", pending.len()));
+        }
 
         // Take eq_store out of self, mutate it, put it back, then
         // borrow Maude — this avoids overlapping borrows of self.
@@ -2350,10 +2396,9 @@ impl<'ctx> Reduction<'ctx> {
         // of `self.sys` ONCE here — mirroring HS's curried
         // `substCreatesNonNormalTerms hnd se` (Reduction.hs:944), which
         // captures `se` at the `simp` call and shares the walk across
-        // every candidate subst probed (see `SubstNfChecker`).  This
-        // replaces a former per-`do_simp` deep System clone + a
-        // per-candidate re-walk.  Gated on `has_reducible` so pair-only
-        // signatures pay nothing on this hot unification path.
+        // every candidate subst probed (see `SubstNfChecker`).  Gated on
+        // `has_reducible` so pair-only signatures pay nothing on this hot
+        // unification path.
         let nf_checker = has_reducible.then(||
             crate::constraint::solver::contradictions::SubstNfChecker::new(
                 &maude, &self.sys));
@@ -2622,11 +2667,7 @@ impl<'ctx> Reduction<'ctx> {
                 // sees the contradiction even if the caller `let _ = ...`s
                 // our result.  Mirrors Haskell's `contradictoryIf`
                 // (Reduction.hs:745) firing mzero on tag mismatch.
-                if !self.sys.eq_store.is_false() {
-                    let s = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
-                    self.sys.invalidate_max_var_idx_cache();
-                    self.sys.eq_store = std::sync::Arc::new(s.set_false());
-                }
+                self.set_eq_store_false();
                 return Ok(SolveOutcome::Contradictory);
             }
         }
@@ -2663,11 +2704,7 @@ impl<'ctx> Reduction<'ctx> {
         // Rule infos must match (rule names, intruder-info, etc.).
         for e in eqs {
             if e.lhs.info != e.rhs.info {
-                if !self.sys.eq_store.is_false() {
-                    let s = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
-                    self.sys.invalidate_max_var_idx_cache();
-                    self.sys.eq_store = std::sync::Arc::new(s.set_false());
-                }
+                self.set_eq_store_false();
                 return Ok(SolveOutcome::Contradictory);
             }
         }
@@ -2848,7 +2885,7 @@ impl<'ctx> Reduction<'ctx> {
         // duplicates are collapsed (HasFrees-based dedup not needed —
         // syntactic equality is sufficient for these sets).
         for f in &sys.solved_formulas {
-            if !self.sys.solved_formulas.contains(f) {
+            if !crate::guarded::stores_contains(&self.sys.solved_formulas, f) {
                 // Pure ADD (joinSets solved-formula merge under
                 // !contains): bump.
                 self.sys.bump_cache_guarded(f);
@@ -2856,7 +2893,7 @@ impl<'ctx> Reduction<'ctx> {
             }
         }
         for l in &sys.lemmas {
-            if !self.sys.lemmas.contains(l) {
+            if !crate::guarded::stores_contains(&self.sys.lemmas, l) {
                 self.sys.invalidate_max_var_idx_cache();
                 self.sys.lemmas.push(l.clone());
             }
@@ -2934,7 +2971,7 @@ impl<'ctx> Reduction<'ctx> {
         // cyclic-LessAtom checks miss the contradiction even though
         // the algebra is already incompatible.
         for f in &sys.formulas {
-            self.insert_formula(f.clone());
+            self.insert_formula(f.as_ref().clone());
         }
         // 8. setNodes (case_nodes ++ live_nodes).
         let mut all_nodes: Vec<_> = (*sys.nodes).clone();
@@ -3226,8 +3263,7 @@ fn dedup_preserve_order<T: PartialEq>(v: &mut Vec<T>) {
     // first-occurrence order).  Two-pointer in-place compaction: for each
     // candidate, keep it only if it differs from every already-kept
     // element in the prefix `v[..kept]`.  This is O(n^2) comparisons with
-    // no tail-shifting `Vec::remove`, vs the previous O(n^3) (quadratic
-    // scan × O(n) remove).  Requires only `T: PartialEq` (no Clone).
+    // no tail-shifting `Vec::remove`.  Requires only `T: PartialEq` (no Clone).
     let len = v.len();
     let mut kept = 0usize;
     for i in 0..len {
@@ -3288,7 +3324,8 @@ fn build_parser_subst_from_eq_store(
     // output-invisible: nothing output-bearing iterates it).  Iterate
     // `dom()` (borrowed keys, same BTreeMap order) instead of `to_list()`,
     // which deep-clones every `(var, term)` pair we never read.
-    let mut out = crate::guarded::VarSubst::with_capacity(subst.len());
+    let mut out = crate::guarded::VarSubst::with_capacity_and_hasher(
+        subst.len(), Default::default());
     for lv in subst.dom() {
         let final_term = lookup_chain(lv);
         // Identity mappings are no-ops; skip.
@@ -3296,7 +3333,8 @@ fn build_parser_subst_from_eq_store(
             if w == lv { continue; }
         }
         let term = crate::elaborate::lnterm_to_term(&final_term);
-        out.insert((lv.name.to_string(), lv.idx), term);
+        // `lv.name` is an interned `&'static str` — zero-alloc key.
+        out.insert((lv.name, lv.idx), term);
     }
     out
 }
@@ -3486,20 +3524,13 @@ fn premise_solving_rule_insts_with_constrs(
 /// shifted to `idx 1`) collide with the lemma's existential `A:Msg
 /// idx 1`, identifying them by structural equality and conflating
 /// downstream substitutions across what should be distinct variables.
-// `bounds_max`'s previous implementation walked the system using the
-// `HasFrees::for_each_free` trait method, which is declared with
-// `&mut dyn FnMut(&LVar)` — every node of every term takes a vtable
-// dispatch hit (~8.5% of CPU on the wireguard `--prove` profile).
-// `bounds_max` is also called recursively from many sites
-// (`Reduction::new`, `insert_goal_with_loop_flag`'s auto-decompose
-// loop, `solve_chain_goal`, etc.), magnifying the cost.
-//
-// This implementation uses specialised, statically-dispatched walkers
-// for the system's concrete types (`LVar` / `LNTerm` / `LNFact` /
-// `RuleACInst` / `Goal`).  The compiler inlines the recursion and
-// folds the per-node "is this idx larger than current max?" into a
-// register operation.  Semantically equivalent to the previous
-// HasFrees-based code.
+// Specialised, statically-dispatched walkers for the system's concrete
+// types (`LVar` / `LNTerm` / `LNFact` / `RuleACInst` / `Goal`): the
+// compiler inlines the recursion and folds the per-node "is this idx
+// larger?" check into a register op, avoiding the `&mut dyn FnMut(&LVar)`
+// vtable dispatch a generic `HasFrees::for_each_free` walk pays on every
+// node (~8.5% of CPU on the wireguard `--prove` profile; `bounds_max` is
+// hot — called many times per proof-step).
 #[inline(always)]
 fn bm_term(t: &tamarin_term::lterm::LNTerm, max: &mut u64) {
     use tamarin_term::term::Term;
@@ -4871,9 +4902,11 @@ impl<'ctx> Reduction<'ctx> {
                 _ => false,
             }
         };
-        crate::constraint::solver::trace::trace_exec(
-            &format!("exploitPrem FreshFact isFresh={}",
-                if is_fresh_var_or_lit { "True" } else { "False" }));
+        if crate::constraint::solver::trace::exec_enabled() {
+            crate::constraint::solver::trace::trace_exec(
+                &format!("exploitPrem FreshFact isFresh={}",
+                    if is_fresh_var_or_lit { "True" } else { "False" }));
+        }
         if !is_fresh_var_or_lit {
             let next_n = bounds_max(&self.sys).saturating_add(1);
             let n_var = tamarin_term::lterm::LVar::new(
@@ -5021,6 +5054,33 @@ impl<'ctx> Reduction<'ctx> {
     /// The XOR-coercion special case for `KU(t1 ⊕ t2 ⊕ ...)` is
     /// deferred — it produces multiple intruder-rule shapes that
     /// require partition enumeration we haven't ported.
+    ///
+    /// Collapse a computed `cases`/`case_counters` pair into a `GoalCases`
+    /// result, shared by the goal solvers whose fork loops end the same
+    /// way.  Empty ⇒ `Contradictory`.  Single case ⇒ adopt it in place
+    /// (`self.sys` swap + `reset_counter_to` to carry the branch's HS
+    /// FreshT counter forward) and return `LinearNamed(single_name)`.
+    /// Two or more ⇒ record `last_case_counters` and return `Cases`.
+    /// `single_name` is caller-supplied because it reaches stdout and is
+    /// the rule name at some sites but the case's own name at others.
+    fn finish_goal_cases(
+        &mut self,
+        cases: Vec<(String, System)>,
+        case_counters: Vec<u64>,
+        single_name: String,
+    ) -> GoalCases {
+        if cases.is_empty() { return GoalCases::Contradictory; }
+        if cases.len() == 1 {
+            self.sys = cases.into_iter().next().unwrap().1;
+            self.maude.reset_counter_to(case_counters[0]);
+            self.changed = ChangeIndicator::Changed;
+            return GoalCases::LinearNamed(single_name);
+        }
+        self.changed = ChangeIndicator::Changed;
+        self.last_case_counters = case_counters;
+        GoalCases::Cases(cases)
+    }
+
     pub fn solve_action_goal(
         &mut self,
         i: &crate::constraint::constraints::NodeId,
@@ -5121,22 +5181,12 @@ impl<'ctx> Reduction<'ctx> {
                         case_counters.push(branch_counter);
                     }
                 }
-                if cases.is_empty() { return GoalCases::Contradictory; }
-                if cases.len() == 1 {
-                    // Mutate in-place AND signal the case-name for
-                    // the printer.  Simplify-pass callers ignore the
-                    // return and look at `self.sys`; the proof-method
-                    // dispatcher emits `case <name>` + qed.
-                    self.sys = cases.into_iter().next().unwrap().1;
-                    // HS FreshT-threading — see the candidate-loop
-                    // single-case adoption below (task #16).
-                    self.maude.reset_counter_to(case_counters[0]);
-                    self.changed = ChangeIndicator::Changed;
-                    return GoalCases::LinearNamed(rule_name);
-                }
-                self.changed = ChangeIndicator::Changed;
-                self.last_case_counters = case_counters;
-                GoalCases::Cases(cases)
+                // Single-case adoption mutates `self.sys` in place and
+                // signals the case-name for the printer (`case <name>` +
+                // qed); simplify-pass callers ignore the return and look
+                // at `self.sys`.  HS FreshT-threading — see the
+                // candidate-loop single-case adoption below (task #16).
+                self.finish_goal_cases(cases, case_counters, rule_name)
             }
             None => {
                 // Source-case dispatch for KU action goals — mirrors
@@ -5724,27 +5774,17 @@ impl<'ctx> Reduction<'ctx> {
                 // across all candidate forks so any later allocation on this
                 // Reduction can't collide with a reserved rule-var range.
                 self.maude.ensure_above(counter_high_water.saturating_sub(1));
-                if cases.is_empty() { return GoalCases::Contradictory; }
-                if cases.len() == 1 {
-                    let (name, sys) = cases.into_iter().next().unwrap();
-                    self.sys = sys;
-                    // HS FreshT-threading (Reduction = StateT System (FreshT
-                    // (DisjT ...)), Reduction.hs:123): the continuation of the
-                    // adopted Disj branch carries the BRANCH's fresh counter —
-                    // rule import + exploitPrems + solveFactEqs draws — not the
-                    // outer counter that only saw the `freshen` reservation.
-                    // RS runs the branch work in a sub-Reduction with a
-                    // detached counter cell; `reset_counter_to` must carry
-                    // its final position forward so later draws in the
-                    // enclosing exec (e.g. insertImpliedFormulas' eq-store
-                    // simp fold draws) stay aligned with HS.
-                    self.maude.reset_counter_to(case_counters[0]);
-                    self.changed = ChangeIndicator::Changed;
-                    return GoalCases::LinearNamed(name);
-                }
-                self.changed = ChangeIndicator::Changed;
-                self.last_case_counters = case_counters;
-                GoalCases::Cases(cases)
+                // HS FreshT-threading (Reduction = StateT System (FreshT
+                // (DisjT ...)), Reduction.hs:123): single-case adoption
+                // carries the BRANCH's fresh counter — rule import +
+                // exploitPrems + solveFactEqs draws — forward via
+                // `reset_counter_to`, not the outer counter that only saw
+                // the `freshen` reservation, so later draws in the
+                // enclosing exec (e.g. insertImpliedFormulas' eq-store simp
+                // fold draws) stay aligned with HS.  Case name reaches
+                // stdout, hence passed explicitly.
+                let name = cases.first().map(|(n, _)| n.clone()).unwrap_or_default();
+                self.finish_goal_cases(cases, case_counters, name)
             }
         }
     }
@@ -6108,22 +6148,13 @@ impl<'ctx> Reduction<'ctx> {
         // high-water mark reached across all forks so any later allocation on
         // this Reduction can't collide with a reserved rule-var range.
         self.maude.ensure_above(counter_high_water.saturating_sub(1));
-        if cases.is_empty() { return GoalCases::Contradictory; }
-        if cases.len() == 1 {
-            let (name, sys) = cases.into_iter().next().unwrap();
-            self.sys = sys;
-            // HS FreshT-threading: the adopted branch's continuation
-            // carries the BRANCH's counter (labelNodeId + insertEdges +
-            // per-arm subst draws), not the outer counter that only saw
-            // the freshen reservation.  See `solve_action_goal`'s
-            // single-case adoption for the full rationale (task #16).
-            self.maude.reset_counter_to(case_counters[0]);
-            self.changed = ChangeIndicator::Changed;
-            return GoalCases::LinearNamed(name);
-        }
-        self.changed = ChangeIndicator::Changed;
-        self.last_case_counters = case_counters;
-        GoalCases::Cases(cases)
+        // HS FreshT-threading: single-case adoption carries the BRANCH's
+        // counter (labelNodeId + insertEdges + per-arm subst draws) forward,
+        // not the outer counter that only saw the freshen reservation.  See
+        // `solve_action_goal`'s single-case adoption for the full rationale
+        // (task #16).  Case name reaches stdout, hence passed explicitly.
+        let name = cases.first().map(|(n, _)| n.clone()).unwrap_or_default();
+        self.finish_goal_cases(cases, case_counters, name)
     }
 
     /// `solveChain` — direct port of Haskell's `Goals.solveChain`
@@ -6211,7 +6242,7 @@ impl<'ctx> Reduction<'ctx> {
                     && !illegal_coerce(p_rule, &fa_conc)
                 {
                     // HS-faithful `insertEdges` (Reduction.hs:278-281):
-                    // route through `insert_edge` so unification fires
+                    // route through `insert_edge_labeled` so unification fires
                     // BEFORE the edge enters sEdges.  Mirrors HS's
                     // `solveFactEqs SplitNow` + `modM sEdges` order.
                     let sys_clone = self.sys.clone();
@@ -6252,8 +6283,10 @@ impl<'ctx> Reduction<'ctx> {
                             if trace_chains {
                                 eprintln!("[RS-CHAIN] DIRECT {}", case_name);
                             }
-                            crate::constraint::solver::trace::trace_exec(
-                                &format!("solveChain DIRECT {}", case_name));
+                            if crate::constraint::solver::trace::exec_enabled() {
+                                crate::constraint::solver::trace::trace_exec(
+                                    &format!("solveChain DIRECT {}", case_name));
+                            }
                             all_cases.push((case_name.clone(), arm_sys));
                             all_case_counters.push(post_edge_counter);
                         }
@@ -6389,8 +6422,10 @@ impl<'ctx> Reduction<'ctx> {
                     if trace_chains {
                         eprintln!("[RS-CHAIN] UNION {}", case_name);
                     }
-                    crate::constraint::solver::trace::trace_exec(
-                        &format!("solveChain UNION {}", case_name));
+                    if crate::constraint::solver::trace::exec_enabled() {
+                        crate::constraint::solver::trace::trace_exec(
+                            &format!("solveChain UNION {}", case_name));
+                    }
                     all_cases.push((case_name.clone(), arm_sys));
                     all_case_counters.push(arm_counter);
                 }
@@ -6642,8 +6677,10 @@ impl<'ctx> Reduction<'ctx> {
                     if trace_chains {
                         eprintln!("[RS-CHAIN] EXTEND {} prem=PremIdx(0)", case_name);
                     }
-                    crate::constraint::solver::trace::trace_exec(
-                        &format!("solveChain EXTEND {}", case_name));
+                    if crate::constraint::solver::trace::exec_enabled() {
+                        crate::constraint::solver::trace::trace_exec(
+                            &format!("solveChain EXTEND {}", case_name));
+                    }
                     all_cases.push((case_name.clone(), arm_sys));
                     all_case_counters.push(arm_counter);
                 }
@@ -7165,7 +7202,7 @@ mod tests {
         ).expect("solve");
         r.subst_system();
         let bot = crate::guarded::gfalse();
-        assert!(r.sys.formulas.contains(&bot),
+        assert!(crate::guarded::stores_contains(&r.sys.formulas, &bot),
             "shape mismatch must push gfalse onto the formula list");
     }
 
@@ -7245,7 +7282,7 @@ mod tests {
         assert!(matches!(&out, GoalCases::LinearNamed(n) if n == "case_1"));
         // gtrue (Conj []) decomposes to solved_formulas — see
         // insert_formula_inner for the Conj arm.
-        assert!(r.sys.solved_formulas.contains(&f));
+        assert!(crate::guarded::stores_contains(&r.sys.solved_formulas, &f));
         assert!(r.sys.goals.iter().any(|(g, s)| matches!(g, Goal::Disj(_)) && s.solved));
     }
 
@@ -7261,8 +7298,8 @@ mod tests {
         match out {
             GoalCases::Cases(systems) => {
                 assert_eq!(systems.len(), 2);
-                assert!(systems[0].1.solved_formulas.contains(&f1));
-                assert!(systems[1].1.formulas.contains(&f2));
+                assert!(crate::guarded::stores_contains(&systems[0].1.solved_formulas, &f1));
+                assert!(crate::guarded::stores_contains(&systems[1].1.formulas, &f2));
                 for (_, s) in &systems {
                     assert!(s.goals.iter().any(|(g, st)| matches!(g, Goal::Disj(_)) && st.solved));
                 }
@@ -7316,14 +7353,11 @@ mod tests {
         assert!(r.sys.subterm_store.contradictory);
     }
 
-    /// Post-`90af50b7` (Root D fix): when the goal's existing node
-    /// already has the matching action, `solve_action_goal` emits
-    /// `GoalCases::LinearNamed(rule_case_name)` instead of bare
-    /// `Linear` — mirrors HS `solveAction`'s `Just ru -> ... return ru`
-    /// arm (Goals.hs) whose surrounding `showRuleCaseName <$>`
-    /// (Goals.hs:257) unconditionally emits the rule's case name.
-    /// The test was originally written for the pre-`90af50b7` bare-Linear
-    /// behaviour; we update the assertion to recognise `LinearNamed`.
+    /// When the goal's existing node already has the matching action,
+    /// `solve_action_goal` emits `GoalCases::LinearNamed(rule_case_name)`
+    /// rather than bare `Linear` — mirrors HS `solveAction`'s `Just ru ->
+    /// ... return ru` arm (Goals.hs) whose surrounding `showRuleCaseName
+    /// <$>` (Goals.hs:257) unconditionally emits the rule's case name.
     #[test]
     fn solve_action_goal_existing_node_with_action_is_linear_named() {
         let ctx = match ctx() { Some(c) => c, None => return };
@@ -7767,7 +7801,7 @@ mod tests {
             "precondition: solved_formulas starts empty");
         // mark=false (the Conj/Ex-body-recursion case).
         r.insert_formula_inner(g.clone(), false);
-        assert!(!r.sys.solved_formulas.contains(&g),
+        assert!(!crate::guarded::stores_contains(&r.sys.solved_formulas, &g),
             "mark=false MUST NOT push the negated-Less universal into \
              solved_formulas — HS `markAsSolved` is `when mark $ ...` \
              (Reduction.hs:491).  Pre-fix RS pushed unconditionally, \
@@ -7782,7 +7816,7 @@ mod tests {
         let g = neg_less_node_universal("i", "j");
         // mark=true (the top-level entrypoint).
         r.insert_formula_inner(g.clone(), true);
-        assert!(r.sys.solved_formulas.contains(&g),
+        assert!(crate::guarded::stores_contains(&r.sys.solved_formulas, &g),
             "mark=true (top-level `insert_formula`) MUST push the \
              negated-Less universal into solved_formulas — \
              HS `markAsSolved` fires (Reduction.hs:491).");

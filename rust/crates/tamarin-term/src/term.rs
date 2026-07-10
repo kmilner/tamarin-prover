@@ -114,8 +114,7 @@ impl<A: PartialOrd> PartialOrd for Term<A> {
 // `App` always hashes its symbol and children, never the `Arc` identity — so it
 // agrees with the content-based `Eq`.  No `HashMap`/`FastSet` keyed on `Term`
 // has an iteration order that reaches the prover output (the port is byte-
-// deterministic and these maps were run-randomised `std::HashMap`s before the
-// `FxHash` switch), so the concrete hash value is output-irrelevant.
+// deterministic), so the concrete hash value is output-irrelevant.
 impl<A: std::hash::Hash> std::hash::Hash for Term<A> {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {

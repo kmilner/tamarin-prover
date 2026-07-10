@@ -18,7 +18,7 @@ use common::*;
 // Haskell URL shape: /autoprove/idfs/0/False/proof/debug  (Bool is
 // capitalised — Yesod `PathPiece Bool` accepts ONLY `True`/`False`).
 //
-// The Rust port now matches that exactly:
+// The Rust port matches that exactly:
 //   - capital `True`/`False` → handler runs
 //   - anything else → 404 HTML (Haskell's behaviour)
 // See `parse_bool_path_piece` in `src/handlers/theory.rs`.

@@ -516,7 +516,7 @@ mod tests {
         // Each rule has shape `[ ] --[ !KU( <const> ) ]-> [ !KU( <const> ) ]`.
         // The action and conclusion fact must carry a 0-arity NoEq term
         // whose name is the canonical sym-string.  Crucially, it must
-        // NOT be a `Term::Lit(Lit::Var(_))` — that was the bug.
+        // NOT be a `Term::Lit(Lit::Var(_))`.
         for (label, rule, expected_name) in [
             ("c_one", c_one, ONE_SYM_STRING),
             ("c_DH_neutral", c_dh_neutral, DH_NEUTRAL_SYM_STRING),

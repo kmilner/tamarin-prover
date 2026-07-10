@@ -2,7 +2,7 @@
 # Diff the full canonicalized proof tree (Haskell vs Rust) for EVERY lemma
 # across the WHOLE corpus, print a per-lemma diff-line count, and a summary.
 #
-# Faster variant of the original (same output format / classification):
+# Cached, parallelised HS pipeline (same output format / classification):
 #   #1  HS canon CACHE keyed by (file-content-sha256, lemma, CACHE_VERSION).
 #       HS is canonical and its proof depends only on the .spthy file, so its
 #       canon tree is stable across RS-fix iterations -> on repeat runs HS is
@@ -34,8 +34,7 @@
 #   NO_HS_CACHE=1    disable the HS canon cache (always re-run HS)
 #   CACHE_VERSION=<n>  bump to invalidate the HS cache if HS *logic* ever changes
 #
-# Output (stdout): one line per lemma, then a SUMMARY block (identical format to
-# the original script).
+# Output (stdout): one line per lemma, then a SUMMARY block.
 set -uo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

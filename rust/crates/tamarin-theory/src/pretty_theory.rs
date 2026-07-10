@@ -1419,8 +1419,7 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1
         // HS trivial branch: `nest 2 (multiComment_ ["has exactly the trivial
         // AC variant"])` (ClosedTheory.hs:337-339).  In HtmlDoc mode this yields
         // an `hl_comment` span; in plain mode `multi_comment_` renders exactly
-        // `/* has exactly the trivial AC variant */` (single line at this width),
-        // byte-identical to the previous literal, so `--prove` is unchanged.
+        // `/* has exactly the trivial AC variant */` (single line at this width).
         out.push_str("  ");
         out.push_str(
             &crate::pretty_hpj::multi_comment_(&["has exactly the trivial AC variant"]).render(),
@@ -2161,117 +2160,6 @@ fn no_existential(g: &crate::guarded::Guarded) -> bool {
 }
 
 // =============================================================================
-// LNTerm rendering (for equations)
-// =============================================================================
-
-pub(crate) fn render_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
-    use tamarin_term::function_symbols::{AcSym, FunSym};
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    match t {
-        Term::Lit(Lit::Var(v)) => {
-            // `x.1`, `~k.2`, `$a`, `#i`, `%n` etc.  Maps `LSort` to
-            // the HS sort prefix.
-            let prefix = match v.sort {
-                tamarin_term::lterm::LSort::Pub => "$",
-                tamarin_term::lterm::LSort::Fresh => "~",
-                tamarin_term::lterm::LSort::Node => "#",
-                tamarin_term::lterm::LSort::Nat => "%",
-                tamarin_term::lterm::LSort::Msg => "",
-            };
-            if v.idx == 0 {
-                format!("{}{}", prefix, v.name)
-            } else {
-                format!("{}{}.{}", prefix, v.name, v.idx)
-            }
-        }
-        Term::Lit(Lit::Con(n)) => {
-            // HS-faithful constant rendering (Term/Term.hs::prettyTerm
-            // via the Show instance on `Name`): single-quoted literal
-            // with sort-prefix sigil.  `'g'`, `~'name'`, `%'n'`.
-            use tamarin_term::lterm::NameTag;
-            let prefix = match n.tag {
-                NameTag::Pub => "",
-                NameTag::Fresh => "~",
-                NameTag::Nat => "%",
-                NameTag::Node => "#",
-            };
-            format!("{}'{}'", prefix, n.id.0)
-        }
-        Term::App(FunSym::NoEq(sym), args) => {
-            let name = String::from_utf8_lossy(sym.name);
-            // Special-case `exp` → `<a>^<b>` (infix DH exponentiation).
-            // Mirrors HS `prettyTerm` (Term/Term.hs:274):
-            //   `FApp (NoEq s) [t1,t2] | s == expSym -> ppTerm t1 <> text "^" <> ppTerm t2`
-            if &*name == "exp" && args.len() == 2 {
-                return format!("{}^{}", render_lnterm(&args[0]), render_lnterm(&args[1]));
-            }
-            // Special-case `pair` → `<a, b, c, ...>` (right-nested pair
-            // chains flattened to n-ary tuple).  Mirrors HS `prettyTerm`
-            // (Term/Term.hs:277,292-293):
-            //   `FApp (NoEq s) _ | s == pairSym -> ppTerms ", " 1 "<" ">" (split t)`
-            //   `split (viewTerm2 -> FPair t1 t2) = t1 : split t2`
-            //   `split t                          = [t]`
-            if &*name == "pair" && args.len() == 2 {
-                let mut parts: Vec<String> = Vec::new();
-                parts.push(render_lnterm(&args[0]));
-                let mut tail = &args[1];
-                loop {
-                    match tail {
-                        Term::App(FunSym::NoEq(s2), a2)
-                            if a2.len() == 2 && &*String::from_utf8_lossy(s2.name) == "pair" =>
-                        {
-                            parts.push(render_lnterm(&a2[0]));
-                            tail = &a2[1];
-                        }
-                        _ => {
-                            parts.push(render_lnterm(tail));
-                            break;
-                        }
-                    }
-                }
-                return format!("<{}>", parts.join(", "));
-            }
-            let inner: Vec<String> = args.iter().map(render_lnterm).collect();
-            if inner.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}({})", name, inner.join(", "))
-            }
-        }
-        Term::App(FunSym::Ac(ac), args) => {
-            // HS `prettyTerm` (Term/Term.hs:273):
-            //   `FApp (AC o) ts -> ppTerms (ppACOp o) 1 "(" ")" ts`
-            // Note the `"("`/`")"` lead/finish — AC products always
-            // print fully parenthesised (e.g. `'g'^(~ekI*~ltkB)`).
-            let op = match ac {
-                AcSym::Mult => "*",
-                AcSym::Union => "++",
-                AcSym::NatPlus => "%+",
-                AcSym::Xor => "\u{2295}",
-            };
-            format!("({})", args.iter().map(render_lnterm).collect::<Vec<_>>().join(op))
-        }
-        Term::App(FunSym::C(sym), args) => {
-            // `C` is the commutative-builtin family — currently just `em`.
-            let name = match sym {
-                tamarin_term::function_symbols::CSym::EMap => "em",
-            };
-            let inner: Vec<String> = args.iter().map(render_lnterm).collect();
-            if inner.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}({})", name, inner.join(", "))
-            }
-        }
-        Term::App(FunSym::List, args) => {
-            let inner: Vec<String> = args.iter().map(render_lnterm).collect();
-            format!("LIST({})", inner.join(", "))
-        }
-    }
-}
-
-// =============================================================================
 // Proof body
 // =============================================================================
 
@@ -2445,13 +2333,11 @@ fn pp_step_doc(
         // Nothing))`) keeps the STRUCTURED `ProofMethod` (`SolveGoal goal`)
         // unchanged and re-renders it via `prettyProofMethod`
         // (ProofMethod.hs:1174) → `prettyGoal` (Constraints.hs:273-287),
-        // which RE-WRAPS the goal at the current `lineLength`/`ribbon`.  The
-        // earlier RS path kept the goal's VERBATIM text from the input
-        // `.spthy` file, so any wrapping the stored file carried (e.g. an
-        // `∃ #j.\n  (body)` break, or a fact arg-list broken before `)`)
-        // leaked into the output where HS reflows it inline.  We mirror HS by
-        // re-parsing the goal text into a structured Doc and laying it out
-        // through the same engine the live `SolveGoal` path uses.
+        // which RE-WRAPS the goal at the current `lineLength`/`ribbon`.  So
+        // the stored `.spthy` layout (e.g. an `∃ #j.\n  (body)` break, or a
+        // fact arg-list broken before `)`) must NOT be echoed verbatim: we
+        // re-parse the goal text into a structured Doc and lay it out through
+        // the same engine the live `SolveGoal` path uses, so HS reflows it inline.
         PM::RawSolve(raw) => raw_solve_to_doc(raw),
         // HS `prettyProofMethod` (ProofMethod.hs:1496-1499):
         //   Finished (Contradictory reason) ->
@@ -2604,8 +2490,8 @@ fn raw_goal_to_doc(raw: &str) -> crate::pretty_hpj::Doc {
         //    fsep $ punctuate "  ∥" (map (nest 1 . parens . prettyGuarded) gfs)`.
         // Re-parse each disjunct's text into a Guarded and route through the
         // same `disj_goal_to_doc` the live path uses.  If ANY disjunct fails
-        // to re-parse, fall back to verbatim (no structural loss vs the prior
-        // behaviour for the rare unparseable case).
+        // to re-parse, fall back to verbatim (the rare unparseable case then
+        // renders as stored).
         GoalSpec::Disj { .. } => {
             match parse_disjuncts_to_guarded(trimmed) {
                 Some(gfs) => pf::disj_goal_to_doc(&gfs),
@@ -2866,7 +2752,7 @@ fn pp_contradiction(c: &crate::constraint::solver::contradictions::Contradiction
         // → `"<m>" derived before and after "<v>"`.
         C::SuperfluousLearn(m, v) =>
             format!("\"{}\" derived before and after \"{}\"",
-                render_lnterm(m), render_node_id(v)),
+                tamarin_term::pretty::pretty_lnterm(m), render_node_id(v)),
         // HS: `NodeAfterLast (i,j) ->
         //        text $ "node " ++ show j ++ " after last node " ++ show i`
         // Note HS reverses the order: `j` first in the message, then `i`.

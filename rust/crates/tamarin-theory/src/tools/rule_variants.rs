@@ -553,8 +553,8 @@ pub fn abstract_rule_and_variants(
     //     removeRenamings $ normSubstVFresh' $
     //     composeVFresh vsubst abstractionSubst
     //
-    // We use the new `compose_vfresh` helper (mirrors HS's full pipeline:
-    // extendWithRenaming + freshToFreeAvoidingFast + compose + freeToFreshRaw).
+    // The `compose_vfresh` helper mirrors HS's full pipeline:
+    // extendWithRenaming + freshToFreeAvoidingFast + compose + freeToFreshRaw.
     // Without this, two variants whose Maude-back-conversion shapes
     // happen to collide end up with structurally-identical range vars
     // and collapse at perform_split (split_case ordering bug).

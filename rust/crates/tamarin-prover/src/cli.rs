@@ -620,9 +620,9 @@ impl Args {
     /// Default = `max(1, effective_processors())` — a 1:1
     /// workers:maudes ratio.  Lemma-level parallelism (B1) plus the
     /// within-lemma fan-out both draw Maude handles from this pool
-    /// concurrently, so a half-size pool (the previous `procs/2`
-    /// default) was frequently exhausted, forcing the fan-out to fall
-    /// back to the single shared subprocess (serialised IPC).  At 1:1 the
+    /// concurrently, so a half-size pool would be exhausted, forcing the
+    /// fan-out to fall back to the single shared subprocess (serialised
+    /// IPC).  At 1:1 the
     /// Maude-bound theories keep more queries in flight (gcm ~-8%,
     /// Yubikey ~-12% @16c; output-identical — Maude is stateless so pool
     /// size never affects results).  Costs ~30-100 MB per extra

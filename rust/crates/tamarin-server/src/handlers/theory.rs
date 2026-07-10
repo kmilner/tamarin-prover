@@ -80,7 +80,7 @@ pub async fn interactive_overview(
     // here regardless of the center path — otherwise a frame whose center
     // needs no proof state (help/edit/add/delete) would show `(0 cases)` and a
     // proto-only rule count.  Best-effort: a Maude failure leaves the counts
-    // as-is (same as before).
+    // as-is.
     let _ = state.store.ensure_proof_state(idx, &state.cfg.maude_path);
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
@@ -119,6 +119,19 @@ pub async fn theory_path_main(
     let title = title_for(&entry, &path);
     let body = theory_html::path_html(&entry, &path);
     json_resp::html(title, body).into_response()
+}
+
+/// Build the `overview/proof` redirect URL for lemma `lemma` at proof
+/// path `sub` under theory `idx`.  Percent-encodes the lemma segment
+/// and each sub segment via the shared `path_parse` helpers, matching
+/// Yesod `getUrlRender`.  `sub == &[]` yields the bare
+/// `.../overview/proof/<lemma>` root URL (`encode_sub_path(&[]) == ""`).
+fn overview_proof_url(idx: usize, lemma: &str, sub: &[String]) -> String {
+    let mut u = format!(
+        "/thy/trace/{}/overview/proof/{}",
+        idx, path_parse::url_path_escape(lemma));
+    u.push_str(&path_parse::encode_sub_path(sub));
+    u
 }
 
 /// Apply ranked method `method_nr` (1-based) at proof path `sub` in
@@ -229,10 +242,7 @@ fn apply_method_and_redirect(
         // fall back to the applied node if that invariant ever breaks.
         _ => (lemma.to_string(), sub.to_vec()),
     };
-    let mut url = format!(
-        "/thy/trace/{}/overview/proof/{}",
-        new_idx, path_parse::url_path_escape(&target_lemma));
-    url.push_str(&path_parse::encode_sub_path(&target_sub));
+    let url = overview_proof_url(new_idx, &target_lemma, &target_sub);
     json_resp::redirect(url)
 }
 
@@ -422,7 +432,7 @@ pub async fn source_(
     // HS renders the CLOSED theory, whose per-lemma proofs exist from
     // theory-close time.  RS materialises the proof state lazily, so
     // ensure it here (best-effort — a Maude failure falls back to the
-    // `by sorry` bodies, same as before).  Mirrors the framed-page
+    // `by sorry` bodies).  Mirrors the framed-page
     // handler's unconditional `ensure_proof_state`.
     let _ = state.store.ensure_proof_state(idx, &state.cfg.maude_path);
     let Some(entry) = state.store.get(idx) else {
@@ -633,16 +643,9 @@ pub async fn autoprove(
                         path_parse::TheoryPath::Proof { lemma, sub } => (lemma, sub),
                         _ => (lemma_name.clone(), Vec::new()),
                     };
-                    let mut u = format!(
-                        "/thy/trace/{}/overview/proof/{}",
-                        new_idx, path_parse::url_path_escape(&tl));
-                    u.push_str(&path_parse::encode_sub_path(&ts));
-                    u
+                    overview_proof_url(new_idx, &tl, &ts)
                 }
-                None => format!(
-                    "/thy/trace/{idx}/overview/proof/{lname}",
-                    idx = new_idx,
-                    lname = path_parse::url_path_escape(&lemma_name)),
+                None => overview_proof_url(new_idx, &lemma_name, &[]),
             };
             json_resp::redirect(redir).into_response()
         }
@@ -782,9 +785,8 @@ pub async fn autoprove_all(
                 }
                 Err(e) => {
                     // HS's fold would fail the whole `modifyTheory`; we
-                    // keep the remaining lemmas best-effort (matches the
-                    // previous RS behaviour of ignoring per-lemma
-                    // failures).
+                    // keep the remaining lemmas best-effort and
+                    // continue with the next lemma.
                     tracing::warn!(lemma = %lname, error = %e,
                         "autoproveAll: prove failed; lemma keeps prior tree");
                 }
@@ -806,18 +808,11 @@ pub async fn autoprove_all(
                 path_parse::TheoryPath::Proof { lemma, sub } => (lemma, sub),
                 _ => (last, Vec::new()),
             };
-            let mut u = format!(
-                "/thy/trace/{}/overview/proof/{}",
-                new_idx, path_parse::url_path_escape(&tl));
-            u.push_str(&path_parse::encode_sub_path(&ts));
-            u
+            overview_proof_url(new_idx, &tl, &ts)
         }
         // No lemmas at all: nothing to prove or point at.
         (_, None) => format!("/thy/trace/{}/overview/help", new_idx),
-        (None, Some(last)) => format!(
-            "/thy/trace/{idx}/overview/proof/{lname}",
-            idx = new_idx,
-            lname = path_parse::url_path_escape(&last)),
+        (None, Some(last)) => overview_proof_url(new_idx, &last, &[]),
     };
     json_resp::redirect(redir).into_response()
 }
@@ -861,10 +856,7 @@ pub async fn verify(
             // `apply_method_and_redirect` (this file): `url_path_escape`
             // on the lemma, `prefixWithUnderscore` + `url_path_escape`
             // on each sub segment.
-            let mut url = format!(
-                "/thy/trace/{}/overview/proof/{}",
-                idx, path_parse::url_path_escape(&lemma));
-            url.push_str(&path_parse::encode_sub_path(&sub));
+            let url = overview_proof_url(idx, &lemma, &sub);
             json_resp::redirect(url).into_response()
         }
         // Help-pane fallback: Haskell falls through to
@@ -1561,10 +1553,7 @@ pub async fn delete_step(
             // URL goes through Yesod `getUrlRender`; percent-encode each
             // segment via the shared helpers, identical to
             // `apply_method_and_redirect` (this file).
-            let mut url = format!(
-                "/thy/trace/{}/overview/proof/{}",
-                new_idx, path_parse::url_path_escape(lemma));
-            url.push_str(&path_parse::encode_sub_path(sub));
+            let url = overview_proof_url(new_idx, lemma, sub);
             json_resp::redirect(url).into_response()
         }
         _ => json_resp::alert("Can't delete the given theory path!")

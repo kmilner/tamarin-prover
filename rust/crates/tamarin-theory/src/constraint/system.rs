@@ -30,6 +30,33 @@ pub struct PrebuiltAdj {
     adj: std::collections::BTreeMap<NodeId, Vec<NodeId>>,
 }
 
+impl PrebuiltAdj {
+    /// The inner `rawLessRel` adjacency (`from -> [to]` successor lists).
+    /// Consumers that walk the relation directly (rather than through the
+    /// `always_before_with` BFS) take this `&BTreeMap` so a single build
+    /// feeds both query styles. The map is identical to the standalone
+    /// `rawLessRel` builders — same insertion sequence (less_atoms, edges,
+    /// unsolved Chain goals) into the same container.
+    pub(crate) fn map(&self) -> &std::collections::BTreeMap<NodeId, Vec<NodeId>> {
+        &self.adj
+    }
+}
+
+/// Probe-index type for [`System::add_less_indexed`]: maps each stored
+/// atom's `(smaller, larger)` pair (the identity key — `Eq`/`Ord LessAtom`
+/// ignore the reason, constraints.rs:88-92) to the FIRST `less_atoms` index
+/// carrying it.
+///
+/// The map is an *auxiliary* accelerator, not a container swap: the
+/// output-bearing `less_atoms` Vec (and its insertion order) is unchanged;
+/// only the dedup PROBE goes from O(n) to O(1).  Deliberately NOT a `System`
+/// field — a resident index would need invalidation on every `less_atoms`
+/// mutation path; instead a caller running many inserts against a
+/// stable-between-inserts Vec builds one with [`System::build_less_index`]
+/// and passes it by `&mut`.
+pub type LessIndex = tamarin_utils::FastMap<
+    (tamarin_term::lterm::LVar, tamarin_term::lterm::LVar), usize>;
+
 // =============================================================================
 // Source kind / side annotations
 // =============================================================================
@@ -78,12 +105,24 @@ pub struct System {
     /// `i < j` constraints with reason tags.
     pub less_atoms: Vec<LessAtom>,
     /// Open formula obligations (lemma negations, restrictions, etc.).
-    pub formulas: Vec<Guarded>,
-    /// Already-solved formulas (for memoisation).
-    pub solved_formulas: Vec<Guarded>,
+    ///
+    /// Each element is wrapped in `Arc` for per-element copy-on-write
+    /// structural sharing: cloning a `System` (at every proof-branch /
+    /// source-case fork) clones a `Vec` of refcounts instead of
+    /// deep-copying every `Guarded` tree.  The `Vec` itself is owned per
+    /// `System` (no whole-store `make_mut`); a formula is replaced
+    /// wholesale (`*slot = Arc::new(new_f)`), so an unchanged formula
+    /// keeps its shared `Arc` across a fork.  `Arc<Guarded>`'s
+    /// `PartialEq` forwards to the inner `Guarded` (content comparison,
+    /// not pointer identity), so dedup / `==` semantics are preserved.
+    pub formulas: Vec<Arc<Guarded>>,
+    /// Already-solved formulas (for memoisation).  Per-element `Arc` —
+    /// see `formulas`.
+    pub solved_formulas: Vec<Arc<Guarded>>,
     /// Lemmas / safety assumptions added by `insert_lemma` (mirrors
     /// Haskell's `sLemmas`). These are treated as known-true.
-    pub lemmas: Vec<Guarded>,
+    /// Per-element `Arc` — see `formulas`.
+    pub lemmas: Vec<Arc<Guarded>>,
     /// Last-atom constraint, e.g. `last(i)` — at most one per system.
     pub last_atom: Option<NodeId>,
     /// Equation store.
@@ -128,7 +167,8 @@ pub struct System {
     /// cases).  Matching Haskell's runtime behaviour eliminates the
     /// spurious `case case_1`/`case case_2` Disj-decomposition steps
     /// that appear in our proof trees for ~10 corpus lemmas.
-    pub sources_lemma_universals: Vec<Guarded>,
+    /// Per-element `Arc` — see `formulas`.
+    pub sources_lemma_universals: Vec<Arc<Guarded>>,
     /// Cached max free-var idx across the system.  `None` means
     /// "invalid — lazily recompute on next `bounds_max` call".
     /// Maintained incrementally on additive mutations and
@@ -656,6 +696,51 @@ impl System {
         }
     }
 
+    /// Build the pair→first-index probe map over the current `less_atoms`.
+    /// `entry().or_insert(i)` records the FIRST index per pair, reproducing
+    /// `iter_mut().find`'s first-match choice even in the (non-occurring in
+    /// practice — `add_less` is the sole dedup path) case of duplicate
+    /// pairs.  `LVar` is interned, so each key clone is a pointer copy.
+    pub fn build_less_index(&self) -> LessIndex {
+        let mut idx: LessIndex = tamarin_utils::FastMap::default();
+        for (i, la) in self.less_atoms.iter().enumerate() {
+            idx.entry((la.smaller.clone(), la.larger.clone())).or_insert(i);
+        }
+        idx
+    }
+
+    /// O(1) indexed twin of [`add_less`](Self::add_less) for hot insertion
+    /// loops (`enforce_fresh_ordering_pass`) that probe the same `less_atoms`
+    /// Vec many times per pass.  Semantically identical to `add_less`, using
+    /// `idx` (built once via [`build_less_index`]) as the dedup probe instead
+    /// of the linear `iter_mut().find`:
+    ///   * HIT (pair already present) — overwrite the stored atom IN PLACE at
+    ///     its first-match index, preserving position and last-wins reason
+    ///     (identical to `add_less`'s `*existing = l`); length unchanged.
+    ///   * MISS — bump the var-idx cache, push, and record the new index.
+    ///
+    /// Returns `true` iff a new atom was pushed (Vec length grew), so the
+    /// caller can set `changed`/`red.changed` exactly as
+    /// [`Reduction::insert_less`](crate::constraint::solver::reduction) does
+    /// via its length compare.  Keeps `idx` coherent with the Vec; the caller
+    /// must ensure no OTHER path mutates `less_atoms` between the build and
+    /// the last indexed insert (within `enforce_fresh_ordering_pass` the only
+    /// mutators are these calls — Maude unifiability queries are read-only).
+    pub fn add_less_indexed(&mut self, l: LessAtom, idx: &mut LessIndex) -> bool {
+        let key = (l.smaller.clone(), l.larger.clone());
+        if let Some(&pos) = idx.get(&key) {
+            self.less_atoms[pos] = l;
+            false
+        } else {
+            self.bump_cache_lvar(&l.smaller);
+            self.bump_cache_lvar(&l.larger);
+            let pos = self.less_atoms.len();
+            self.less_atoms.push(l);
+            idx.insert(key, pos);
+            true
+        }
+    }
+
     /// Build the `alwaysBefore` adjacency map (`rawLessRel`) underpinning
     /// `alwaysBefore i j` ("True iff `i < j` in every model of the
     /// system"), mirroring Haskell's `Theory.Constraint.System.alwaysBefore`.
@@ -737,9 +822,9 @@ impl System {
                 for item in items { self.insert_lemma(item); }
             }
             other => {
-                if !self.lemmas.contains(&other) {
+                if !crate::guarded::stores_contains(&self.lemmas, &other) {
                     self.bump_cache_guarded(&other);
-                    self.lemmas.push(other);
+                    self.lemmas.push(Arc::new(other));
                 }
             }
         }
@@ -747,6 +832,20 @@ impl System {
 
     pub fn insert_lemmas(&mut self, ls: Vec<Guarded>) {
         for l in ls { self.insert_lemma(l); }
+    }
+
+    /// Direct port of Haskell `isInitialSystem` (`System.hs:828`):
+    ///   isInitialSystem sys =
+    ///     null (get sSolvedFormulas sys) && not (member bot (get sFormulas sys))
+    /// where `bot = gfalse()`.  Two conditions: no solved formulas yet, and no
+    /// gfalse in the formula set.  This is the gate the automatic-search path
+    /// (`rankProofMethods`, ProofMethod.hs:527) uses to decide whether
+    /// `insertInduction` runs — NOT the stricter replay-only `canApplyInduction`
+    /// (ProofMethod.hs:264-270), which additionally checks node/goal emptiness
+    /// and omits the gfalse check.
+    pub fn is_initial(&self) -> bool {
+        self.solved_formulas.is_empty()
+            && !crate::guarded::stores_contains(&self.formulas, &crate::guarded::gfalse())
     }
 }
 
@@ -794,7 +893,7 @@ pub fn formula_to_system(
     let mut conj_items = vec![gf1];
     conj_items.extend(other_restrictions);
     let gf2 = gconj(conj_items);
-    sys.formulas.push(gf2);
+    sys.formulas.push(Arc::new(gf2));
     // Safety restrictions are added as known-true lemmas.
     sys.insert_lemmas(safety);
     sys
@@ -839,8 +938,8 @@ mod tests {
         let l2 = crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&Atom::Last(mkvar("j"))));
         s.insert_lemma(crate::guarded::Guarded::Conj(vec![l1.clone(), l2.clone()]));
         assert_eq!(s.lemmas.len(), 2);
-        assert!(s.lemmas.contains(&l1));
-        assert!(s.lemmas.contains(&l2));
+        assert!(crate::guarded::stores_contains(&s.lemmas, &l1));
+        assert!(crate::guarded::stores_contains(&s.lemmas, &l2));
     }
 
     #[test]
@@ -856,7 +955,7 @@ mod tests {
         );
         // ExistsTrace ⇒ formula kept as-is.
         assert_eq!(sys.formulas.len(), 1);
-        assert_eq!(sys.formulas[0], f);
+        assert_eq!(*sys.formulas[0], f);
     }
 
     #[test]
@@ -872,7 +971,7 @@ mod tests {
             &f,
         );
         assert_eq!(sys.formulas.len(), 1);
-        assert_eq!(sys.formulas[0], crate::guarded::gfalse());
+        assert_eq!(*sys.formulas[0], crate::guarded::gfalse());
     }
 
     #[test]
@@ -897,6 +996,6 @@ mod tests {
         // gtrue is `Conj []` which `insert_lemma` flattens to nothing
         // (no items inside the empty conjunction). gfalse stays.
         // Lemmas should contain at least the gfalse non-conj entry.
-        assert!(sys.lemmas.contains(&crate::guarded::gfalse()));
+        assert!(crate::guarded::stores_contains(&sys.lemmas, &crate::guarded::gfalse()));
     }
 }

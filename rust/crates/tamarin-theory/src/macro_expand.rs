@@ -142,16 +142,65 @@ pub(crate) fn subst_term_by_name(t: &p::Term, subst: &BTreeMap<String, p::Term>)
     }
 }
 
+/// Shared structural walker: rebuild a fact, mapping `g` over every arg.
+/// The single traversal shape behind `apply_macros_fact`,
+/// `elaborate::canonicalize_ac_in_pfact`, and `elaborate::rewrite_arity1_fact`
+/// (each supplies its own leaf `&Term -> Term`).
+pub(crate) fn map_fact_terms(f: &p::Fact, g: &dyn Fn(&p::Term) -> p::Term) -> p::Fact {
+    p::Fact {
+        persistent: f.persistent,
+        name: f.name.clone(),
+        args: f.args.iter().map(g).collect(),
+        annotations: f.annotations.clone(),
+    }
+}
+
+/// Shared structural walker: rebuild an atom, mapping `g` over every term and
+/// `map_fact_terms` over embedded facts.  See [`map_fact_terms`].
+pub(crate) fn map_atom_terms(a: &p::Atom, g: &dyn Fn(&p::Term) -> p::Term) -> p::Atom {
+    use p::Atom::*;
+    match a {
+        Eq(x, y) => Eq(g(x), g(y)),
+        Less(x, y) => Less(g(x), g(y)),
+        LessMset(x, y) => LessMset(g(x), g(y)),
+        Subterm(x, y) => Subterm(g(x), g(y)),
+        Action(f, t) => Action(map_fact_terms(f, g), g(t)),
+        Last(t) => Last(g(t)),
+        Pred(f) => Pred(map_fact_terms(f, g)),
+    }
+}
+
+/// Shared structural walker: rebuild a formula, mapping `g` over every leaf
+/// term while cloning quantifier `VarSpec`s unchanged.  See [`map_fact_terms`].
+pub(crate) fn map_formula_terms(f: &p::Formula, g: &dyn Fn(&p::Term) -> p::Term) -> p::Formula {
+    use p::Formula::*;
+    match f {
+        False => False,
+        True => True,
+        Atom(a) => Atom(map_atom_terms(a, g)),
+        Not(x) => Not(Box::new(map_formula_terms(x, g))),
+        And(x, y) => And(
+            Box::new(map_formula_terms(x, g)),
+            Box::new(map_formula_terms(y, g))),
+        Or(x, y) => Or(
+            Box::new(map_formula_terms(x, g)),
+            Box::new(map_formula_terms(y, g))),
+        Implies(x, y) => Implies(
+            Box::new(map_formula_terms(x, g)),
+            Box::new(map_formula_terms(y, g))),
+        Iff(x, y) => Iff(
+            Box::new(map_formula_terms(x, g)),
+            Box::new(map_formula_terms(y, g))),
+        Forall(vs, x) => Forall(vs.clone(), Box::new(map_formula_terms(x, g))),
+        Exists(vs, x) => Exists(vs.clone(), Box::new(map_formula_terms(x, g))),
+    }
+}
+
 /// Apply macros to every term in a fact.  Mirrors HS `applyMacroInFact`
 /// (Fact.hs:301-303 `applyMacroInFact mcs (Fact tag annot terms) =
 /// Fact tag annot (map (applyMacros mcs) terms)`).
 pub fn apply_macros_fact(macros: &[p::Macro], f: &p::Fact) -> p::Fact {
-    p::Fact {
-        persistent: f.persistent,
-        name: f.name.clone(),
-        args: f.args.iter().map(|a| apply_macros_term(macros, a)).collect(),
-        annotations: f.annotations.clone(),
-    }
+    map_fact_terms(f, &|t| apply_macros_term(macros, t))
 }
 
 /// Apply macros to every term in a formula.  Mirrors HS
@@ -163,62 +212,7 @@ pub fn apply_macros_fact(macros: &[p::Macro], f: &p::Fact) -> p::Fact {
 /// variable in the surrounding formula can ever be a param (the macro
 /// definition is independent of the use site).
 pub fn apply_macros_formula(macros: &[p::Macro], f: &p::Formula) -> p::Formula {
-    match f {
-        p::Formula::True | p::Formula::False => f.clone(),
-        p::Formula::Atom(a) => p::Formula::Atom(apply_macros_atom(macros, a)),
-        p::Formula::Not(g) => p::Formula::Not(Box::new(apply_macros_formula(macros, g))),
-        p::Formula::And(a, b) => p::Formula::And(
-            Box::new(apply_macros_formula(macros, a)),
-            Box::new(apply_macros_formula(macros, b)),
-        ),
-        p::Formula::Or(a, b) => p::Formula::Or(
-            Box::new(apply_macros_formula(macros, a)),
-            Box::new(apply_macros_formula(macros, b)),
-        ),
-        p::Formula::Implies(a, b) => p::Formula::Implies(
-            Box::new(apply_macros_formula(macros, a)),
-            Box::new(apply_macros_formula(macros, b)),
-        ),
-        p::Formula::Iff(a, b) => p::Formula::Iff(
-            Box::new(apply_macros_formula(macros, a)),
-            Box::new(apply_macros_formula(macros, b)),
-        ),
-        p::Formula::Forall(vs, body) => p::Formula::Forall(
-            vs.clone(),
-            Box::new(apply_macros_formula(macros, body)),
-        ),
-        p::Formula::Exists(vs, body) => p::Formula::Exists(
-            vs.clone(),
-            Box::new(apply_macros_formula(macros, body)),
-        ),
-    }
-}
-
-fn apply_macros_atom(macros: &[p::Macro], a: &p::Atom) -> p::Atom {
-    match a {
-        p::Atom::Eq(s, t) => p::Atom::Eq(
-            apply_macros_term(macros, s),
-            apply_macros_term(macros, t),
-        ),
-        p::Atom::Less(s, t) => p::Atom::Less(
-            apply_macros_term(macros, s),
-            apply_macros_term(macros, t),
-        ),
-        p::Atom::LessMset(s, t) => p::Atom::LessMset(
-            apply_macros_term(macros, s),
-            apply_macros_term(macros, t),
-        ),
-        p::Atom::Subterm(s, t) => p::Atom::Subterm(
-            apply_macros_term(macros, s),
-            apply_macros_term(macros, t),
-        ),
-        p::Atom::Action(fact, t) => p::Atom::Action(
-            apply_macros_fact(macros, fact),
-            apply_macros_term(macros, t),
-        ),
-        p::Atom::Last(t) => p::Atom::Last(apply_macros_term(macros, t)),
-        p::Atom::Pred(fact) => p::Atom::Pred(apply_macros_fact(macros, fact)),
-    }
+    map_formula_terms(f, &|t| apply_macros_term(macros, t))
 }
 
 /// Apply macros to all items in a theory.  Mirrors HS's call-sites:

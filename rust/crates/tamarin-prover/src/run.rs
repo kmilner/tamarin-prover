@@ -438,6 +438,37 @@ fn macro_expanded_clone(parsed: &tamarin_parser::ast::Theory) -> tamarin_parser:
     t
 }
 
+/// Canonical HS wellformedness check-order (Wellformedness.hs check list).
+/// Each ordered-splice call site below passes a SUFFIX of this list as its
+/// `later_topics`: since `insert_report_before` only tests membership, a
+/// suffix contains exactly the topics that sort AFTER the check being
+/// inserted.  One source of truth avoids four in-sync literal lists that
+/// would silently mis-order a single report on a typo.
+const WF_TOPIC_ORDER: &[&str] = &[
+    "Reserved names",
+    "Special facts",
+    "Fr facts must only use a fresh- or a msg-variable",
+    "Fact arity issues",
+    "Fact multiplicity issues",
+    "Fact capitalization issues",
+    "Facts occur in the left-hand-side but not in any right-hand-side ",
+    "Unbound variables",
+    "Formula terms",
+    " Formula guardedness",
+    "Lemma annotations",
+    "Multiplication restriction of rules",
+    "Nat Sorts",
+    "Subterm Convergence Warning",
+    "Message Derivation Checks",
+    "Derivation Checks",
+];
+
+// First `WF_TOPIC_ORDER` index whose topic sorts after each splicing check.
+const WF_AFTER_VARIANTS: usize = 0; // ruleVariantsReport → before factReports
+const WF_AFTER_FACT_LHS: usize = 8; // "Formula terms"
+const WF_AFTER_CHECK_TERMS: usize = 9; // " Formula guardedness"
+const WF_AFTER_CHECK_GUARDED: usize = 10; // "Lemma annotations"
+
 /// Splice `new` WF errors into `wf_report` just before the first existing
 /// entry whose topic is in `later_topics` (the HS check-order position), or
 /// at the end if none match.  Extracted from the four ordered-splice call
@@ -606,9 +637,15 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // HS emits this trace marker as soon as the theory parses
         // (TheoryLoader.hs:409).  `--parse-only` and `--quiet` skip it.
         let theory_name = parsed.name.clone();
-        if !args.quiet && !args.parse_only {
-            eprintln!("[Theory {}] Theory loaded", theory_name);
-        }
+        // HS `[Theory X] …` progress markers go to stderr and are suppressed
+        // by `--quiet` / `--parse-only`.  Route all of them through one guard
+        // so the suppression rule lives in a single place.
+        let marker = |msg: &str| {
+            if !args.quiet && !args.parse_only {
+                eprintln!("[Theory {}] {}", theory_name, msg);
+            }
+        };
+        marker("Theory loaded");
 
         // Wellformedness checks — mirrors HS `checkWellformedness`
         // (`Theory.Tools.Wellformedness:1270`).  Runs on every file
@@ -683,9 +720,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 
         // HS emits this marker after `translateTheory` finishes
         // (TheoryLoader.hs:454).
-        if !args.quiet && !args.parse_only {
-            eprintln!("[Theory {}] Theory translated", theory_name);
-        }
+        marker("Theory translated");
 
         // Port of HS `formulaReports.checkTerms` (Wellformedness.hs:960-985,
         // "Formula terms" topic).  This check needs the elaborated `MaudeSig`
@@ -703,12 +738,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         {
             let term_errors = tamarin_theory::check_terms::check_terms_wf(
                 &parsed_for_wf, &maude_sig);
-            insert_report_before(&mut wf_report, term_errors, &[
-                " Formula guardedness",
-                "Lemma annotations", "Multiplication restriction of rules",
-                "Nat Sorts", "Subterm Convergence Warning",
-                "Message Derivation Checks", "Derivation Checks",
-            ]);
+            insert_report_before(&mut wf_report, term_errors,
+                &WF_TOPIC_ORDER[WF_AFTER_CHECK_TERMS..]);
         }
 
         // Port of HS `formulaReports.checkGuarded` (Wellformedness.hs:988-1004):
@@ -738,11 +769,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             // matches HS: Formula guardedness (8c) before Lemma
             // annotations (9).  Find the first index of a topic that
             // comes after position 8 in HS's check order.
-            insert_report_before(&mut wf_report, guard_errors, &[
-                "Lemma annotations", "Multiplication restriction of rules",
-                "Nat Sorts", "Subterm Convergence Warning",
-                "Message Derivation Checks", "Derivation Checks",
-            ]);
+            insert_report_before(&mut wf_report, guard_errors,
+                &WF_TOPIC_ORDER[WF_AFTER_CHECK_GUARDED..]);
         }
 
         // SAPIC `process:` translation (HS `typeTheory` → `translate`,
@@ -802,12 +830,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             let lhs_rhs = tamarin_parser::wf::fact_lhs_occur_no_rhs(&post_thy);
             // Insert at the factReports position (after fact_usage, before
             // formulaReports), matching HS check order.
-            insert_report_before(&mut wf_report, lhs_rhs, &[
-                "Formula terms", " Formula guardedness",
-                "Lemma annotations", "Multiplication restriction of rules",
-                "Nat Sorts", "Subterm Convergence Warning",
-                "Message Derivation Checks", "Derivation Checks",
-            ]);
+            insert_report_before(&mut wf_report, lhs_rhs,
+                &WF_TOPIC_ORDER[WF_AFTER_FACT_LHS..]);
         }
 
         // Spawn a single Maude handle for this file.  Used by:
@@ -990,17 +1014,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 
             // HS position 6: ruleVariantsReport comes BEFORE factReports
             // (position 7).  Insert before factReports items.
-            insert_report_before(&mut wf_report, variants_errors, &[
-                "Reserved names", "Special facts",
-                "Fr facts must only use a fresh- or a msg-variable",
-                "Fact arity issues", "Fact multiplicity issues",
-                "Fact capitalization issues",
-                "Facts occur in the left-hand-side but not in any right-hand-side ",
-                "Unbound variables", "Formula terms", " Formula guardedness",
-                "Lemma annotations", "Multiplication restriction of rules",
-                "Nat Sorts", "Subterm Convergence Warning",
-                "Message Derivation Checks", "Derivation Checks",
-            ]);
+            insert_report_before(&mut wf_report, variants_errors,
+                &WF_TOPIC_ORDER[WF_AFTER_VARIANTS..]);
 
             // HS closeProtoRule (Rule.hs:97-98): `ClosedProtoRule ruE <$>
             // maybeToList (variantsProtoRule hnd ruE)` — a rule with NO
@@ -1054,18 +1069,14 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         if deriv_timeout > 0 {
             // HS emits these markers around the per-variable derivability
             // check (TheoryLoader.hs:485, :498).
-            if !args.quiet && !args.parse_only {
-                eprintln!("[Theory {}] Derivation checks started", theory_name);
-            }
+            marker("Derivation checks started");
             if let Some(m) = file_maude.as_ref() {
                 let extra = tamarin_theory::deriv_check::check_message_derivation(
                     &parsed, m, deriv_timeout,
                 );
                 wf_report.extend(extra);
             }
-            if !args.quiet && !args.parse_only {
-                eprintln!("[Theory {}] Derivation checks ended", theory_name);
-            }
+            marker("Derivation checks ended");
         }
 
         // Decide which lemmas to prove.  Without --prove, HS still runs
@@ -1187,9 +1198,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             // marker here (before the prove loop) to match HS's observable
             // stderr order.  The no-prove / precompute-only paths (which skip
             // the prove loop) emit it below instead.
-            if !args.quiet && !args.parse_only {
-                eprintln!("[Theory {}] Theory closed", theory_name);
-            }
+            marker("Theory closed");
 
             let run_lemma = |l: &tamarin_theory::theory::Lemma<_>|
                 -> (tamarin_theory::pretty_theory::ProvedLemma, LemmaResult) {
@@ -1340,9 +1349,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // (TheoryLoader.hs:596).  In prove mode it is emitted before the
         // prove loop (above); here it covers only the no-prove /
         // precompute-only paths, which skip that loop.
-        if !args.quiet && !args.parse_only
-            && (args.precompute_only || (!prove_anything && !any_stored_proof)) {
-            eprintln!("[Theory {}] Theory closed", theory_name);
+        if args.precompute_only || (!prove_anything && !any_stored_proof) {
+            marker("Theory closed");
         }
 
         // Build the HS-faithful theory pretty-print body.  This replaces

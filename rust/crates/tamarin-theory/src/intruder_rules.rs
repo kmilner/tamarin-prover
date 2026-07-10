@@ -213,7 +213,7 @@ pub fn destruction_rules(
                     // traversing an AC operator index exactly as Haskell.
                     // `pos` is the (valid) walked LHS position, so the
                     // lookup is `Some`; on the impossible invalid case fall
-                    // back to `lhs` (the old non-AC helper's behaviour),
+                    // back to `lhs`,
                     // keeping the boolean unchanged rather than panicking.
                     let at = tamarin_term::positions::at_pos(lhs, pos)
                         .unwrap_or_else(|| lhs.clone());
@@ -355,10 +355,8 @@ fn private_constructor_rules(
         let sym = NoEqSym::new(s.clone(), 0, Privacy::Private, Constructability::Constructor);
         let m: LNTerm = Term::App(FunSym::NoEq(sym), Vec::<LNTerm>::new().into());
         let concfact = ku_fact(m);
-        let mut name = b"_".to_vec();
-        name.extend_from_slice(&s);
         Rule::new(
-            IntrRuleACInfo::ConstrRule(name),
+            intr_constr_info(&s),
             vec![],
             vec![concfact.clone()],
             vec![concfact],
@@ -492,8 +490,7 @@ pub fn multiset_intruder_rules() -> Vec<IntrRuleAC> {
     let x_var = var_term(LVar::new("x", LSort::Msg, 0));
     let y_var = var_term(LVar::new("y", LSort::Msg, 0));
     let xy_union = Term::App(FunSym::Ac(AcSym::Union), vec![x_var.clone(), y_var.clone()].into());
-    let mut name = b"_".to_vec();
-    name.extend_from_slice(UNION_SYM_STRING);
+    let name = underscore_prefixed(UNION_SYM_STRING);
     let d_rule = Rule::new(
         IntrRuleACInfo::DestrRule(name.clone(), 0, true, false),
         vec![kd_fact(xy_union.clone())],
@@ -552,8 +549,7 @@ pub fn xor_intruder_rules() -> Vec<IntrRuleAC> {
     let x_xor_y = xor2(x.clone(), y.clone());
     let x_xor_z = xor2(x.clone(), z.clone());
     let y_xor_z = xor2(y.clone(), z.clone());
-    let mut name = b"_".to_vec();
-    name.extend_from_slice(XOR_SYM_STRING);
+    let name = underscore_prefixed(XOR_SYM_STRING);
 
     // Rule 1: KD(x⊕y) ∧ KU(y⊕z) → KD(x⊕z)
     // HS: mkDXorRule [x, y] [y, z] x_xor_z
@@ -588,8 +584,7 @@ pub fn xor_intruder_rules() -> Vec<IntrRuleAC> {
     let zero_sym = NoEqSym::new(ZERO_SYM_STRING.to_vec(), 0,
         Privacy::Public, Constructability::Constructor);
     let zero_term: LNTerm = Term::App(FunSym::NoEq(zero_sym), Vec::<LNTerm>::new().into());
-    let mut zero_name = b"_".to_vec();
-    zero_name.extend_from_slice(ZERO_SYM_STRING);
+    let zero_name = underscore_prefixed(ZERO_SYM_STRING);
     let zero_rule = {
         let mut r = Rule::new(
             IntrRuleACInfo::ConstrRule(zero_name),
@@ -643,9 +638,7 @@ pub fn construction_rules(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<IntrRu
         let conc = ku_fact(m.clone());
         let act = ku_fact(m);
         // Encode the constructor name in the IntrRuleACInfo.
-        let mut name = b"_".to_vec();
-        name.extend_from_slice(s.name);
-        let info = IntrRuleACInfo::ConstrRule(name);
+        let info = intr_constr_info(s.name);
         out.push(Rule::new(info, prems, vec![conc], vec![act]));
     }
     out
@@ -878,6 +871,9 @@ fn variants_intruder_with(
     // restrict to the packed free vars.  This is the
     // `computeVariants (fAppList ruleTerms)` list that `minimizeVariants`
     // is applied to.
+    // `restrict` key-set is loop-invariant (`packed_frees` never mutates), so
+    // materialise the `Vec<LVar>` once rather than per variant subst.
+    let packed_frees_vec: Vec<LVar> = packed_frees.iter().cloned().collect();
     let cleaned: Vec<LNSubstVFresh> = raw_substs
         .into_iter()
         .map(|pairs| {
@@ -889,8 +885,8 @@ fn variants_intruder_with(
             // each entry whose image is a bare fresh Var with no other role in
             // the substitution's range (`isRenamedVar`, SubstVFresh.hs:140-145).
             // RS's `maude.variants()` does NOT clean (the proving caller
-            // `compute_rule_variants_for_rule` cleans it itself,
-            // rule_variants.rs:485), so we clean here to match HS.  The IDENTITY
+            // `abstract_rule_and_variants` cleans it itself,
+            // tools/rule_variants.rs:548), so we clean here to match HS.  The IDENTITY
             // variant Maude returns for the `inv`/`exp` destructors is
             // `x0 --> #1` (a fresh witness); `removeRenamings` collapses it to
             // the EMPTY subst, so `freshToFreeAvoiding {}` is the identity and
@@ -901,7 +897,7 @@ fn variants_intruder_with(
             // +1 `d_exp`) that over-produce 53 rules instead of HS's 51.
             LNSubstVFresh::from_list(pairs)
                 .remove_renamings()
-                .restrict(&packed_frees.iter().cloned().collect::<Vec<_>>())
+                .restrict(&packed_frees_vec)
         })
         .collect();
 
@@ -1213,11 +1209,16 @@ pub(crate) fn norm_rule(
 // `bp_intruder_rules` (these are inline HS `where`-helpers, not distinct HS
 // functions, so a single Rust definition serves both generators).
 
+/// `append (pack "_") xSymString` — the intruder-rule name-mangling primitive.
+fn underscore_prefixed(sym: &[u8]) -> Vec<u8> {
+    let mut n = b"_".to_vec();
+    n.extend_from_slice(sym);
+    n
+}
+
 /// `ConstrRule (append (pack "_") xSymString)`.
 fn intr_constr_info(sym: &[u8]) -> IntrRuleACInfo {
-    let mut name = b"_".to_vec();
-    name.extend_from_slice(sym);
-    IntrRuleACInfo::ConstrRule(name)
+    IntrRuleACInfo::ConstrRule(underscore_prefixed(sym))
 }
 
 /// `DestrRule (append (pack "_") xSymString) 0 True False` (IntruderRules.hs:243-244).
@@ -1227,9 +1228,7 @@ fn intr_constr_info(sym: &[u8]) -> IntrRuleACInfo {
 /// convergent-eq destructors for which the budget is irrelevant
 /// (variantsIntruder will expand them).
 fn intr_destr_info(sym: &[u8]) -> IntrRuleACInfo {
-    let mut name = b"_".to_vec();
-    name.extend_from_slice(sym);
-    IntrRuleACInfo::DestrRule(name, 0, true, false)
+    IntrRuleACInfo::DestrRule(underscore_prefixed(sym), 0, true, false)
 }
 
 /// `return :: a -> [a]` — singleton-list action constructor (HS).

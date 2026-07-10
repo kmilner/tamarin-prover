@@ -521,7 +521,7 @@ pub fn fact_name_probe(goal: &crate::constraint::constraints::Goal) -> FactNameP
 }
 
 /// The set of `show`n LVars from `concat (map (checkFormula o) sFormulas)`.
-pub fn sys_reveal_shown(oracle_type: &str, formulas: &[Guarded]) -> Vec<String> {
+pub fn sys_reveal_shown(oracle_type: &str, formulas: &[std::sync::Arc<Guarded>]) -> Vec<String> {
     let mut out = Vec::new();
     for f in formulas {
         for v in check_formula(oracle_type, f) {

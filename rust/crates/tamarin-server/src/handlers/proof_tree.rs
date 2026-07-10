@@ -923,14 +923,28 @@ fn write_applicable_methods(
     out.push(format!(
         "<div class=\"preformatted methods\">{}</div>",
         method_blocks.join("\n\n")));
-    // Autoprove links — faithful port of HS `subProofSnippet`'s
-    // `autoProverLinks` (`Web/Theory.hs:547-591`), in HS order a, b, [o], s.
-    // Each `AutoProverR tidx cut bound oracleBool path` renders as
-    //   /thy/trace/<idx>/autoprove/<cut>/<bound>/<oracleBool>/<path>
-    // with cut ∈ {idfs=CutDFS, characterize=CutNothing}; `AutoProverAllR`
-    // omits the oracle flag.  `linkToPath` prepends the `internal-link`
-    // class (the gate sorts class tokens, so ordering is immaterial).
-    let l = url_path_escape(lemma);
+    // Autoprove menu links (a./b./[o.]/s.) — self-contained block.
+    write_autoprove_links(out, idx, &url_path_escape(lemma), url_path, ctx);
+}
+
+/// Emit the `a.`/`b.`/`[o.]`/`s.` autoprove menu links that trail the
+/// numbered method list — a faithful port of HS `subProofSnippet`'s
+/// `autoProverLinks` (`Web/Theory.hs:547-591`), in HS order a, b, [o], s.
+/// Each `AutoProverR tidx cut bound oracleBool path` renders as
+///   /thy/trace/<idx>/autoprove/<cut>/<bound>/<oracleBool>/<path>
+/// with cut ∈ {idfs=CutDFS, characterize=CutNothing}; `AutoProverAllR`
+/// omits the oracle flag.  `linkToPath` prepends the `internal-link`
+/// class (the gate sorts class tokens, so ordering is immaterial).
+/// `lemma_esc` is the already-`url_path_escape`d lemma segment.
+fn write_autoprove_links(
+    out: &mut Vec<String>,
+    idx: usize,
+    lemma_esc: &str,
+    url_path: &str,
+    ctx: &ProofContext,
+) {
+    use tamarin_theory::pretty_hpj as hpj;
+    let l = lemma_esc;
     let p = url_path;
     let bound = 5; // HS `fromMaybe 5 (apBound ti.autoProver)` — default depth bound.
     // HS `autoProverLinks` (Web/Theory.hs:557-591) wraps each link's visible

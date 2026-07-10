@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 
 use tamarin_utils::prelude_ext::nub_on;
+use crate::base_translation::{list_intersect, list_union};
 use tamarin_theory::sapic::{
     frees_sapic_fact, frees_sapic_term, pfold_map, GoodAnnotation, Process, ProcessCombinator,
     SapicAction, SapicLVar,
@@ -96,31 +97,6 @@ fn captured_variables_at<A: GoodAnnotation>(p: &Process<A, SapicLVar>) -> Vec<Sa
 /// some path and yields a `WFBoundTwice` warning.
 pub fn captured_variables<A: GoodAnnotation>(p: &Process<A, SapicLVar>) -> Vec<SapicLVar> {
     pfold_map(p, &mut captured_variables_at)
-}
-
-/// `Data.List.intersect xs ys`: keep every element of `xs` (in `xs`-order,
-/// duplicates preserved) that is an `Eq`-member of `ys`.  `SapicLVar`'s derived
-/// `Eq` (Theory/Sapic/Term.hs:65) compares the `LVar` (name+sort+idx) AND the
-/// optional type annotation, so this respects sort/type as HS does.
-fn list_intersect(xs: &[SapicLVar], ys: &[SapicLVar]) -> Vec<SapicLVar> {
-    xs.iter()
-        .filter(|x| ys.iter().any(|y| *x == y))
-        .cloned()
-        .collect()
-}
-
-/// `Data.List.union xs ys = xs ++ (nub ys \\ xs)` — append `ys`'s elements not
-/// already present (and not duplicated within the appended tail).  Used for
-/// membership only by [`captured_variables_at`], so order is irrelevant to the
-/// intersection result, but we port it faithfully for exactness.
-fn list_union(xs: &[SapicLVar], ys: &[SapicLVar]) -> Vec<SapicLVar> {
-    let mut out = xs.to_vec();
-    for y in ys {
-        if !xs.iter().any(|x| x == y) && !out[xs.len()..].iter().any(|o| o == y) {
-            out.push(y.clone());
-        }
-    }
-    out
 }
 
 /// HS `nub xs \\ S.toList drop`: keep the first occurrence of each variable

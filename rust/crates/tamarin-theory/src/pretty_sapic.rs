@@ -247,7 +247,7 @@ fn sapic_fact_to_doc(f: &crate::sapic::SapicLNFact) -> Doc {
     let lead = format!("{name}(");
     let arg_docs: Vec<Doc> = f.terms.iter().map(|t| sapic_term_to_doc(t, None)).collect();
     let body = hpj::fsep(hpj::punctuate(Doc::char(','), arg_docs));
-    nest_short_doc(&lead, ")", body)
+    hpj::nest_short_doc(&lead, ")", body)
 }
 
 /// The MSR `process="..."` attribute printer.  HS `prettyRuleAttribute`'s
@@ -303,15 +303,6 @@ fn render_msr(
         pp_facts_list(concls).nest(1),
     ]);
     render_sapic(doc)
-}
-
-/// HS `nestShort n lead finish body = sep [lead $$ nest n body, finish]`
-/// with `n = length lead + 1` (Class.hs:218-223).  Mirrors
-/// `pretty_formula::nest_short_doc`.
-fn nest_short_doc(lead: &str, finish: &str, body: Doc) -> Doc {
-    let n = lead.chars().count() as isize + 1;
-    let above = Doc::text(lead).above(body.nest(n));
-    hpj::sep(vec![above, Doc::text(finish)])
 }
 
 /// `prettySapicAction'` (Process.hs:450-469), linear subset.

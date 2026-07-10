@@ -180,7 +180,7 @@ fn from_rule_restriction(rname: &str, f: &p::Formula) -> (p::Restriction, p::Fac
     let action_args: Vec<p::Term> = rewr_frees
         .into_iter()
         .filter(|v| !is_var_now(v))
-        .map(|v| match subst.get(&var_key(&v)) {
+        .map(|v| match subst.get(&var_full_key(&v)) {
             Some(t) => t.clone(),
             None => p::Term::Var(v),
         })
@@ -432,11 +432,6 @@ fn rebuild_term(t: &p::Term, mut f: impl FnMut(&p::Term) -> p::Term) -> p::Term 
 /// Is this var the special `#NOW` timepoint (HS `varNow`)?
 fn is_var_now(v: &p::VarSpec) -> bool {
     v.name == "NOW" && matches!(v.sort, p::SortHint::Node) && v.idx == 0
-}
-
-/// Substitution key for a (fresh) var: `(name, idx)`.
-fn var_key(v: &p::VarSpec) -> (String, u64) {
-    (v.name.clone(), v.idx)
 }
 
 /// NOTE: unlike HS `freesList` (LTerm.hs = `D.toList . freesDList`)

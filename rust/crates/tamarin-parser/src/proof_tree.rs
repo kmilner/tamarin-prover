@@ -746,7 +746,7 @@ mod tests {
         // body-terminator `.` (followed by ws/EOF) ends the var list.
         assert_eq!(count_quant_vars("x y #i.1 #j."), 4);
         assert_eq!(count_quant_vars("t.5 x."), 2);
-        // Trailing dotted var is the case that was already correct.
+        // Trailing dotted var before the body terminator.
         assert_eq!(count_quant_vars("#t #t.1."), 2);
         // No dotted suffixes.
         assert_eq!(count_quant_vars("a b c."), 3);

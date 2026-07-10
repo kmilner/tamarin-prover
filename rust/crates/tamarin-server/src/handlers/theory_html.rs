@@ -228,7 +228,7 @@ fn lemma_index(out: &mut String, entry: &TheoryEntry,
     // entity-ESCAPED text (Html.hs:102-105).  `pretty_formula` alone kept
     // source operand order and never wrapped, so `++`-operand order and
     // the fcat break-spaces inside tuples/AC chains diverged (the alethea
-    // overview family, task #17).
+    // overview family).
     let canon = tamarin_theory::elaborate::canonicalize_ac_in_formula(&l.formula);
     // `nest 2 (sep [prettyTraceQuantifier tq, doubleQuotes (prettyLNFormula f)])`
     // — rendered under the active `HtmlDocGuard` (proof_state's), so operators

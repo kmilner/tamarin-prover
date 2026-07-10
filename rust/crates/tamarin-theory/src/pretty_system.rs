@@ -136,9 +136,9 @@ fn pretty_last(sys: &System) -> Doc {
 /// HS: `vsep $ map prettyGuarded $ S.toList` (System.hs:1677/1680/1682) —
 /// each formula is a real Doc (`guarded_doc`) and formulas are separated
 /// by a blank line (`vsep` = fold `$--$`).
-fn pretty_formula_set(items: &[Guarded]) -> Doc {
+fn pretty_formula_set(items: &[std::sync::Arc<Guarded>]) -> Doc {
     if items.is_empty() { return Doc::Empty; }
-    let mut sorted: Vec<&Guarded> = items.iter().collect();
+    let mut sorted: Vec<&Guarded> = items.iter().map(|f| f.as_ref()).collect();
     sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
     sorted.dedup_by(|a, b| crate::guarded::cmp_guarded(a, b) == std::cmp::Ordering::Equal);
     vsep_docs(sorted.into_iter().map(guarded_doc).collect())

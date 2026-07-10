@@ -104,12 +104,19 @@ struct TheoryStoreInner {
     by_idx: BTreeMap<usize, TheoryEntry>,
 }
 
+/// Next free store index: Haskell's `M.findMax + 1` (empty → 1).  Single
+/// spelling shared by `insert` and `clone_at_new_idx_with` so they cannot
+/// drift; `next_back()` is O(log n) (unlike `keys().last()`, which walks).
+fn next_free_idx(inner: &TheoryStoreInner) -> usize {
+    inner.by_idx.keys().next_back().map_or(1, |k| k + 1)
+}
+
 impl TheoryStore {
     /// Insert a new theory and return the freshly assigned index.
     pub fn insert(&self, mut entry: TheoryEntry) -> usize {
         let mut inner = self.inner.lock();
         // Match Haskell's `M.findMax + 1` (BTreeMap max key); empty → 1.
-        let idx = inner.by_idx.keys().next_back().map_or(1, |k| k + 1);
+        let idx = next_free_idx(&inner);
         entry.idx = idx;
         inner.by_idx.insert(idx, entry);
         idx
@@ -159,7 +166,7 @@ impl TheoryStore {
     ) -> Option<usize> {
         let mut inner = self.inner.lock();
         let mut clone = inner.by_idx.get(&src_idx).cloned()?;
-        let new_idx = inner.by_idx.keys().last().copied().unwrap_or(0) + 1;
+        let new_idx = next_free_idx(&inner);
         clone.idx = new_idx;
         clone.primary = false;
         clone.loaded_at = Local::now();

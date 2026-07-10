@@ -27,9 +27,13 @@ fn mark_contradictory_labeled(red: &mut Reduction, pass: &'static str) {
 /// HS's `tracePassPair` format.  Lets us count contradiction-firing per
 /// pass via `delta = enter - exit` (an exit MISSING means the pass
 /// mzero'd via contradictoryIfT in HS, or marked contradictory in Rust).
-fn trace_subpass<F: FnOnce(&mut Reduction) -> ChangeIndicator>(
+// Generic over the pass return type `R` (`ChangeIndicator` for the plain
+// passes, `Result<ChangeIndicator, T>` for the fan-out variant): the
+// dead-state bookkeeping never inspects the returned value, so the same
+// tracing shell serves both.
+fn trace_subpass<R, F: FnOnce(&mut Reduction) -> R>(
     label: &'static str, red: &mut Reduction, f: F,
-) -> ChangeIndicator {
+) -> R {
     // Tracing off (the default): skip the two `is_dead_for_trace` scans
     // entirely — they are only observed through the `&& on` guard below.
     if !tamarin_utils::env_gate!("TAM_RS_TRACE_SIMPLIFY") {
@@ -52,7 +56,7 @@ fn trace_subpass<F: FnOnce(&mut Reduction) -> ChangeIndicator>(
 fn is_dead_for_trace(red: &Reduction) -> bool {
     red.sys.eq_store.is_false()
         || red.sys.formulas.iter().any(|f|
-            matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()))
+            matches!(f.as_ref(), crate::guarded::Guarded::Disj(v) if v.is_empty()))
 }
 
 /// `simplifySystem` — run all non-case-splitting CR-rules to a fixpoint.
@@ -242,7 +246,7 @@ fn simplify_system_fan_out_inner(
             return fan_out_on_pending_eq_arms(red, ctx);
         }
         // solveUniqueActions — may fan out.
-        match trace_subpass_fan_out("solveUniqueActions", red, solve_unique_actions_pass_fan_out) {
+        match trace_subpass("solveUniqueActions", red, solve_unique_actions_pass_fan_out) {
             Ok(_c) => { /* no fan-out, continue */ }
             Err(case_systems) => {
                 // FAN-OUT: per HS, each case continues independently
@@ -352,25 +356,33 @@ fn install_pass_cases_arms(
     }
 }
 
-/// `trace_subpass` analog that lets the inner pass return a
-/// Result-typed value (Ok(ChangeIndicator) | Err(fan-out)).
-fn trace_subpass_fan_out<T, F>(
-    label: &'static str, red: &mut Reduction, f: F,
-) -> std::result::Result<ChangeIndicator, T>
-where
-    F: FnOnce(&mut Reduction) -> std::result::Result<ChangeIndicator, T>,
-{
-    if !tamarin_utils::env_gate!("TAM_RS_TRACE_SIMPLIFY") {
-        return f(red);
+/// Shared `SolveOutcome` dispatch for the uniqueness passes
+/// (`enforceFreshNodeUniqueness`, `enforceKuActionUniqueness`,
+/// `enforceKdFactUniqueness`).  Installs a multi-arm `Cases` result
+/// (arm[0] → eq-store, rest → `pending_eq_arms`; see
+/// `install_pass_cases_arms`) and funnels `Contradictory`/`Err` into
+/// `*hit_contra` — the mzero proxy, with each caller's
+/// `mark_contradictory` firing once at the end.  Returns whether the
+/// merge made progress (`true` for `Cases`/`Linear`, `false` for
+/// `Contradictory`/`Err`) so callers that track a `changed` flag can set
+/// it; the fresh/KD callers ignore the bool.
+fn absorb_solve_outcome<E>(
+    red: &mut Reduction,
+    res: std::result::Result<crate::constraint::solver::reduction::SolveOutcome, E>,
+    hit_contra: &mut bool,
+) -> bool {
+    match res {
+        Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
+        | Err(_) => {
+            *hit_contra = true;
+            false
+        }
+        Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) => {
+            install_pass_cases_arms(red, arms);
+            true
+        }
+        Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(_)) => true,
     }
-    eprintln!("[SUBPASS] enter {}", label);
-    let was_dead_before = is_dead_for_trace(red);
-    let r = f(red);
-    let dead_after = is_dead_for_trace(red);
-    if was_dead_before || !dead_after {
-        eprintln!("[SUBPASS] exit  {}", label);
-    }
-    r
 }
 
 /// Direct port of Haskell `addNonInjectiveFactInstances`
@@ -408,15 +420,8 @@ fn non_injective_fact_instances_pairs(
     if inj_tags.is_empty() { return out; }
 
     // Resolve node-id → rule via a once-built map instead of a linear
-    // `nodes.iter().find` per lookup.  `or_insert` keeps the FIRST rule
-    // for a given id, matching `find`'s first-match semantics.
-    let node_rule_map: tamarin_utils::FastMap<&NodeId, &crate::rule::RuleACInst> = {
-        let mut m = tamarin_utils::FastMap::default();
-        for (n, r) in sys.nodes.iter() {
-            m.entry(n).or_insert(r);
-        }
-        m
-    };
+    // `nodes.iter().find` per lookup (see `node_rule_map`).
+    let node_rule_map = node_rule_map(sys);
     let lookup_node = |id: &NodeId| -> Option<&crate::rule::RuleACInst> {
         node_rule_map.get(id).copied()
     };
@@ -570,7 +575,7 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     // unchanged, so cloning every `Guarded` up-front (a deep recursive AST
     // clone) is wasted work.  Iteration order is preserved (same comparator,
     // same set), so the change list is byte-identical.
-    let mut formulas: Vec<&Guarded> = red.sys.formulas.iter().collect();
+    let mut formulas: Vec<&Guarded> = red.sys.formulas.iter().map(|f| f.as_ref()).collect();
     formulas.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
     // HS-faithful: `evalFormulaAtoms` builds a CHANGE LIST via
     // `applyChangeList`'s list comprehension (Simplify.hs) where
@@ -601,14 +606,7 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         // evaluation, replacing the per-call linear `sys.nodes` scans inside
         // `partial_atom_valuation_with`.  `sys.nodes` is unique-keyed, so the
         // map returns the identical rule the linear scan found.
-        let node_rule_map: std::collections::HashMap<
-            &crate::constraint::constraints::NodeId, &crate::rule::RuleACInst> = {
-            let mut m = std::collections::HashMap::new();
-            for (n, r) in red.sys.nodes.iter() {
-                m.entry(n).or_insert(r);
-            }
-            m
-        };
+        let node_rule_map = node_rule_map(&red.sys);
         let val = |a: &tamarin_parser::ast::Atom|
             partial_atom_valuation_with(&red.sys, &maude, &ab_adj, &node_rule_map, a);
         for fm in formulas.into_iter() {
@@ -657,10 +655,10 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         // vacuous Simplify step downstream where Haskell goes straight to
         // Solve (injectivity_check class).
         red.sys.invalidate_max_var_idx_cache();
-        red.sys.formulas.retain(|f| f != &fm);
-        if !red.sys.solved_formulas.contains(&fm) {
+        red.sys.formulas.retain(|f| **f != fm);
+        if !crate::guarded::stores_contains(&red.sys.solved_formulas, &fm) {
             red.sys.invalidate_max_var_idx_cache();
-            red.sys.solved_formulas.push(fm);
+            red.sys.solved_formulas.push(std::sync::Arc::new(fm));
         }
         // HS-faithful: `evalFormulaAtoms` (Simplify.hs) ALWAYS
         // calls `insertFormula fm'` regardless of whether `fm'` is gtrue,
@@ -711,11 +709,28 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
 /// via `ab_adj` — mirroring HS `partialAtomValuation`, which binds
 /// `before = alwaysBefore sys` ONCE in its `where` clause (Simplify.hs)
 /// rather than recomputing it per atom.
+/// Build the read-only `NodeId → &RuleACInst` index the uniqueness /
+/// atom-valuation passes use for `.get()` lookups, replacing a per-lookup
+/// linear `sys.nodes.iter().find`.  `or_insert` keeps the FIRST rule for a
+/// given id, matching `find`'s first-match semantics; `sys.nodes` is
+/// unique-keyed, so the map returns the identical rule the linear scan
+/// found.
+fn node_rule_map(
+    sys: &crate::constraint::system::System,
+) -> tamarin_utils::FastMap<
+    &crate::constraint::constraints::NodeId, &crate::rule::RuleACInst> {
+    let mut m = tamarin_utils::FastMap::default();
+    for (n, r) in sys.nodes.iter() {
+        m.entry(n).or_insert(r);
+    }
+    m
+}
+
 fn partial_atom_valuation_with(
     sys: &crate::constraint::system::System,
     maude: &tamarin_term::maude_proc::MaudeHandle,
     ab_adj: &crate::constraint::system::PrebuiltAdj,
-    node_rule: &std::collections::HashMap<
+    node_rule: &tamarin_utils::FastMap<
         &crate::constraint::constraints::NodeId, &crate::rule::RuleACInst>,
     atom: &tamarin_parser::ast::Atom,
 ) -> Option<bool> {
@@ -1044,17 +1059,17 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // (Guarded Ord ascending) — Simplify.hs:
     //   clause <- (S.toList $ get sFormulas sys) ++
     //             (S.toList $ get sLemmas sys)
-    let mut sorted_universals_src: Vec<&Guarded> = red.sys.formulas.iter().collect();
+    let mut sorted_universals_src: Vec<&Guarded> = red.sys.formulas.iter().map(|f| f.as_ref()).collect();
     sorted_universals_src.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
-    let mut sorted_lemmas_src: Vec<&Guarded> = red.sys.lemmas.iter().collect();
+    let mut sorted_lemmas_src: Vec<&Guarded> = red.sys.lemmas.iter().map(|f| f.as_ref()).collect();
     sorted_lemmas_src.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
-    let universals: Vec<(Guarded, Vec<tamarin_parser::ast::VarSpec>,
+    let universals: Vec<(Vec<tamarin_parser::ast::VarSpec>,
                          Vec<AAtom>, Guarded)> = sorted_universals_src.iter()
         .chain(sorted_lemmas_src.iter())
         .copied()
         .filter_map(|f| match f {
             Guarded::GGuarded { qua: Quant::All, vars, guards, body } => {
-                if skip_sources && red.sys.sources_lemma_universals.contains(f) {
+                if skip_sources && crate::guarded::stores_contains(&red.sys.sources_lemma_universals, f) {
                     return None;
                 }
                 // openGuarded: fresh-allocate LVars in HS lexical order,
@@ -1078,7 +1093,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
                     })
                     .collect();
                 let new_body = crate::guarded::subst_bound_guarded(body, &open_s);
-                Some((f.clone(), xs, new_guards, new_body))
+                Some((xs, new_guards, new_body))
             }
             _ => None,
         })
@@ -1127,16 +1142,25 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
 
     let maude = red.ctx.maude.clone();
     let mut new_formulas: Vec<Guarded> = Vec::new();
+    // Canon keys of the accepted candidates, threaded across every universal in
+    // lock-step with `new_formulas` (`try_match_all_guards` pushes to both).
+    // Owning it here (instead of recomputing `out.iter().map(canon)` on entry to
+    // each `try_match_all_guards`) computes each candidate's canon ONCE — the
+    // pushed value is byte-identical to a recompute because the push uses the
+    // same `implied_apply_canon_cow`.
+    let mut new_formulas_canon: Vec<crate::guarded::Guarded> = Vec::new();
     // Canon keys of the existing formulas, computed ONCE for the whole pass:
     // `red.sys.formulas`/`solved_formulas` are not mutated inside the loop
     // (only the local `new_formulas` grows; `red.insert_formula` runs after),
     // so these are loop-invariant.  Hoisting them out turns the dedup canon
-    // cost from O(universals · |formulas|) to O(|formulas|).
-    let existing_formulas_canon: Vec<crate::guarded::Guarded> =
-        red.sys.formulas.iter().map(implied_apply_canon).collect();
-    let existing_solved_canon: Vec<crate::guarded::Guarded> =
-        red.sys.solved_formulas.iter().map(implied_apply_canon).collect();
-    for (_orig, vars, guards, body) in &universals {
+    // cost from O(universals · |formulas|) to O(|formulas|).  Held as `Cow`
+    // borrowing `red.sys.formulas`: an already-canonical formula is borrowed
+    // (zero clone), and dedup compares by content either way.
+    let existing_formulas_canon: Vec<std::borrow::Cow<crate::guarded::Guarded>> =
+        red.sys.formulas.iter().map(|f| implied_apply_canon_cow(f)).collect();
+    let existing_solved_canon: Vec<std::borrow::Cow<crate::guarded::Guarded>> =
+        red.sys.solved_formulas.iter().map(|f| implied_apply_canon_cow(f)).collect();
+    for (vars, guards, body) in &universals {
         // Mirrors Haskell's `impliedFormulas`'s `prepare` partition
         // (`System.hs:1124-1126`): Action and Eq atoms drive matching,
         // everything else is carried as a non-Action precondition.
@@ -1183,7 +1207,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
             &red.sys.formulas, &existing_formulas_canon,
             &red.sys.solved_formulas, &existing_solved_canon,
             &other_guards,
-            &mut new_formulas,
+            &mut new_formulas, &mut new_formulas_canon,
         );
     }
     if new_formulas.is_empty() { return ChangeIndicator::Unchanged; }
@@ -1231,27 +1255,40 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
 }
 
 /// Canonicalising key for implied-formula dedup: witness LVars `~mw#N → ~mw#0`,
-/// bound LVars normalised, then AC `BinOp` permutations re-sorted.  Two formulas
-/// that differ only by Maude witness idxs / AC argument order compare equal
-/// under `==` after this.  MUST mirror the per-candidate canonicalisation used
-/// in `try_match_all_guards::rec` for `implied` (the dedup compares the two), so
-/// keep this and that site in lock-step.  Hoisted to a free fn so the existing
-/// formulas' canons can be precomputed ONCE per `try_match_all_guards` call
-/// rather than recomputed for every candidate (the dedup was O(candidates ×
-/// |existing|) deep canonicalisations; now O(candidates + |existing|)).
-fn implied_apply_canon(f: &crate::guarded::Guarded) -> crate::guarded::Guarded {
-    // `normalize_bound_lvars` is currently an identity clone (the DeBruijn
-    // bound-var invariant already holds for formulas reaching dedup), so we skip
-    // it here and at the lock-step `apply_canon` closure below — saving one full
-    // `Guarded` deep clone per canonicalisation.  Byte-inert while that fn stays
-    // identity (the parity gate verifies); the two sites MUST stay in lock-step.
-    let f1 = crate::guarded::normalize_witness_lvars(f);
-    let f2 = crate::guarded::canonicalize_ac_in_guarded_cow(&f1).unwrap_or(f1);
-    // Compare in stored normal form (HS 150f5eba: insertImpliedFormulas
-    // normalises derived instances before the membership pre-check) — a
-    // raw duplicate-carrying candidate must match its normalised stored
-    // twin, or the pass re-fires it every simplifier iteration.
-    crate::guarded::normalise_stored_formula_owned(f2)
+/// bound LVars normalised, then AC `BinOp` permutations re-sorted, then stored
+/// normal form.  This is the SINGLE source of the dedup canon — the existing/
+/// threaded canon vectors and the per-candidate site both call it, so they cannot
+/// drift out of lock-step.  Each of the three stages reuses its borrowed input
+/// when the transform is a structural no-op, so an already-canonical formula
+/// pays zero clones — the dedup only materialises (`into_owned`) a survivor.
+///
+/// `normalize_bound_lvars` is currently an identity clone (the DeBruijn
+/// bound-var invariant already holds for formulas reaching dedup), so it is
+/// skipped here — byte-inert while that fn stays identity (the parity gate
+/// verifies).
+///
+/// Comparison is in stored normal form (HS 150f5eba: `insertImpliedFormulas`
+/// normalises derived instances before the membership pre-check) — a raw
+/// duplicate-carrying candidate must match its normalised stored twin, or the
+/// pass re-fires it every simplifier iteration.
+fn implied_apply_canon_cow(f: &crate::guarded::Guarded)
+    -> std::borrow::Cow<'_, crate::guarded::Guarded>
+{
+    use std::borrow::Cow;
+    let f1: Cow<crate::guarded::Guarded> =
+        match crate::guarded::normalize_witness_lvars_cow(f) {
+            None => Cow::Borrowed(f),
+            Some(g) => Cow::Owned(g),
+        };
+    let f2: Cow<crate::guarded::Guarded> =
+        match crate::guarded::canonicalize_ac_in_guarded_cow(f1.as_ref()) {
+            None => f1,
+            Some(g) => Cow::Owned(g),
+        };
+    match crate::guarded::normalise_stored_formula_cow(f2.as_ref()) {
+        None => f2,
+        Some(g) => Cow::Owned(g),
+    }
 }
 
 /// Try every assignment of system actions to the universal's action
@@ -1263,18 +1300,22 @@ fn try_match_all_guards(
     action_guards: &[&tamarin_parser::ast::Atom],
     sys_actions: &[(crate::constraint::constraints::NodeId, crate::fact::LNFact)],
     body: &crate::guarded::Guarded,
-    existing_formulas: &[crate::guarded::Guarded],
+    existing_formulas: &[std::sync::Arc<crate::guarded::Guarded>],
     // Canon keys of `existing_formulas` / `existing_solved`, precomputed ONCE by
     // the caller (`insert_implied_formulas_pass`) and shared across every
     // universal — they depend only on `red.sys.formulas`/`solved_formulas`,
     // which the per-universal loop never mutates.  Shared across every
     // universal so canonicalisation runs O(|formulas|) times per pass, not
-    // O(universals · |formulas|).
-    existing_formulas_canon: &[crate::guarded::Guarded],
-    existing_solved: &[crate::guarded::Guarded],
-    existing_solved_canon: &[crate::guarded::Guarded],
+    // O(universals · |formulas|).  `Cow` so an already-canonical existing
+    // formula is borrowed (zero clone); dedup compares content either way.
+    existing_formulas_canon: &[std::borrow::Cow<crate::guarded::Guarded>],
+    existing_solved: &[std::sync::Arc<crate::guarded::Guarded>],
+    existing_solved_canon: &[std::borrow::Cow<crate::guarded::Guarded>],
     other_guards: &[&tamarin_parser::ast::Atom],
     out: &mut Vec<crate::guarded::Guarded>,
+    // Canon keys of accepted candidates, 1:1 with `out` and threaded across
+    // universals by the caller (so each candidate's canon is computed once).
+    out_canon: &mut Vec<crate::guarded::Guarded>,
 ) {
     use crate::guarded::{subst_guarded, subst_atom, VarSubst};
     use tamarin_parser::ast::Atom as AAtom;
@@ -1287,10 +1328,10 @@ fn try_match_all_guards(
         sys_actions: &[(crate::constraint::constraints::NodeId, crate::fact::LNFact)],
         acc: &VarSubst,
         body: &crate::guarded::Guarded,
-        existing_formulas: &[crate::guarded::Guarded],
-        existing_formulas_canon: &[crate::guarded::Guarded],
-        existing_solved: &[crate::guarded::Guarded],
-        existing_solved_canon: &[crate::guarded::Guarded],
+        existing_formulas: &[std::sync::Arc<crate::guarded::Guarded>],
+        existing_formulas_canon: &[std::borrow::Cow<crate::guarded::Guarded>],
+        existing_solved: &[std::sync::Arc<crate::guarded::Guarded>],
+        existing_solved_canon: &[std::borrow::Cow<crate::guarded::Guarded>],
         other_guards: &[&tamarin_parser::ast::Atom],
         out: &mut Vec<crate::guarded::Guarded>,
         out_canon: &mut Vec<crate::guarded::Guarded>,
@@ -1348,20 +1389,6 @@ fn try_match_all_guards(
             // dedup doesn't over-merge legitimately-distinct
             // implications (which would unsoundly drop typing
             // refinements on [sources] lemmas).
-            // Canonicalize via TWO normalizations:
-            //   (a) apply the current eq-store substitution, so vars
-            //       that have been unified to bigger terms (`pms →
-            //       h(...)` etc.) compare equal across iterations —
-            //       `subst_system` rewrites stored formulas at iter
-            //       start, so the freshly-generated implication has
-            //       to be brought to the same canonical form.
-            //   (b) rename witness LVars `~mw#N → ~mw#0`, since each
-            //       Maude unification mints a fresh witness idx.
-            // Mirrors `insert_formula_inner`'s Atom-branch
-            // dedup (`reduction.rs:715-720`).  Without applying (a),
-            // RFID_Simple loops forever in `insert_implied_formulas`
-            // because new implications never recognize that the same
-            // body (post-subst) already exists.
             // HS-faithful dedup: HS uses bare `Eq Guarded` (structural)
             // for the `S.member sFormulas` / `S.member sSolvedFormulas`
             // checks in `insertFormula`.  Two HS firings whose only
@@ -1385,43 +1412,25 @@ fn try_match_all_guards(
             // canonical form), whereas HS's bare structural `Eq` keeps
             // them apart — dedup here uses witness+bound normalisation
             // only.
-            let apply_canon = |f: &crate::guarded::Guarded| {
-                // Lock-step with `implied_apply_canon`: `normalize_bound_lvars`
-                // is an identity clone, so skip it (saves a `Guarded` deep clone
-                // per candidate).
-                let f1 = crate::guarded::normalize_witness_lvars(f);
-                // HS-faithful: collapse AC-`BinOp` permutations so two
-                // formulas that differ only by AC argument ordering
-                // (e.g. `Mult(ltkI, ekR)` vs `Mult(ekR, ltkI)`) compare
-                // equal under `==`.  HS stores formulas as LNTerm where
-                // every `mapFrees` re-sorts AC heads via `f_app_ac`; RS
-                // stores parser-AST `BinOp(op, l, r)` whose `subst_term`
-                // never re-sorts.  After `rename_precise_system` renumbers
-                // free vars (e.g. `ltkI.7 → ltkI.0`, `ekR.5 → ekR.0`), the
-                // LVar `Ord` (`idx`-first ⇒ `name`-only on ties) flips,
-                // leaving the stored formula's `BinOp` in a now-unsorted
-                // slot order — while a freshly built implied formula
-                // (lnterm_to_term of an `f_app_ac`-output) is in canonical
-                // sorted form.  Without this normalisation, dedup fails
-                // and `insertImpliedFormulas` adds a structurally-duplicate
-                // formula on every subsequent `simplifySystem` call,
-                // breaking idempotency (wireguard::key_secrecy: each call
-                // adds 1 RKeys-from-IKeys implication, RS emits an extra
-                // `simplify` proof-tree node where HS reports
-                // `Nothing` from the `sys' /= cleanup sys` guard).
-                let f2 = crate::guarded::canonicalize_ac_in_guarded_cow(&f1).unwrap_or(f1);
-                // Lock-step with `implied_apply_canon`: compare in stored
-                // normal form (HS 150f5eba pre-check normalisation).
-                crate::guarded::normalise_stored_formula_owned(f2)
-            };
-            let canon = apply_canon(&implied);
+            // Per-candidate canon via the shared `implied_apply_canon_cow` —
+            // guaranteed lock-step with the free `implied_apply_canon` used for
+            // the existing/threaded canon vectors (single source of truth).  It
+            // collapses AC-`BinOp` permutations (so `Mult(ltkI, ekR)` and
+            // `Mult(ekR, ltkI)` compare equal after `rename_precise_system`
+            // reorders the LVar `Ord`, matching a freshly built `f_app_ac`
+            // form — without which `insertImpliedFormulas` re-adds a duplicate
+            // every `simplifySystem` call, breaking idempotency:
+            // wireguard::key_secrecy) and compares in stored normal form
+            // (HS 150f5eba pre-check normalisation).  Held as `Cow` so an
+            // already-canonical candidate is borrowed until it survives dedup.
+            let canon = implied_apply_canon_cow(&implied);
             // TAM_RS_TRACE_FORM=1 also emits an `Impl-candidate` event
             // for every successful match BEFORE dedup — so the count
             // diffs against HS's [IMPL-FIRE] count reveal whether Rust's
             // matcher finds the same number of candidates HS finds.
             crate::constraint::solver::trace::trace_form(
                 "Impl-candidate",
-                &crate::constraint::solver::trace::guarded_repr(&implied));
+                || crate::constraint::solver::trace::guarded_repr(&implied));
             // Canonicalisation-based dedup is necessary in RS (vs HS's
             // bare `Eq Guarded`): RS's Maude unification draws witness
             // idxs from a GLOBAL atomic `fresh_counter` (maude_proc.rs),
@@ -1440,18 +1449,18 @@ fn try_match_all_guards(
             // Dedup against existing formulas using PRECOMPUTED canons (zipped
             // 1:1 with their source slices), so `apply_canon` runs once per
             // existing formula per pass instead of once per (existing × candidate).
-            // Identical result to the previous `apply_canon(f) == canon` — the
-            // `f == &implied` syntactic fast-path is preserved verbatim.
             let in_formulas = existing_formulas.iter().zip(existing_formulas_canon.iter())
-                .any(|(f, fc)| f == &implied || *fc == canon);
+                .any(|(f, fc)| f.as_ref() == &implied || fc.as_ref() == canon.as_ref());
             let in_solved = existing_solved.iter().zip(existing_solved_canon.iter())
-                .any(|(f, fc)| f == &implied || *fc == canon);
+                .any(|(f, fc)| f.as_ref() == &implied || fc.as_ref() == canon.as_ref());
             let in_out = out.iter().zip(out_canon.iter())
-                .any(|(f, fc)| f == &implied || *fc == canon);
+                .any(|(f, fc)| f == &implied || fc == canon.as_ref());
             let already = in_formulas || in_solved || in_out;
             if !already {
                 // Keep `out_canon` 1:1 with `out` so the `in_out` check above
-                // stays correct as `out` grows across candidates.
+                // stays correct as `out` grows across candidates.  Materialise
+                // the survivor's canon (`into_owned`) BEFORE moving `implied`.
+                let canon = canon.into_owned();
                 out.push(implied);
                 out_canon.push(canon);
             }
@@ -1631,13 +1640,14 @@ fn try_match_all_guards(
                 for struct_subst in candidates {
                     // Translate the LVar → LNTerm bindings back to a
                     // parser-AST VarSubst, restricted to universal vars.
-                    let mut subst_here = VarSubst::new();
+                    let mut subst_here = VarSubst::default();
                     for (lv, lt) in struct_subst {
                         if !vars.iter().any(|v| v.name == *lv.name && v.idx == lv.idx) {
                             continue;
                         }
                         let term = crate::elaborate::lnterm_to_term(&lt);
-                        subst_here.insert((lv.name.to_string(), lv.idx), term);
+                        // `lv.name` is an interned `&'static str` — zero-alloc key.
+                        subst_here.insert((lv.name, lv.idx), term);
                     }
                     let Some(combined) = combine_substs(acc, &subst_here) else { continue };
                     rec(maude, vars, guards, guard_idx + 1, sys_actions,
@@ -1650,14 +1660,12 @@ fn try_match_all_guards(
     }
 
     // `existing_formulas_canon` / `existing_solved_canon` arrive precomputed
-    // from the caller (loop-invariant across universals).  Only `out_canon`
-    // (the canon of accepted candidates) is per-call, since `out` grows here;
-    // `rec` pushes each accepted candidate's canon in lock-step with `out`.
-    let mut out_canon: Vec<crate::guarded::Guarded> =
-        out.iter().map(implied_apply_canon).collect();
+    // from the caller (loop-invariant across universals).  `out_canon` likewise
+    // arrives from the caller, threaded across universals in lock-step with `out`
+    // (`rec` pushes each accepted candidate's canon), so it is never recomputed.
     rec(maude, vars, action_guards, 0, sys_actions,
-        &VarSubst::new(), body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
-        other_guards, out, &mut out_canon);
+        &VarSubst::default(), body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
+        other_guards, out, out_canon);
 }
 
 /// Combine two substitutions. If they map the same key to different
@@ -1670,7 +1678,7 @@ fn combine_substs(
     for (k, v) in b {
         match out.get(k) {
             Some(existing) if existing != v => return None,
-            _ => { out.insert(k.clone(), v.clone()); }
+            _ => { out.insert(*k, v.clone()); }
         }
     }
     Some(out)
@@ -1885,7 +1893,7 @@ fn match_atom_via_maude(
 ) -> Vec<crate::guarded::VarSubst> {
     use crate::guarded::VarSubst;
     use tamarin_parser::ast::Term as ATerm;
-    let mut base_subst = VarSubst::new();
+    let mut base_subst = VarSubst::default();
 
     // Time variable.  HS's `matchAction` (Guarded.hs:805-807) matches
     // the time node `i1 matchWith i2` ALONGSIDE the fact — the time is
@@ -1918,7 +1926,7 @@ fn match_atom_via_maude(
             sort: tamarin_parser::ast::SortHint::Node,
             typ: None,
         });
-        base_subst.insert((g_t.name.clone(), g_t.idx), i_term);
+        base_subst.insert((tamarin_term::intern::intern_str(&g_t.name), g_t.idx), i_term);
     } else if !(g_t.name == *i.name && g_t.idx == i.idx) {
         // Bound (ground) time that is not this system node — no match.
         return Vec::new();
@@ -2052,16 +2060,13 @@ fn match_atom_via_maude(
                 continue;
             }
             let term = crate::elaborate::lnterm_to_term(&lt);
-            subst.insert((lv.name.to_string(), lv.idx), term);
+            // `lv.name` is an interned `&'static str` — zero-alloc key.
+            subst.insert((lv.name, lv.idx), term);
         }
         out.push(subst);
     }
     out
 }
-
-// Note: `match_atom_via_maude` runs a pure structural matcher first
-// (`structural_match`) and falls back to Maude AC matching only for
-// AC-shaped arguments.
 
 /// Apply the eq-store substitution to existing `less_atoms` so any
 /// mid-loop node merges propagate to atoms that were inserted earlier.
@@ -2072,11 +2077,14 @@ fn normalise_less_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     // Skip the clone and the per-atom normalize loop; the dedup below still
     // runs unconditionally to stay byte-faithful.
     if !red.sys.eq_store.subst.is_empty() {
-        let subst = red.sys.eq_store.subst.clone();
+        // `eq_store` and `less_atoms` are disjoint `System` fields, so a
+        // shared borrow of the subst coexists with the `less_atoms.iter_mut()`
+        // below — no per-pass BTreeMap+Term deep clone of the subst.
+        let subst = &red.sys.eq_store.subst;
         let normalize = |id: &crate::constraint::constraints::NodeId| -> crate::constraint::constraints::NodeId {
             let t = tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(id.clone()));
-            let mapped = tamarin_term::subst::apply_vterm(&subst, t);
+            let mapped = tamarin_term::subst::apply_vterm(subst, t);
             if let tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(v)) = mapped {
                 v
             } else {
@@ -2099,8 +2107,18 @@ fn normalise_less_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     let pre_len = red.sys.less_atoms.len();
     let mut new_less: Vec<crate::constraint::constraints::LessAtom>
         = Vec::with_capacity(pre_len);
+    // First-occurrence-wins dedup: `LessAtom` Eq ignores the reason
+    // (constraints.rs:88-92), so the identity key is the `(smaller,larger)`
+    // pair.  A `FastSet` membership probe reproduces the former
+    // `new_less.iter().any(|x| x == &la)` scan exactly — the atom is pushed
+    // iff its pair was unseen — turning the O(n²) dedup into O(n).  The set
+    // never escapes (only membership is read), so its hash order is
+    // irrelevant; only `new_less`'s Vec order is output-bearing.
+    let mut seen: tamarin_utils::FastSet<
+        (tamarin_term::lterm::LVar, tamarin_term::lterm::LVar)>
+        = tamarin_utils::FastSet::default();
     for la in std::mem::take(&mut red.sys.less_atoms) {
-        if !new_less.iter().any(|x| x == &la) {
+        if seen.insert((la.smaller.clone(), la.larger.clone())) {
             new_less.push(la);
         }
     }
@@ -2172,16 +2190,7 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         // + stash the rest (see `install_pass_cases_arms`); ignoring it
         // leaves the `mem::take`'d default eq-store installed.
         let res = red.solve_node_id_eqs(&eqs);
-        match res {
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
-            | Err(_) => {
-                hit_contra = true;
-            }
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) => {
-                install_pass_cases_arms(red, arms);
-            }
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(_)) => {}
-        }
+        absorb_solve_outcome(red, res, &mut hit_contra);
         // HS-faithful: HS's `enforceNodeUniqueness` freshRuleInsts
         // branch (Simplify.hs) uses `solver = const $ return
         // Unchanged` — calls solveNodeIdEqs ONLY, never merges inline.
@@ -2318,28 +2327,14 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
             crate::constraint::solver::reduction::SplitStrategy::SplitNow,
             &fact_eqs,
         );
-        match res {
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
-            | Err(_) => hit_contra = true,
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) => {
-                install_pass_cases_arms(red, arms);
-                changed = ChangeIndicator::Changed;
-            }
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(_)) =>
-                changed = ChangeIndicator::Changed,
+        if absorb_solve_outcome(red, res, &mut hit_contra) {
+            changed = ChangeIndicator::Changed;
         }
     }
     if !node_eqs.is_empty() {
         let res = red.solve_node_id_eqs_broadcast(&node_eqs);
-        match res {
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
-            | Err(_) => hit_contra = true,
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) => {
-                install_pass_cases_arms(red, arms);
-                changed = ChangeIndicator::Changed;
-            }
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(_)) =>
-                changed = ChangeIndicator::Changed,
+        if absorb_solve_outcome(red, res, &mut hit_contra) {
+            changed = ChangeIndicator::Changed;
         }
     }
     if hit_contra {
@@ -2813,25 +2808,11 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
             crate::constraint::solver::reduction::SplitStrategy::SplitNow,
             &rule_eqs,
         );
-        match res {
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
-            | Err(_) => hit_contra = true,
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) => {
-                install_pass_cases_arms(red, arms);
-            }
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(_)) => {}
-        }
+        absorb_solve_outcome(red, res, &mut hit_contra);
     }
     if !node_eqs.is_empty() {
         let res = red.solve_node_id_eqs_broadcast(&node_eqs);
-        match res {
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
-            | Err(_) => hit_contra = true,
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) => {
-                install_pass_cases_arms(red, arms);
-            }
-            Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(_)) => {}
-        }
+        absorb_solve_outcome(red, res, &mut hit_contra);
     }
     if hit_contra {
         mark_contradictory_labeled(red, "enforce_kd_fact_uniqueness");
@@ -2861,28 +2842,34 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
 
     // Fast path: an empty eq-store subst makes `apply_vterm` the identity,
     // so the per-premise normalisation below is a no-op and the suppliers
-    // are collected from the raw terms.  Clone the subst only when non-empty.
-    let subst = if red.sys.eq_store.subst.is_empty() {
-        None
-    } else {
-        Some(red.sys.eq_store.subst.clone())
-    };
-
+    // are collected from the raw terms.
+    //
     // Step 1: collect (consumer_node_id, fresh_var) for every node
     // whose premise is `Fr(~x)`. Matches Haskell's `getFreshVars`.
+    //
+    // The subst is read-only here and `suppliers` is fully collected before
+    // any `less_atoms` mutation below, so a scoped shared borrow of the
+    // eq-store subst suffices — `eq_store` and `nodes` are disjoint `System`
+    // fields, so this reads both at once with no per-pass BTreeMap+Term deep
+    // clone of the subst.
     let mut suppliers: Vec<(crate::constraint::constraints::NodeId, LVar)>
         = Vec::new();
-    for (id, rule) in red.sys.nodes.iter() {
-        for prem in &rule.premises {
-            if !matches!(prem.tag, FactTag::Fresh) { continue; }
-            let t = match prem.terms.first() { Some(t) => t, None => continue };
-            let t_norm = match &subst {
-                Some(s) => tamarin_term::subst::apply_vterm(s, t.clone()),
-                None => t.clone(),
-            };
-            if let Term::Lit(Lit::Var(v)) = t_norm {
-                if v.sort == tamarin_term::lterm::LSort::Fresh {
-                    suppliers.push((id.clone(), v));
+    {
+        let subst = &red.sys.eq_store.subst;
+        let subst_empty = subst.is_empty();
+        for (id, rule) in red.sys.nodes.iter() {
+            for prem in &rule.premises {
+                if !matches!(prem.tag, FactTag::Fresh) { continue; }
+                let t = match prem.terms.first() { Some(t) => t, None => continue };
+                let t_norm = if subst_empty {
+                    t.clone()
+                } else {
+                    tamarin_term::subst::apply_vterm(subst, t.clone())
+                };
+                if let Term::Lit(Lit::Var(v)) = t_norm {
+                    if v.sort == tamarin_term::lterm::LSort::Fresh {
+                        suppliers.push((id.clone(), v));
+                    }
                 }
             }
         }
@@ -3037,6 +3024,17 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
         })
         .collect();
 
+    // O(1) probe index for the insert storm below: Steps 2/3 issue
+    // suppliers×mentioning-nodes `insert_less` calls, mostly dedup HITS after
+    // the first fixpoint iteration, so `add_less`'s `iter_mut().find` scans
+    // full-length each time.  Built LAZILY on the first insert attempt (over
+    // the current `less_atoms`, unmutated since function entry) so passes
+    // whose supplier/membership filters never fire skip the build entirely;
+    // `add_less_indexed` keeps it coherent, and within this pass no other
+    // path mutates `less_atoms` (the Maude unifiability queries below are
+    // read-only w.r.t. `red.sys`).
+    let mut less_idx: Option<crate::constraint::system::LessIndex> = None;
+
     for (sup_id, fresh_var) in &suppliers {
         let sup_rule = match nodes_snapshot.iter().find(|(id, _)| id == sup_id) {
             Some((_, r)) => r, None => continue,
@@ -3055,11 +3053,16 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
                 Err(_) => continue,
             }
             // HS-faithful insertLess (Reduction.hs:390-391 `modM sLessAtoms . S.insert`).
-            // Routes through `red.insert_less` which already does set-add dedup.
-            let before = red.sys.less_atoms.len();
-            red.insert_less(LessAtom::new(
-                sup_id.clone(), other_id.clone(), Reason::Fresh));
-            if red.sys.less_atoms.len() != before {
+            // `add_less_indexed` is the indexed twin of the set-add dedup
+            // `insert_less` routes through; it returns `true` on a push (Vec
+            // grew), so we set `red.changed`/`changed` exactly as
+            // `insert_less` would via its length compare.
+            if less_idx.is_none() { less_idx = Some(red.sys.build_less_index()); }
+            if red.sys.add_less_indexed(
+                LessAtom::new(sup_id.clone(), other_id.clone(), Reason::Fresh),
+                less_idx.as_mut().unwrap(),
+            ) {
+                red.changed = ChangeIndicator::Changed;
                 changed = ChangeIndicator::Changed;
             }
             new_lesses.push((sup_id.clone(), other_id.clone()));
@@ -3112,10 +3115,15 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
         });
         if !all_non_unifiable { continue; }
         let last = match rs.last() { Some(l) => l.clone(), None => continue };
-        // HS-faithful insertLess (Reduction.hs:390-391).
-        let before = red.sys.less_atoms.len();
-        red.insert_less(LessAtom::new(last, j.clone(), Reason::Fresh));
-        if red.sys.less_atoms.len() != before {
+        // HS-faithful insertLess (Reduction.hs:390-391).  `less_idx` stays
+        // coherent across Steps 2/3: the between-loop work (route walk,
+        // Maude unifiability queries) is read-only w.r.t. `less_atoms`.
+        if less_idx.is_none() { less_idx = Some(red.sys.build_less_index()); }
+        if red.sys.add_less_indexed(
+            LessAtom::new(last, j.clone(), Reason::Fresh),
+            less_idx.as_mut().unwrap(),
+        ) {
+            red.changed = ChangeIndicator::Changed;
             changed = ChangeIndicator::Changed;
         }
     }
@@ -3325,7 +3333,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
         let mut set = std::collections::BTreeSet::new();
         let all_fms = red.sys.formulas.iter().chain(red.sys.solved_formulas.iter());
         for fm in all_fms {
-            if let crate::guarded::Guarded::GGuarded { qua, vars, guards, body } = fm {
+            if let crate::guarded::Guarded::GGuarded { qua, vars, guards, body } = fm.as_ref() {
                 if !matches!(qua, crate::guarded::Quant::All) { continue; }
                 if !vars.is_empty() { continue; }
                 if guards.len() != 1 { continue; }
@@ -3354,7 +3362,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     let formula_set = |red: &Reduction| -> Vec<crate::guarded::Guarded> {
         let mut v: Vec<crate::guarded::Guarded> = red.sys.formulas.iter()
             .chain(red.sys.solved_formulas.iter())
-            .cloned()
+            .map(|f| f.as_ref().clone())
             .collect();
         v.sort_by(crate::guarded::cmp_guarded);
         v.dedup();
@@ -3400,12 +3408,9 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     // the contradiction pass — same porting strategy as simplify.rs:1051-1054.
     let is_true_false = |s: &tamarin_term::lterm::LNTerm,
                          t: &tamarin_term::lterm::LNTerm| -> Option<bool> {
-        use crate::tools::subterm_store::elem_not_below_reducible;
-        use tamarin_term::lterm::{is_fresh_var, is_pub_var, is_msg_var,
-            sort_of_lnterm, flattened_ac_terms, LSort};
-        use tamarin_term::term::Term as LTerm;
-        use tamarin_term::vterm::Lit as LLit;
-        use tamarin_term::function_symbols::{FunSym, AcSym};
+        use tamarin_term::lterm::{is_msg_var, sort_of_lnterm,
+            flattened_ac_terms, LSort};
+        use tamarin_term::function_symbols::AcSym;
         if s == t { return Some(false); }
         // HS `isTrueFalse reducible Nothing` Nat guards (SubtermStore.hs:336-340),
         // which fire BEFORE the redElem cases:
@@ -3433,38 +3438,13 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
             return crate::constraint::solver::reduction::process_ac_subterm(
                 AcSym::NatPlus, s, t).err();
         }
-        if elem_not_below_reducible(&reducible, t, s) { return Some(false); }
-        if elem_not_below_reducible(&reducible, s, t) { return Some(true); }
-        if let LTerm::Lit(LLit::Con(_)) = t { return Some(false); }
-        // CR-rule S_invalid (SubtermStore.hs:348-349): when big is a Var,
-        // pub/fresh has no subterms; also a Nat-sorted big with a
-        // non-Nat/non-MsgVar small is invalid.
-        if let LTerm::Lit(LLit::Var(_)) = t {
-            if is_pub_var(t) || is_fresh_var(t) { return Some(false); }
-            let small_ok = sort_of_lnterm(s) == LSort::Nat || is_msg_var(s);
-            if !small_ok && sort_of_lnterm(t) == LSort::Nat { return Some(false); }
-        }
-        // HS-faithful: CR-rule `S_subterm-ac-recurse` (SubtermStore.hs:350-354).
-        // When `t = FApp (AC f) _` and `AC f` is NOT a reducible function
-        // symbol, run `processACSubterm` to peel matched flat elements
-        // off both sides — if the small side becomes empty, the subterm
-        // relation is trivially true; if the big side becomes empty, it
-        // is trivially false; otherwise the test is inconclusive.
-        if let LTerm::App(FunSym::Ac(ac_sym), _) = t {
-            let ac_fun_sym = FunSym::Ac(*ac_sym);
-            if !reducible.contains(&ac_fun_sym) {
-                // processACSubterm (SubtermStore.hs:313-318): sort +
-                // removeSame on flattenedACTerms of both sides; empty big
-                // -> False, empty small -> True.  The rebuilt `Ok` terms
-                // are unused — fall through to the `(Just sst)` arm.
-                match crate::constraint::solver::reduction::process_ac_subterm(
-                    *ac_sym, s, t)
-                {
-                    Err(false) => return Some(false),
-                    Err(true) => return Some(true),
-                    Ok(_) => {}
-                }
-            }
+        // Shared structural core (redElem / Con / atom-var / non-reducible
+        // AC big), spliced back at the same position in the check order —
+        // after the nat guards above, before the store-membership arm
+        // below.  `s==t` inside the core is unreachable here (already
+        // returned).  See `is_true_false_core`.
+        if let Some(r) = is_true_false_core(&reducible, s, t) {
+            return Some(r);
         }
         // HS `isTrueFalse reducible (Just sst)` membership arm
         // (SubtermStore.hs:359-360,368-371): after the structural
@@ -3693,9 +3673,9 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // Simplify.hs:304-306 — ascending Guarded Ord.  Sort to match HS's
     // iteration order; otherwise the decomposition + re-insertion
     // sequence picks up different goal-nrs than HS.
-    let mut to_decompose: Vec<_> = red.sys.formulas.iter()
+    let mut to_decompose: Vec<crate::guarded::Guarded> = red.sys.formulas.iter()
         .filter(|f| reducible_formula(f))
-        .cloned()
+        .map(|f| f.as_ref().clone())
         .collect();
     to_decompose.sort_by(crate::guarded::cmp_guarded);
     if to_decompose.is_empty() { return ChangeIndicator::Unchanged; }
@@ -3732,12 +3712,12 @@ fn remove_solved_split_goals_pass(red: &mut Reduction) -> ChangeIndicator {
 fn drop_trivially_true_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     let before = red.sys.formulas.len();
     let gt = crate::guarded::gtrue();
-    let had_gtrue = red.sys.formulas.contains(&gt);
+    let had_gtrue = crate::guarded::stores_contains(&red.sys.formulas, &gt);
     red.sys.invalidate_max_var_idx_cache();
-    red.sys.formulas.retain(|f| f != &gt);
-    if had_gtrue && !red.sys.solved_formulas.contains(&gt) {
+    red.sys.formulas.retain(|f| **f != gt);
+    if had_gtrue && !crate::guarded::stores_contains(&red.sys.solved_formulas, &gt) {
         red.sys.invalidate_max_var_idx_cache();
-        red.sys.solved_formulas.push(gt);
+        red.sys.solved_formulas.push(std::sync::Arc::new(gt));
     }
     if red.sys.formulas.len() != before {
         red.changed = ChangeIndicator::Changed;
@@ -3760,7 +3740,7 @@ fn drop_trivially_true_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
 fn dedupe_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::guarded::{Guarded, normalize_sort_hints};
     let before = red.sys.formulas.len();
-    let mut seen: Vec<Guarded> = Vec::new();
+    let mut seen: Vec<std::sync::Arc<Guarded>> = Vec::new();
     let mut seen_canon: Vec<Guarded> = Vec::new();
     for f in red.sys.formulas.drain(..) {
         let canon = normalize_sort_hints(&f);
@@ -3776,6 +3756,62 @@ fn dedupe_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     } else {
         ChangeIndicator::Unchanged
     }
+}
+
+/// Shared structural core of `isTrueFalse` (HS SubtermStore.hs:334-355,
+/// the `Nothing` sst branch): the `s==t`, `elem_not_below_reducible`,
+/// constant-big, atom-var-big, and non-reducible AC-big checks common to
+/// `propagate_subterm_obvious` and `simp_injective_fact_eq_mon_pass`.
+/// Returns `Some(true)`/`Some(false)` for a trivially-(un)satisfied
+/// subterm relation, `None` when undecidable.  `simp_injective` wraps
+/// this with its extra nat-plus guards (before) and store-membership arms
+/// (after); `propagate` uses it directly.
+fn is_true_false_core(
+    reducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
+    s: &tamarin_term::lterm::LNTerm,
+    t: &tamarin_term::lterm::LNTerm,
+) -> Option<bool> {
+    use crate::tools::subterm_store::elem_not_below_reducible;
+    use tamarin_term::lterm::{is_fresh_var, is_pub_var, is_msg_var,
+        LSort, sort_of_lnterm};
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    use tamarin_term::function_symbols::FunSym;
+    if s == t { return Some(false); }
+    if elem_not_below_reducible(reducible, t, s) { return Some(false); }
+    if elem_not_below_reducible(reducible, s, t) { return Some(true); }
+    // Constants have no strict subterms.
+    if let Term::Lit(Lit::Con(_)) = t { return Some(false); }
+    // CR-rule S_invalid: pub/fresh var (atom var) has no subterms;
+    // similarly, a Nat-sorted big with a non-Nat/non-MsgVar small is
+    // invalid (HS SubtermStore.hs:349).
+    if let Term::Lit(Lit::Var(_)) = t {
+        if is_pub_var(t) || is_fresh_var(t) {
+            return Some(false);
+        }
+        let small_ok = sort_of_lnterm(s) == LSort::Nat || is_msg_var(s);
+        if !small_ok && sort_of_lnterm(t) == LSort::Nat {
+            return Some(false);
+        }
+    }
+    // CR-rule S_subterm-ac-recurse: AC big-side processed via
+    // processACSubterm (SubtermStore.hs:313-318).
+    if let Term::App(FunSym::Ac(ac_sym), _) = t {
+        let ac_fun_sym = FunSym::Ac(*ac_sym);
+        if !reducible.contains(&ac_fun_sym) {
+            // processACSubterm (SubtermStore.hs:313-318): empty big
+            // -> False, empty small -> True; the rebuilt `Ok` terms
+            // are unused — fall through to `None` below.
+            match crate::constraint::solver::reduction::process_ac_subterm(
+                *ac_sym, s, t)
+            {
+                Err(false) => return Some(false),
+                Err(true) => return Some(true),
+                Ok(_) => {}
+            }
+        }
+    }
+    None
 }
 
 /// Subterm-store simplification — partial port of Haskell's
@@ -3835,12 +3871,7 @@ fn dedupe_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
 /// difference (HS `oldNegSubterms`, SubtermStore.hs:95,189) decides
 /// which entries this pass (re-)splits.
 fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
-    use crate::tools::subterm_store::elem_not_below_reducible;
-    use tamarin_term::lterm::{is_fresh_var, is_pub_var, is_msg_var,
-        LSort, sort_of_lnterm};
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    use tamarin_term::function_symbols::FunSym;
+    use tamarin_term::lterm::{is_msg_var, LSort, sort_of_lnterm};
     let mut changed = ChangeIndicator::Unchanged;
     if red.sys.subterm_store.contradictory { return changed; }
     let reducible = red.ctx.maude.maude_sig().reducible_fun_syms_fast.clone();
@@ -3853,41 +3884,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     // var big, or AC-flattened big empties out), None if undecidable.
     let is_true_false = |s: &tamarin_term::lterm::LNTerm,
                          t: &tamarin_term::lterm::LNTerm| -> Option<bool> {
-        if s == t { return Some(false); }
-        if elem_not_below_reducible(&reducible, t, s) { return Some(false); }
-        if elem_not_below_reducible(&reducible, s, t) { return Some(true); }
-        // Constants have no strict subterms.
-        if let Term::Lit(Lit::Con(_)) = t { return Some(false); }
-        // CR-rule S_invalid: pub/fresh var (atom var) has no subterms;
-        // similarly, a Nat-sorted big with a non-Nat/non-MsgVar small is
-        // invalid (HS SubtermStore.hs:349).
-        if let Term::Lit(Lit::Var(_)) = t {
-            if is_pub_var(t) || is_fresh_var(t) {
-                return Some(false);
-            }
-            let small_ok = sort_of_lnterm(s) == LSort::Nat || is_msg_var(s);
-            if !small_ok && sort_of_lnterm(t) == LSort::Nat {
-                return Some(false);
-            }
-        }
-        // CR-rule S_subterm-ac-recurse: AC big-side processed via
-        // processACSubterm (SubtermStore.hs:313-318).
-        if let Term::App(FunSym::Ac(ac_sym), _) = t {
-            let ac_fun_sym = FunSym::Ac(*ac_sym);
-            if !reducible.contains(&ac_fun_sym) {
-                // processACSubterm (SubtermStore.hs:313-318): empty big
-                // -> False, empty small -> True; the rebuilt `Ok` terms
-                // are unused — fall through to `None` below.
-                match crate::constraint::solver::reduction::process_ac_subterm(
-                    *ac_sym, s, t)
-                {
-                    Err(false) => return Some(false),
-                    Err(true) => return Some(true),
-                    Ok(_) => {}
-                }
-            }
-        }
-        None
+        is_true_false_core(&reducible, s, t)
     };
 
     // -------------------------------------------------------------
@@ -4435,9 +4432,9 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         // Stored-state boundary (150f5eba): normalise before the dedup
         // check and the push, so the comparison is normal-to-normal.
         let f = crate::guarded::normalise_stored_formula_owned(f);
-        if !red.sys.formulas.contains(&f) && !red.sys.solved_formulas.contains(&f) {
+        if !crate::guarded::stores_contains(&red.sys.formulas, &f) && !crate::guarded::stores_contains(&red.sys.solved_formulas, &f) {
             red.sys.invalidate_max_var_idx_cache();
-            red.sys.formulas.push(f);
+            red.sys.formulas.push(std::sync::Arc::new(f));
             red.changed = ChangeIndicator::Changed;
             changed = ChangeIndicator::Changed;
         }
@@ -4965,12 +4962,12 @@ mod tests {
             mkvar_idx("j", 0),
         )));
         sys.invalidate_max_var_idx_cache();
-        sys.formulas.push(crate::guarded::Guarded::Conj(vec![a1.clone(), a2.clone()]));
+        sys.formulas.push(std::sync::Arc::new(crate::guarded::Guarded::Conj(vec![a1.clone(), a2.clone()])));
         let mut r = Reduction::new(&ctx, sys);
         simplify_system(&mut r);
         // The Conj should have been removed from the open formula set.
         assert!(!r.sys.formulas.iter().any(|f|
-            matches!(f, crate::guarded::Guarded::Conj(items) if items.len() == 2)));
+            matches!(f.as_ref(), crate::guarded::Guarded::Conj(items) if items.len() == 2)));
         // Haskell-faithful: GConj decomposition recurses on its
         // members with mark=False, so GAto-Action members are
         // inserted as `Goal::Action` (via `insertAtom -> insertAction`)
@@ -5007,7 +5004,7 @@ mod tests {
         // the Disj inside.
         let disj = crate::guarded::Guarded::Disj(vec![a1, a2]);
         sys.invalidate_max_var_idx_cache();
-        sys.formulas.push(crate::guarded::Guarded::Conj(vec![disj]));
+        sys.formulas.push(std::sync::Arc::new(crate::guarded::Guarded::Conj(vec![disj])));
         let mut r = Reduction::new(&ctx, sys);
         simplify_system(&mut r);
         // After decomposition, a Goal::Disj should exist.
@@ -5061,14 +5058,7 @@ mod tests {
             crate::constraint::constraints::Reason::Formula,
         ));
         let ab_adj = sys.build_always_before_adj();
-        let node_rule_map: std::collections::HashMap<
-            &crate::constraint::constraints::NodeId, &crate::rule::RuleACInst> = {
-            let mut m = std::collections::HashMap::new();
-            for (nid, r) in sys.nodes.iter() {
-                m.entry(nid).or_insert(r);
-            }
-            m
-        };
+        let node_rule_map = node_rule_map(&sys);
         let result = partial_atom_valuation_with(
             &sys, &h, &ab_adj, &node_rule_map, &Atom::Last(mkvar("n", 0)));
         assert_eq!(result, None,
@@ -5143,7 +5133,7 @@ mod tests {
         let subst = substs.into_iter().next().unwrap();
         // The time mapping is direct (we set it ourselves before
         // calling Maude). Should always be present.
-        let i_map = subst.get(&("i".to_string(), 0u64)).cloned();
+        let i_map = subst.get(&("i", 0u64)).cloned();
         match i_map {
             Some(tamarin_parser::ast::Term::Var(v)) => {
                 assert_eq!(v.name, "n");
@@ -5202,7 +5192,7 @@ mod tests {
         let subst = substs.into_iter().next().unwrap();
         // The time variable mapping is recorded by our matcher
         // directly (independent of Maude's output).
-        assert!(subst.contains_key(&("i".to_string(), 0u64)));
+        assert!(subst.contains_key(&("i", 0u64)));
     }
 
     #[test]
@@ -5348,7 +5338,7 @@ mod tests {
             "negative AC subterm should drive a change (acFormula emission)");
         // A universally-quantified formula `∀ newVar. _ = _ ⇒ ⊥` must
         // have been emitted (the ACNewVarD acFormula).
-        let has_ac_formula = r.sys.formulas.iter().any(|f| matches!(f,
+        let has_ac_formula = r.sys.formulas.iter().any(|f| matches!(f.as_ref(),
             crate::guarded::Guarded::GGuarded {
                 qua: crate::guarded::Quant::All, vars, body, .. }
             if vars.len() == 1 && **body == crate::guarded::gfalse()));
