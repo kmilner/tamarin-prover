@@ -2,9 +2,11 @@
 //!
 //! Vertex-list-based DAG operations. A `Relation<T>` is `Vec<(T, T)>`.
 //!
-//! Intentionally retained: faithful HS port. Currently has no live caller —
-//! the consumers that need these operations (loop breakers, transitive
-//! reduction, cyclicity) carry their own specialized re-implementations.
+//! `dfs_loop_breakers` is the live loop-breaker selector used by the
+//! constraint-solver context (`useAutoLoopBreakersAC`). The remaining
+//! operations (`restrict`, `image`, `inverse`, `reachable_set`, `cyclic`,
+//! `toposort`, `trans_red`) are a faithful port of the rest of
+//! `Data.DAG.Simple` retained for completeness and have no live caller yet.
 
 use std::collections::BTreeSet;
 
@@ -126,8 +128,44 @@ pub fn toposort<T: Ord + Clone>(rel: &Relation<T>) -> Vec<T> {
 }
 
 /// `dfsLoopBreakers rel`: a minimal set of vertices whose removal breaks
-/// every cycle, found by greedy DFS. Determinism follows the order of
-/// `rel`'s source vertices.
+/// every cycle, found by greedy DFS. Faithful port of HS
+/// `Data.DAG.Simple.dfsLoopBreakers` (`lib/utils/src/Data/DAG/Simple.hs:111-128`):
+///
+/// ```haskell
+/// dfsLoopBreakers rel =
+///     D.toList $ snd $ execRWS (mapM_ (visit . fst) rel) () S.empty
+///   where
+///     visit x = do
+///         visited <- gets (S.member x)
+///         unless visited $ findLoopBreakers S.empty x
+///     findLoopBreakers parents0 x = do
+///         modify (S.insert x)
+///         let parents = S.insert x parents0
+///             ys      = x `image` rel
+///         if any (`S.member` parents) ys
+///           then tell (return x)
+///           else forM_ ys $ \y -> do
+///                    visited <- gets (S.member y)
+///                    unless visited $ findLoopBreakers parents y
+/// ```
+///
+/// Semantics replicated exactly (the picked set reaches printed output, so
+/// order matters):
+/// - Iterate the relation in **list order**, using each tuple's first
+///   component as a DFS root — callers must build `rel` in HS's order.
+/// - A single **monotonic `visited` set** shared across all roots: once a
+///   node is visited it is never re-explored, even from a later root.
+/// - On the **first** successor that is already a parent (back-edge), emit
+///   the **current node** (the back-edge source, not the ancestor target) and
+///   stop descending.
+/// - Emission order = DFS discovery order (`tell`/`DList` append), mirrored
+///   by pushing onto the `breakers` `Vec`.
+///
+/// `parents` is threaded down the current DFS path; here it is a single set
+/// mutated with insert-on-enter / remove-on-leave, so at each node it holds
+/// exactly that node's path ancestors — equivalent to HS's persistent
+/// `S.insert x parents0`, because the monotonic `visited` set explores each
+/// node only once.
 pub fn dfs_loop_breakers<T: Ord + Clone>(rel: &Relation<T>) -> Vec<T> {
     let mut visited: BTreeSet<T> = BTreeSet::new();
     let mut breakers: Vec<T> = Vec::new();
@@ -270,6 +308,26 @@ mod tests {
     fn loop_breakers_empty_for_acyclic() {
         let r = rel(&[(1, 2), (2, 3)]);
         assert_eq!(dfs_loop_breakers(&r), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn loop_breakers_simple_cycle_breaks_one() {
+        // 1 -> 2 -> 1: breaking either makes it acyclic.
+        let breakers = dfs_loop_breakers(&rel(&[(1, 2), (2, 1)]));
+        assert_eq!(breakers.len(), 1);
+        assert!(breakers[0] == 1 || breakers[0] == 2);
+    }
+
+    #[test]
+    fn loop_breakers_three_cycle_breaks_one() {
+        // 1 -> 2 -> 3 -> 1.
+        assert_eq!(dfs_loop_breakers(&rel(&[(1, 2), (2, 3), (3, 1)])).len(), 1);
+    }
+
+    #[test]
+    fn loop_breakers_two_independent_cycles_break_both() {
+        let breakers = dfs_loop_breakers(&rel(&[(1, 2), (2, 1), (3, 4), (4, 3)]));
+        assert_eq!(breakers.len(), 2);
     }
 
     #[test]

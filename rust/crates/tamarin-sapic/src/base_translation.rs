@@ -1086,13 +1086,6 @@ pub fn predicate_restrictions() -> Vec<tamarin_parser::ast::Restriction> {
     vec![predicate_eq, predicate_not_eq]
 }
 
-/// The `set_in` / `set_notin` restrictions (Basetranslation.hs:332-359), added
-/// by `baseRestr` (449-457) when the process `contains isLookup`.  HS hardcodes
-/// these as restriction strings and parses them with `toEx`/`parseRestriction`;
-/// we do the same with the RS `parse_formula_str` (so the rendered output is
-/// byte-identical to HS's hand-written strings, and AC/sort handling matches the
-/// parser path).  `has_delete` selects the full variants (the process also
-/// `contains isDelete`) over the NoDelete variants.
 /// Parse one of the hard-coded restriction strings (`parseRestriction`'s job in
 /// HS) and wrap it in a named `Restriction`.  Shared by all four hard-coded
 /// restriction builders so the parse+panic+wrap shape lives in one place.
@@ -1103,6 +1096,13 @@ fn parse_restriction(name: &str, src: &str) -> tamarin_parser::ast::Restriction 
     p::Restriction { name: name.to_string(), formula, attributes: vec![] }
 }
 
+/// The `set_in` / `set_notin` restrictions (Basetranslation.hs:332-359), added
+/// by `baseRestr` (449-457) when the process `contains isLookup`.  HS hardcodes
+/// these as restriction strings and parses them with `toEx`/`parseRestriction`;
+/// we do the same with the RS `parse_formula_str` (so the rendered output is
+/// byte-identical to HS's hand-written strings, and AC/sort handling matches the
+/// parser path).  `has_delete` selects the full variants (the process also
+/// `contains isDelete`) over the NoDelete variants.
 pub fn state_restrictions(has_delete: bool) -> Vec<tamarin_parser::ast::Restriction> {
     // `parseRestriction`'s formula body, verbatim from Basetranslation.hs.
     let (set_in_src, set_notin_src) = if has_delete {

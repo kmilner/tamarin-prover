@@ -1352,26 +1352,6 @@ fn sort_tag(s: crate::lterm::LSort) -> &'static str {
     }
 }
 
-/// Build the synthetic skolem-constant `Name` for a free/subject `LVar`
-/// `lv`, using `counter` to keep the id unique across one match call.
-///
-/// The constant must round-trip through Maude with the SAME order-sorted
-/// behaviour HS gives a `SkConst`, whose sort is `lvarSort v`
-/// (Guarded.hs:805-808) — i.e. the variable's *own* sort, which may be
-/// `Msg`.  Maude's `match A <=? B` requires the pattern's declared sort
-/// to be a supersort of the subject's, so encoding a `Msg`-sorted
-/// subject variable as `Pub` (a strict subsort of `Msg`) would let it
-/// match a `Msg` pattern position that HS would reject — an over-match
-/// that can change `--prove` results.
-///
-/// `NameTag` has no `Msg` variant, and adding one would break the many
-/// exhaustive `match`es on it across other crates.  Instead we carry a
-/// `Msg`-sorted skolem as a `NameTag::Pub` `Name` whose id begins with
-/// `maude_types::SKOLEM_MSG_PREFIX`; `maude_types::sort_of_name`
-/// recognises that sentinel and reports `LSort::Msg`, so the emitted
-/// Maude constant is `c(i)` (op `c : Nat -> Msg`) rather than `p(i)`.
-/// For every other sort the matching `NameTag` already yields the right
-/// Maude sort directly.
 /// Build a conjunction-equation Maude command: `<prefix>lhs =? rhs /\ ... .\n`.
 /// Shared by `unify` (with the AC residual eqs) and `variant_unify_eqs`; each
 /// side is converted via `lterm_to_mterm_global` threading the shared `ctx`, so
@@ -1438,6 +1418,26 @@ fn unskolemize_subst(
         .collect()
 }
 
+/// Build the synthetic skolem-constant `Name` for a free/subject `LVar`
+/// `lv`, using `counter` to keep the id unique across one match call.
+///
+/// The constant must round-trip through Maude with the SAME order-sorted
+/// behaviour HS gives a `SkConst`, whose sort is `lvarSort v`
+/// (Guarded.hs:805-808) — i.e. the variable's *own* sort, which may be
+/// `Msg`.  Maude's `match A <=? B` requires the pattern's declared sort
+/// to be a supersort of the subject's, so encoding a `Msg`-sorted
+/// subject variable as `Pub` (a strict subsort of `Msg`) would let it
+/// match a `Msg` pattern position that HS would reject — an over-match
+/// that can change `--prove` results.
+///
+/// `NameTag` has no `Msg` variant, and adding one would break the many
+/// exhaustive `match`es on it across other crates.  Instead we carry a
+/// `Msg`-sorted skolem as a `NameTag::Pub` `Name` whose id begins with
+/// `maude_types::SKOLEM_MSG_PREFIX`; `maude_types::sort_of_name`
+/// recognises that sentinel and reports `LSort::Msg`, so the emitted
+/// Maude constant is `c(i)` (op `c : Nat -> Msg`) rather than `p(i)`.
+/// For every other sort the matching `NameTag` already yields the right
+/// Maude sort directly.
 fn skolem_name(counter: u64, lv: &crate::lterm::LVar) -> crate::lterm::Name {
     use crate::lterm::{LSort, Name, NameTag};
     match lv.sort {

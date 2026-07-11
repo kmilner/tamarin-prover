@@ -689,6 +689,23 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     changed
 }
 
+/// Build the read-only `NodeId → &RuleACInst` index the uniqueness /
+/// atom-valuation passes use for `.get()` lookups, replacing a per-lookup
+/// linear `sys.nodes.iter().find`.  `or_insert` keeps the FIRST rule for a
+/// given id, matching `find`'s first-match semantics; `sys.nodes` is
+/// unique-keyed, so the map returns the identical rule the linear scan
+/// found.
+fn node_rule_map(
+    sys: &crate::constraint::system::System,
+) -> tamarin_utils::FastMap<
+    &crate::constraint::constraints::NodeId, &crate::rule::RuleACInst> {
+    let mut m = tamarin_utils::FastMap::default();
+    for (n, r) in sys.nodes.iter() {
+        m.entry(n).or_insert(r);
+    }
+    m
+}
+
 /// Partial atom valuation. Mirrors Haskell's `partialAtomValuation`
 /// from `Theory.Constraint.Solver.Simplify`. Returns:
 ///   - `Some(true)`  if the atom is True in every model of the system
@@ -709,23 +726,6 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
 /// via `ab_adj` — mirroring HS `partialAtomValuation`, which binds
 /// `before = alwaysBefore sys` ONCE in its `where` clause (Simplify.hs)
 /// rather than recomputing it per atom.
-/// Build the read-only `NodeId → &RuleACInst` index the uniqueness /
-/// atom-valuation passes use for `.get()` lookups, replacing a per-lookup
-/// linear `sys.nodes.iter().find`.  `or_insert` keeps the FIRST rule for a
-/// given id, matching `find`'s first-match semantics; `sys.nodes` is
-/// unique-keyed, so the map returns the identical rule the linear scan
-/// found.
-fn node_rule_map(
-    sys: &crate::constraint::system::System,
-) -> tamarin_utils::FastMap<
-    &crate::constraint::constraints::NodeId, &crate::rule::RuleACInst> {
-    let mut m = tamarin_utils::FastMap::default();
-    for (n, r) in sys.nodes.iter() {
-        m.entry(n).or_insert(r);
-    }
-    m
-}
-
 fn partial_atom_valuation_with(
     sys: &crate::constraint::system::System,
     maude: &tamarin_term::maude_proc::MaudeHandle,
@@ -1140,26 +1140,42 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     sys_actions.extend(node_actions);
     if sys_actions.is_empty() { return ChangeIndicator::Unchanged; }
 
+    // Group `sys_actions` indices by fact name, once per pass.  The Action-
+    // guard arm of `try_match_all_guards::rec` previously scanned EVERY
+    // sys_action per recursion step, paying a `fact_name` String allocation
+    // plus a compare for each — O(paths · |sys_actions|) allocations.  A
+    // name-keyed index narrows each arm to exactly the actions the old scan
+    // would have accepted, in the SAME order (indices ascend within a group,
+    // preserving the original scan order restricted to name-equal entries),
+    // so the sequence of match attempts — and hence every downstream match/
+    // candidate — is unchanged.  The map is lookup-only (never iterated), so
+    // its hash order is unobservable; it dies with the pass.
+    let mut actions_by_name: tamarin_utils::FastMap<String, Vec<u32>> =
+        tamarin_utils::FastMap::default();
+    for (ai, (_, fa)) in sys_actions.iter().enumerate() {
+        actions_by_name.entry(fact_name(&fa.tag)).or_default().push(ai as u32);
+    }
+
     let maude = red.ctx.maude.clone();
     let mut new_formulas: Vec<Guarded> = Vec::new();
-    // Canon keys of the accepted candidates, threaded across every universal in
-    // lock-step with `new_formulas` (`try_match_all_guards` pushes to both).
-    // Owning it here (instead of recomputing `out.iter().map(canon)` on entry to
-    // each `try_match_all_guards`) computes each candidate's canon ONCE — the
+    // Canon keys (+ FxHash prefilter hashes) of the accepted candidates,
+    // threaded across every universal in lock-step with `new_formulas`
+    // (`try_match_all_guards` pushes to both).  Owning it here (instead of
+    // recomputing `out.iter().map(canon)` on entry to each
+    // `try_match_all_guards`) computes each candidate's canon ONCE — the
     // pushed value is byte-identical to a recompute because the push uses the
     // same `implied_apply_canon_cow`.
-    let mut new_formulas_canon: Vec<crate::guarded::Guarded> = Vec::new();
-    // Canon keys of the existing formulas, computed ONCE for the whole pass:
-    // `red.sys.formulas`/`solved_formulas` are not mutated inside the loop
-    // (only the local `new_formulas` grows; `red.insert_formula` runs after),
-    // so these are loop-invariant.  Hoisting them out turns the dedup canon
-    // cost from O(universals · |formulas|) to O(|formulas|).  Held as `Cow`
-    // borrowing `red.sys.formulas`: an already-canonical formula is borrowed
-    // (zero clone), and dedup compares by content either way.
-    let existing_formulas_canon: Vec<std::borrow::Cow<crate::guarded::Guarded>> =
-        red.sys.formulas.iter().map(|f| implied_apply_canon_cow(f)).collect();
-    let existing_solved_canon: Vec<std::borrow::Cow<crate::guarded::Guarded>> =
-        red.sys.solved_formulas.iter().map(|f| implied_apply_canon_cow(f)).collect();
+    let mut new_formulas_canon: Vec<(crate::guarded::Guarded, u64)> = Vec::new();
+    // Canon keys of the existing formulas, computed at most ONCE for the whole
+    // pass: `red.sys.formulas`/`solved_formulas` are not mutated inside the
+    // loop (only the local `new_formulas` grows; `red.insert_formula` runs
+    // after), so the tables are loop-invariant — and built LAZILY on the first
+    // candidate that reaches dedup, so a pass whose universals produce no
+    // candidate (no matching action assignment) skips the O(|formulas|) canon
+    // walk entirely.  Laziness is unobservable: the table contents depend only
+    // on the un-mutated stores, not on when they are built.
+    let dedup_tables = ImpliedDedupTables::new(
+        &red.sys.formulas, &red.sys.solved_formulas);
     for (vars, guards, body) in &universals {
         // Mirrors Haskell's `impliedFormulas`'s `prepare` partition
         // (`System.hs:1124-1126`): Action and Eq atoms drive matching,
@@ -1203,9 +1219,8 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
         // immediately at `guard_idx == 0` and emits the implied body
         // with `acc = emptySubst`.
         try_match_all_guards(
-            &maude, vars, &driving_guards, &sys_actions, body,
-            &red.sys.formulas, &existing_formulas_canon,
-            &red.sys.solved_formulas, &existing_solved_canon,
+            &maude, vars, &driving_guards, &sys_actions, &actions_by_name, body,
+            &dedup_tables,
             &other_guards,
             &mut new_formulas, &mut new_formulas_canon,
         );
@@ -1214,7 +1229,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // Route each implied-formula body through `insert_formula`
     // so Disj / Ex / Conj bodies generate the matching `Goal::Disj`,
     // existential decomposition, and atomic goal entries.  Raw-pushing
-    // to `sys.formulas` (which we did before) silently leaks Disj bodies
+    // to `sys.formulas` silently leaks Disj bodies
     // past `is_finished`: it checks `no_open_goals && no_false_formula`,
     // and a Disj sitting in `formulas` with no corresponding open goal
     // satisfies both — so `is_finished` returns `Solved` even though the
@@ -1291,6 +1306,61 @@ fn implied_apply_canon_cow(f: &crate::guarded::Guarded)
     }
 }
 
+/// Lazily-built dedup tables for `insert_implied_formulas_pass`: the canon key
+/// (via `implied_apply_canon_cow`) plus its `fx_hash_one` prefilter hash for
+/// every existing formula / solved formula.
+///
+/// Lazy (`OnceCell`, forced by the first candidate reaching dedup) because the
+/// stores are pass-invariant — `red.sys.formulas`/`solved_formulas` are never
+/// mutated inside the per-universal loop — so the contents are independent of
+/// WHEN the table is built, and a pass producing zero candidates skips the
+/// O(|formulas|) canon walk entirely.  `Cow` so an already-canonical stored
+/// formula is borrowed (zero clone); dedup compares content either way.
+///
+/// The u64 hash rides along entries that are materialised (at most) once per
+/// pass — it is a per-entry prefilter, not a per-merge index (contrast the
+/// refuted goal-merge fingerprint bucket index): hash inequality proves canon
+/// inequality (`Hash`/`PartialEq` derive consistency), so the deep AST
+/// equality walk only runs on hash agreement.  Hashes never reach output.
+struct ImpliedDedupTables<'a> {
+    formulas: &'a [std::sync::Arc<crate::guarded::Guarded>],
+    solved: &'a [std::sync::Arc<crate::guarded::Guarded>],
+    formulas_canon: std::cell::OnceCell<Vec<(std::borrow::Cow<'a, crate::guarded::Guarded>, u64)>>,
+    solved_canon: std::cell::OnceCell<Vec<(std::borrow::Cow<'a, crate::guarded::Guarded>, u64)>>,
+}
+
+impl<'a> ImpliedDedupTables<'a> {
+    fn new(
+        formulas: &'a [std::sync::Arc<crate::guarded::Guarded>],
+        solved: &'a [std::sync::Arc<crate::guarded::Guarded>],
+    ) -> Self {
+        ImpliedDedupTables {
+            formulas,
+            solved,
+            formulas_canon: std::cell::OnceCell::new(),
+            solved_canon: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn build(
+        store: &'a [std::sync::Arc<crate::guarded::Guarded>],
+    ) -> Vec<(std::borrow::Cow<'a, crate::guarded::Guarded>, u64)> {
+        store.iter().map(|f| {
+            let c = implied_apply_canon_cow(f.as_ref());
+            let h = tamarin_utils::fx_hash_one(c.as_ref());
+            (c, h)
+        }).collect()
+    }
+
+    fn formulas_canon(&self) -> &[(std::borrow::Cow<'a, crate::guarded::Guarded>, u64)] {
+        self.formulas_canon.get_or_init(|| Self::build(self.formulas))
+    }
+
+    fn solved_canon(&self) -> &[(std::borrow::Cow<'a, crate::guarded::Guarded>, u64)] {
+        self.solved_canon.get_or_init(|| Self::build(self.solved))
+    }
+}
+
 /// Try every assignment of system actions to the universal's action
 /// guards. For each consistent assignment that binds all universal
 /// vars, instantiate the body and add to `new_formulas`.
@@ -1299,42 +1369,47 @@ fn try_match_all_guards(
     vars: &[tamarin_parser::ast::VarSpec],
     action_guards: &[&tamarin_parser::ast::Atom],
     sys_actions: &[(crate::constraint::constraints::NodeId, crate::fact::LNFact)],
+    // Pass-invariant name index over `sys_actions` (see
+    // `insert_implied_formulas_pass`): the Action-guard arm iterates only the
+    // name-equal group, in original `sys_actions` order.
+    actions_by_name: &tamarin_utils::FastMap<String, Vec<u32>>,
     body: &crate::guarded::Guarded,
-    existing_formulas: &[std::sync::Arc<crate::guarded::Guarded>],
-    // Canon keys of `existing_formulas` / `existing_solved`, precomputed ONCE by
-    // the caller (`insert_implied_formulas_pass`) and shared across every
-    // universal — they depend only on `red.sys.formulas`/`solved_formulas`,
-    // which the per-universal loop never mutates.  Shared across every
-    // universal so canonicalisation runs O(|formulas|) times per pass, not
-    // O(universals · |formulas|).  `Cow` so an already-canonical existing
-    // formula is borrowed (zero clone); dedup compares content either way.
-    existing_formulas_canon: &[std::borrow::Cow<crate::guarded::Guarded>],
-    existing_solved: &[std::sync::Arc<crate::guarded::Guarded>],
-    existing_solved_canon: &[std::borrow::Cow<crate::guarded::Guarded>],
+    // Canon keys (+ hash prefilters) of the existing formula stores, built
+    // lazily and shared across every universal — see `ImpliedDedupTables`.
+    dedup_tables: &ImpliedDedupTables<'_>,
     other_guards: &[&tamarin_parser::ast::Atom],
     out: &mut Vec<crate::guarded::Guarded>,
-    // Canon keys of accepted candidates, 1:1 with `out` and threaded across
-    // universals by the caller (so each candidate's canon is computed once).
-    out_canon: &mut Vec<crate::guarded::Guarded>,
+    // Canon keys (+ hash prefilters) of accepted candidates, 1:1 with `out`
+    // and threaded across universals by the caller (so each candidate's canon
+    // is computed once).
+    out_canon: &mut Vec<(crate::guarded::Guarded, u64)>,
 ) {
     use crate::guarded::{subst_guarded, subst_atom, VarSubst};
     use tamarin_parser::ast::Atom as AAtom;
 
+    // The `(name, idx)` set of the universal's bound vars, hoisted out of the
+    // per-(guard, action) matching calls: `match_atom_via_maude` and the Eq
+    // arm previously rebuilt this same `BTreeSet` (String clones included) on
+    // every invocation, though it depends only on `vars` — invariant across
+    // the whole recursion.
+    let pattern_vars: std::collections::BTreeSet<(String, u64)> = vars.iter()
+        .map(|v| (v.name.clone(), v.idx))
+        .collect();
+
     fn rec(
         maude: &tamarin_term::maude_proc::MaudeHandle,
         vars: &[tamarin_parser::ast::VarSpec],
+        pattern_vars: &std::collections::BTreeSet<(String, u64)>,
         guards: &[&tamarin_parser::ast::Atom],
         guard_idx: usize,
         sys_actions: &[(crate::constraint::constraints::NodeId, crate::fact::LNFact)],
+        actions_by_name: &tamarin_utils::FastMap<String, Vec<u32>>,
         acc: &VarSubst,
         body: &crate::guarded::Guarded,
-        existing_formulas: &[std::sync::Arc<crate::guarded::Guarded>],
-        existing_formulas_canon: &[std::borrow::Cow<crate::guarded::Guarded>],
-        existing_solved: &[std::sync::Arc<crate::guarded::Guarded>],
-        existing_solved_canon: &[std::borrow::Cow<crate::guarded::Guarded>],
+        dedup_tables: &ImpliedDedupTables<'_>,
         other_guards: &[&tamarin_parser::ast::Atom],
         out: &mut Vec<crate::guarded::Guarded>,
-        out_canon: &mut Vec<crate::guarded::Guarded>,
+        out_canon: &mut Vec<(crate::guarded::Guarded, u64)>,
     ) {
         if guard_idx == guards.len() {
             // All Action guards matched.  Now decide what the implied
@@ -1413,8 +1488,8 @@ fn try_match_all_guards(
             // them apart — dedup here uses witness+bound normalisation
             // only.
             // Per-candidate canon via the shared `implied_apply_canon_cow` —
-            // guaranteed lock-step with the free `implied_apply_canon` used for
-            // the existing/threaded canon vectors (single source of truth).  It
+            // guaranteed lock-step with the `ImpliedDedupTables` entries and
+            // the threaded `out_canon` (single source of truth).  It
             // collapses AC-`BinOp` permutations (so `Mult(ltkI, ekR)` and
             // `Mult(ekR, ltkI)` compare equal after `rename_precise_system`
             // reorders the LVar `Ord`, matching a freshly built `f_app_ac`
@@ -1438,31 +1513,39 @@ fn try_match_all_guards(
             // re-fires would never dedup via bare `==`, causing an
             // infinite-fire loop on RFID_Simple etc.
             //
-            // Fast-path: structurally-equal candidates (no apply_canon
-            // call needed).  Most existing_formulas are NOT
-            // canon-equal to the freshly-built implied, so we want to
-            // bail out fast.  `==` on Guarded walks the AST in O(min(|a|,|b|))
-            // and returns false as soon as a node differs; apply_canon
-            // unconditionally clones + walks.  If implied == f
-            // syntactically (typical post-fixpoint case), skip
-            // canonicalization entirely.
-            // Dedup against existing formulas using PRECOMPUTED canons (zipped
-            // 1:1 with their source slices), so `apply_canon` runs once per
-            // existing formula per pass instead of once per (existing × candidate).
-            let in_formulas = existing_formulas.iter().zip(existing_formulas_canon.iter())
-                .any(|(f, fc)| f.as_ref() == &implied || fc.as_ref() == canon.as_ref());
-            let in_solved = existing_solved.iter().zip(existing_solved_canon.iter())
-                .any(|(f, fc)| f.as_ref() == &implied || fc.as_ref() == canon.as_ref());
-            let in_out = out.iter().zip(out_canon.iter())
-                .any(|(f, fc)| f == &implied || fc == canon.as_ref());
-            let already = in_formulas || in_solved || in_out;
+            // Dedup against the LAZILY-built canon tables (zipped 1:1 with
+            // their source stores — see `ImpliedDedupTables`), so
+            // `apply_canon` runs at most once per existing formula per pass.
+            // Each membership probe compares the u64 prefilter hash first;
+            // the deep canon-equality walk only runs on hash agreement
+            // (hash inequality proves value inequality, so the accept/
+            // reject decision is untouched).
+            //
+            // The former raw structural disjunct (`f == &implied ||`) is
+            // dropped as subsumed: `implied_apply_canon_cow` is a pure
+            // function of the formula value, and every table entry is the
+            // canon of its source formula, so `f == implied` forces
+            // `canon(f) == canon(implied)` — the canon comparison already
+            // answers `true` for every structurally-equal pair, and the OR
+            // of both checks equals the canon check alone.
+            //
+            // Short-circuiting `||` (vs the former three eager `any` scans)
+            // is equally unobservable: the probes are pure and the combined
+            // boolean is identical.
+            let canon_hash = tamarin_utils::fx_hash_one(canon.as_ref());
+            let already = dedup_tables.formulas_canon().iter()
+                    .any(|(fc, fh)| *fh == canon_hash && fc.as_ref() == canon.as_ref())
+                || dedup_tables.solved_canon().iter()
+                    .any(|(fc, fh)| *fh == canon_hash && fc.as_ref() == canon.as_ref())
+                || out_canon.iter()
+                    .any(|(fc, fh)| *fh == canon_hash && fc == canon.as_ref());
             if !already {
-                // Keep `out_canon` 1:1 with `out` so the `in_out` check above
+                // Keep `out_canon` 1:1 with `out` so the `already` probe above
                 // stays correct as `out` grows across candidates.  Materialise
                 // the survivor's canon (`into_owned`) BEFORE moving `implied`.
                 let canon = canon.into_owned();
                 out.push(implied);
-                out_canon.push(canon);
+                out_canon.push((canon, canon_hash));
             }
             return;
         }
@@ -1477,19 +1560,28 @@ fn try_match_all_guards(
                 use crate::guarded::{subst_fact, subst_term};
                 let g_fact_subst = subst_fact(g_fact, acc);
                 let g_time_subst = subst_term(g_time, acc);
-                for (i, fa_sys) in sys_actions {
-                    if g_fact_subst.name != fact_name(&fa_sys.tag) { continue; }
+                // Iterate only the name-equal group of the pass-invariant
+                // `actions_by_name` index (substitution never rewrites a
+                // fact NAME, so the group key is exact).  The group holds
+                // ascending `sys_actions` indices — the identical sequence
+                // the old full scan visited after its name filter — so
+                // match attempts, and therefore candidates, are unchanged.
+                // A missing key means the old scan skipped every action.
+                let name_group = actions_by_name.get(&g_fact_subst.name)
+                    .map(|v| v.as_slice()).unwrap_or(&[]);
+                for &ai in name_group {
+                    let (i, fa_sys) = &sys_actions[ai as usize];
                     if g_fact_subst.args.len() != fa_sys.terms.len() { continue; }
                     // HS-faithful: AC matching can yield multiple matchers
                     // per (sys_action, pattern) pair. HS's `candidateSubsts`
                     // (System.hs:1131-1135) iterates them via the list monad
                     // — each match becomes its own candidate substitution.
                     let substs_here = match_atom_via_maude(
-                        maude, vars, &g_fact_subst, &g_time_subst, i, &fa_sys.terms);
+                        maude, vars, pattern_vars, &g_fact_subst, &g_time_subst, i, &fa_sys.terms);
                     for subst_here in substs_here {
                         let Some(combined) = combine_substs(acc, &subst_here) else { continue };
-                        rec(maude, vars, guards, guard_idx + 1, sys_actions,
-                            &combined, body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
+                        rec(maude, vars, pattern_vars, guards, guard_idx + 1, sys_actions, actions_by_name,
+                            &combined, body, dedup_tables,
                             other_guards, out, out_canon);
                     }
                 }
@@ -1540,15 +1632,15 @@ fn try_match_all_guards(
                         let rhs_eq = crate::elaborate::term_to_lnterm(&t_subst);
                         if let (Some(a), Some(b)) = (lhs_eq, rhs_eq) {
                             if a == b {
-                                rec(maude, vars, guards, guard_idx + 1, sys_actions,
-                                    acc, body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
+                                rec(maude, vars, pattern_vars, guards, guard_idx + 1, sys_actions, actions_by_name,
+                                    acc, body, dedup_tables,
                                     other_guards, out, out_canon);
                             }
                         } else if s_subst == t_subst {
                             // Fallback for terms term_to_lnterm can't elaborate
-                            // (e.g. PatMatch); preserve previous behaviour.
-                            rec(maude, vars, guards, guard_idx + 1, sys_actions,
-                                acc, body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
+                            // (e.g. PatMatch): compare raw parser AST.
+                            rec(maude, vars, pattern_vars, guards, guard_idx + 1, sys_actions, actions_by_name,
+                                acc, body, dedup_tables,
                                 other_guards, out, out_canon);
                         }
                         return;
@@ -1563,18 +1655,17 @@ fn try_match_all_guards(
                     // which can't soundly produce a unique sigma.
                     (true, true) => return,
                 };
-                // Convert parser-AST terms to LNTerm and run
-                // structural match.  Reuse the same pattern_vars set
-                // logic.
-                let pattern_vars: std::collections::BTreeSet<(String, u64)> =
-                    vars.iter().map(|v| (v.name.clone(), v.idx)).collect();
+                // Convert parser-AST terms to LNTerm and run structural
+                // match, with the recursion-invariant `pattern_vars` set
+                // hoisted to `try_match_all_guards` (same content as the
+                // former per-invocation build).
                 let Some(pat_lnt) = crate::elaborate::term_to_lnterm(&pat_term)
                     else { return };
                 let Some(subj_lnt) = crate::elaborate::term_to_lnterm(&subj_term)
                     else { return };
                 let mut struct_subst = std::collections::BTreeMap::new();
                 let struct_outcome = structural_match(&pat_lnt, &subj_lnt,
-                    &pattern_vars, &mut struct_subst);
+                    pattern_vars, &mut struct_subst);
                 // HS-faithful: HS's `matchTerm` (Guarded.hs:810-815)
                 // delegates to `solveMatchLTerm` → Maude, which does AC
                 // matching modulo the equational theory.  Our pure
@@ -1628,7 +1719,7 @@ fn try_match_all_guards(
                         lhs: pat_lnt,
                         rhs: subj_lnt,
                     }];
-                    match maude.match_eqs_skolemize_both(&eqs, &pattern_vars) {
+                    match maude.match_eqs_skolemize_both(&eqs, pattern_vars) {
                         Ok(matches) => matches.into_iter()
                             .map(|m| m.into_iter().collect())
                             .collect(),
@@ -1650,8 +1741,8 @@ fn try_match_all_guards(
                         subst_here.insert((lv.name, lv.idx), term);
                     }
                     let Some(combined) = combine_substs(acc, &subst_here) else { continue };
-                    rec(maude, vars, guards, guard_idx + 1, sys_actions,
-                        &combined, body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
+                    rec(maude, vars, pattern_vars, guards, guard_idx + 1, sys_actions, actions_by_name,
+                        &combined, body, dedup_tables,
                         other_guards, out, out_canon);
                 }
             }
@@ -1659,12 +1750,12 @@ fn try_match_all_guards(
         }
     }
 
-    // `existing_formulas_canon` / `existing_solved_canon` arrive precomputed
-    // from the caller (loop-invariant across universals).  `out_canon` likewise
+    // `dedup_tables` arrives from the caller (its canon tables are built at
+    // most once per pass, shared across universals).  `out_canon` likewise
     // arrives from the caller, threaded across universals in lock-step with `out`
     // (`rec` pushes each accepted candidate's canon), so it is never recomputed.
-    rec(maude, vars, action_guards, 0, sys_actions,
-        &VarSubst::default(), body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
+    rec(maude, vars, &pattern_vars, action_guards, 0, sys_actions, actions_by_name,
+        &VarSubst::default(), body, dedup_tables,
         other_guards, out, out_canon);
 }
 
@@ -1804,6 +1895,25 @@ fn structural_match(
                 LSort::Msg,
         }
     }
+    // Pairwise left-to-right recursion shared by the `NoEq` and `List`
+    // arms (HS `sequence_ . zipWith match`): equal arity required, first
+    // non-`Matched` outcome wins.
+    fn match_args(
+        p_args: &[tamarin_term::lterm::LNTerm],
+        s_args: &[tamarin_term::lterm::LNTerm],
+        pattern_vars: &std::collections::BTreeSet<(String, u64)>,
+        subst: &mut std::collections::BTreeMap<
+            tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm>,
+    ) -> StructMatch {
+        if p_args.len() != s_args.len() { return StructMatch::NoMatcher; }
+        for (pa, sa) in p_args.iter().zip(s_args.iter()) {
+            match structural_match(pa, sa, pattern_vars, subst) {
+                StructMatch::Matched => {}
+                other => return other,
+            }
+        }
+        StructMatch::Matched
+    }
     match (pat, subj) {
         // Pattern-bound var: bindable Maude var.  Mirrors HS
         // `(_, Lit (Var vp))` (`Unification.hs:317-324`) — checked
@@ -1843,25 +1953,11 @@ fn structural_match(
         // `t` (term/subject), `pat` is HS's `p` (pattern); the head/arity
         // guard is symmetric so the order here doesn't matter.
         (Term::App(FunSym::NoEq(pf), p_args), Term::App(FunSym::NoEq(sf), s_args)) => {
-            if pf != sf || p_args.len() != s_args.len() { return StructMatch::NoMatcher; }
-            for (pa, sa) in p_args.iter().zip(s_args.iter()) {
-                match structural_match(pa, sa, pattern_vars, subst) {
-                    StructMatch::Matched => {}
-                    other => return other,
-                }
-            }
-            StructMatch::Matched
+            if pf != sf { return StructMatch::NoMatcher; }
+            match_args(p_args, s_args, pattern_vars, subst)
         }
-        (Term::App(FunSym::List, p_args), Term::App(FunSym::List, s_args)) => {
-            if p_args.len() != s_args.len() { return StructMatch::NoMatcher; }
-            for (pa, sa) in p_args.iter().zip(s_args.iter()) {
-                match structural_match(pa, sa, pattern_vars, subst) {
-                    StructMatch::Matched => {}
-                    other => return other,
-                }
-            }
-            StructMatch::Matched
-        }
+        (Term::App(FunSym::List, p_args), Term::App(FunSym::List, s_args)) =>
+            match_args(p_args, s_args, pattern_vars, subst),
         // HS `(FApp (AC _) _, FApp (AC _) _) -> throwError ACProblem`
         // and `(FApp (C _) _, FApp (C _) _) -> throwError ACProblem`
         // (Unification.hs:333-334): ONLY when BOTH sides are AC-/C-headed.
@@ -1883,9 +1979,14 @@ fn structural_match(
 /// Maude reports no match.
 ///
 /// Mirrors Haskell's `matchAction` flow in `impliedFormulas`.
+///
+/// `pattern_vars` is the `(name, idx)` projection of `vars`, hoisted to the
+/// caller (`try_match_all_guards`) because it is invariant across every
+/// (guard, action) matching call of one universal.
 fn match_atom_via_maude(
     maude: &tamarin_term::maude_proc::MaudeHandle,
     vars: &[tamarin_parser::ast::VarSpec],
+    pattern_vars: &std::collections::BTreeSet<(String, u64)>,
     g_fact: &tamarin_parser::ast::Fact,
     g_time: &tamarin_parser::ast::Term,
     i: &crate::constraint::constraints::NodeId,
@@ -1952,12 +2053,9 @@ fn match_atom_via_maude(
     // arguments to Maude.  We mirror that two-phase matching here.
     //
     // The structural matcher binds each pattern var (LVar whose
-    // (name, idx) appears in `vars`) to the corresponding subject
-    // term, recursing through `App`.  Subject-side LVars that
-    // aren't pattern vars are treated as opaque constants.
-    let pattern_vars: std::collections::BTreeSet<(String, u64)> = vars.iter()
-        .map(|v| (v.name.clone(), v.idx))
-        .collect();
+    // (name, idx) appears in the caller-hoisted `pattern_vars`) to the
+    // corresponding subject term, recursing through `App`.  Subject-side
+    // LVars that aren't pattern vars are treated as opaque constants.
     let mut struct_subst: std::collections::BTreeMap<
         tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm> =
         std::collections::BTreeMap::new();
@@ -1967,7 +2065,7 @@ fn match_atom_via_maude(
     // first non-`Matched` outcome and remember WHICH (NoMatcher vs NeedsAc).
     let mut outcome = StructMatch::Matched;
     for eq in &eqs {
-        match structural_match(&eq.lhs, &eq.rhs, &pattern_vars, &mut struct_subst) {
+        match structural_match(&eq.lhs, &eq.rhs, pattern_vars, &mut struct_subst) {
             StructMatch::Matched => {}
             other => { outcome = other; break; }
         }
@@ -2038,7 +2136,7 @@ fn match_atom_via_maude(
         // `structural_match` returns the precise `NeedsAc`/`NoMatcher`
         // distinction so Maude is only invoked for genuine AC-/C-vs-AC-/C
         // pairs.
-        let maude_res = maude.match_eqs_skolemize_both(&eqs, &pattern_vars);
+        let maude_res = maude.match_eqs_skolemize_both(&eqs, pattern_vars);
         let Ok(matches) = maude_res else { return Vec::new() };
         if matches.is_empty() { return Vec::new(); }
         matches
@@ -5098,6 +5196,13 @@ mod tests {
             name: name.into(), idx, sort, typ: None,
         })
     }
+    /// The `(name, idx)` projection `try_match_all_guards` hoists and passes
+    /// to `match_atom_via_maude` in production.
+    fn mk_pattern_vars(vars: &[tamarin_parser::ast::VarSpec])
+        -> std::collections::BTreeSet<(String, u64)>
+    {
+        vars.iter().map(|v| (v.name.clone(), v.idx)).collect()
+    }
     fn mk_var_l(name: &str, idx: u64, sort: tamarin_term::lterm::LSort)
         -> tamarin_term::lterm::LNTerm
     {
@@ -5128,7 +5233,7 @@ mod tests {
         let i_node = tamarin_term::lterm::LVar::new(
             "n", tamarin_term::lterm::LSort::Node, 7);
         let sys_arg = mk_var_l("alpha", 3, tamarin_term::lterm::LSort::Msg);
-        let substs = match_atom_via_maude(&h, &vars, &g_fact, &g_time, &i_node, &[sys_arg]);
+        let substs = match_atom_via_maude(&h, &vars, &mk_pattern_vars(&vars), &g_fact, &g_time, &i_node, &[sys_arg]);
         assert!(!substs.is_empty(), "should match");
         let subst = substs.into_iter().next().unwrap();
         // The time mapping is direct (we set it ourselves before
@@ -5186,7 +5291,7 @@ mod tests {
             mk_var_l("x", 5, tamarin_term::lterm::LSort::Msg),
             mk_var_l("y", 6, tamarin_term::lterm::LSort::Msg),
         ]);
-        let substs = match_atom_via_maude(&h, &vars, &g_fact, &g_time, &i_node, &[sys_pair]);
+        let substs = match_atom_via_maude(&h, &vars, &mk_pattern_vars(&vars), &g_fact, &g_time, &i_node, &[sys_pair]);
         // Match exists.
         assert!(!substs.is_empty(), "pair pattern should match against pair subject");
         let subst = substs.into_iter().next().unwrap();
@@ -5213,7 +5318,7 @@ mod tests {
         let g_time = mk_var_p("i", 0, tamarin_parser::ast::SortHint::Node);
         let i_node = tamarin_term::lterm::LVar::new(
             "n", tamarin_term::lterm::LSort::Node, 0);
-        let subst = match_atom_via_maude(&h, &vars, &g_fact, &g_time, &i_node, &[]);
+        let subst = match_atom_via_maude(&h, &vars, &mk_pattern_vars(&vars), &g_fact, &g_time, &i_node, &[]);
         // Different arity: empty subst (no fact args to match) but
         // implementation handles via early return — match_eqs on
         // empty list returns trivial unifier. We accept either way
@@ -5237,7 +5342,7 @@ mod tests {
         let g_time = tamarin_parser::ast::Term::PubLit("notavar".into());
         let i_node = tamarin_term::lterm::LVar::new(
             "n", tamarin_term::lterm::LSort::Node, 0);
-        let substs = match_atom_via_maude(&h, &vars, &g_fact, &g_time, &i_node, &[]);
+        let substs = match_atom_via_maude(&h, &vars, &mk_pattern_vars(&vars), &g_fact, &g_time, &i_node, &[]);
         assert!(substs.is_empty());
     }
 

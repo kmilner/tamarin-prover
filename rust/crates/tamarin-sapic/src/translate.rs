@@ -143,10 +143,9 @@ fn gen(
     let proc = process_at(an_proc, p)
         .ok_or_else(|| format!("gen: invalid position {p:?}"))?;
     match proc {
-        Process::Null(ann) => {
+        Process::Null(_) => {
             // `trans_null` is the identity wrapper for progress/reliable.
             let bodies = base_trans_null(p, tildex);
-            let _ = ann;
             Ok(map_to_annotated_rule(proc, p, bodies))
         }
         Process::Action(ac, ann, _) => {

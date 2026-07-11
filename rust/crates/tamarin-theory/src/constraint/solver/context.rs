@@ -1100,9 +1100,10 @@ pub fn annotate_loop_breakers(
             }
         }
     }
-    // Run DFS loop-breaker selection.
+    // Run DFS loop-breaker selection. `dfsLoopBreakers` lives in HS
+    // `Data.DAG.Simple`, ported to `tamarin_utils::dag`.
     let breakers: Vec<(String, PremIdx)> =
-        crate::tools::loop_breakers::dfs_loop_breakers(&relation);
+        tamarin_utils::dag::dfs_loop_breakers(&relation);
     // Annotate each rule's `loop_breakers` with the picked premises.
     for (k, ru) in keys.iter().zip(rules.iter_mut()) {
         ru.loop_breakers = breakers.iter()

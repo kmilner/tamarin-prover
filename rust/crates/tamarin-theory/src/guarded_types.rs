@@ -38,7 +38,11 @@ pub struct GBinding {
 ///
 /// Structurally identical to `p::Term`, but Var carries a `BVar` instead of
 /// a raw `VarSpec`. All other variants are unchanged.
-#[derive(Debug, Clone, PartialEq)]
+// `Hash` (here and on `GFact`/`GAtom`/`Guarded`) is derived alongside the
+// derived `PartialEq`, so the impl hashes exactly the fields equality
+// compares — the consistency (equal values ⇒ equal hashes) the implied-
+// formula dedup's hash prefilter relies on (see `fx_hash_one`).
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum GTerm {
     Var(BVar),
     PubLit(String),
@@ -79,7 +83,7 @@ pub(crate) fn cow_pair_arc(
 }
 
 /// Mirrors HS `Fact (VTerm c (BVar v))`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct GFact {
     pub persistent: bool,
     pub name: String,
@@ -90,7 +94,7 @@ pub struct GFact {
 /// Mirrors HS `Atom (VTerm c (BVar v))`.
 ///
 /// Same variant set as `p::Atom`, but terms are `GTerm`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum GAtom {
     Eq(GTerm, GTerm),
     Less(GTerm, GTerm),

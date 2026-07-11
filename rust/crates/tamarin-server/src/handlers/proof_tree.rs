@@ -1090,8 +1090,9 @@ pub fn method_label(m: &ProofMethod) -> String {
     // Delegate to the byte-faithful `--prove` renderer (HS `prettyProofMethod`)
     // so the interactive method labels carry the same fact spacing
     // (`!KU( ~ltk )`), LVar dots (`#vk.2`), and contradiction reasons as the
-    // text proof.  The earlier hand-rolled `goal_summary` dropped the fact
-    // multiplicity `!`, the inner-paren spaces, and the LVar index dot.
+    // text proof.  The hand-rolled `goal_summary` below drops the fact
+    // multiplicity `!`, the inner-paren spaces, and the LVar index dot, so it
+    // is unsuitable here.
     tamarin_theory::pretty_theory::pretty_proof_method_inline(m)
 }
 

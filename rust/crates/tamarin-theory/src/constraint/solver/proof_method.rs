@@ -126,18 +126,6 @@ pub fn finished_subterms(ctx: &ProofContext, sys: &System) -> bool {
         && sys.subterm_store.neg_subterms.iter().all(|(_, big)| top_is_not_reducible(big))
 }
 
-/// Execute a proof method against `sys`, returning the resulting
-/// case list in dispatch order. `Sorry` / `Finished` produce empty
-/// cases; `Simplify` runs the simplify fan-out and returns one case
-/// per surviving branch; `SolveGoal(g)` dispatches via `solve_*_goal`
-/// and converts `GoalCases` to a case list; `Induction` splits the
-/// first formula into base/step cases via `ginduct`.
-///
-/// The case list is returned as a `Vec` in the order branches were
-/// produced, but callers do not rely on that order: both `search.rs`
-/// and `replay.rs` re-sort the cases by name before walking them, to
-/// reproduce Haskell's `Data.Map` (alphabetical) iteration order from
-/// `execProofMethod`'s `M.fromListWith`.
 /// Render/index applicability — the evaluation depth HS's
 /// `mapMaybe execProofMethod` forces when building the web UI's
 /// "Applicable Proof Methods" list, WITHOUT the `SolveGoal` fan-out.
@@ -242,6 +230,18 @@ fn process_cases(ctx: &ProofContext, cases: Vec<(String, System)>) -> Vec<(Strin
     distinguish_case_names(remove_redundant_cases_ctx(ctx, |p: &(String, System)| &p.1, cases))
 }
 
+/// Execute a proof method against `sys`, returning the resulting
+/// case list in dispatch order. `Sorry` / `Finished` produce empty
+/// cases; `Simplify` runs the simplify fan-out and returns one case
+/// per surviving branch; `SolveGoal(g)` dispatches via `solve_*_goal`
+/// and converts `GoalCases` to a case list; `Induction` splits the
+/// first formula into base/step cases via `ginduct`.
+///
+/// The case list is returned as a `Vec` in the order branches were
+/// produced, but callers do not rely on that order: both `search.rs`
+/// and `replay.rs` re-sort the cases by name before walking them, to
+/// reproduce Haskell's `Data.Map` (alphabetical) iteration order from
+/// `execProofMethod`'s `M.fromListWith`.
 pub fn exec_proof_method(
     ctx: &ProofContext,
     method: &ProofMethod,

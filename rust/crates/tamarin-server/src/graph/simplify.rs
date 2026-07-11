@@ -16,9 +16,7 @@ use tamarin_theory::rule::{
     is_coerce_rule_info, is_irecv_rule_info, is_isend_rule_info,
     RuleACInst, RuleInfo,
 };
-use tamarin_term::function_symbols::FunSym;
 use tamarin_term::lterm::{sort_of_lnterm, LSort, LNTerm};
-use tamarin_term::term::Term;
 
 // ---------------------------------------------------------------------
 // Compression (compressSystem)
@@ -276,15 +274,9 @@ fn try_hide_action(v: &NodeId, sys: System) -> Result<System, System> {
 ///   isPair m  || isInverse m  || sortOfLNTerm m == LSortPub  || == LSortNat
 fn eligible_term(t: &LNTerm) -> bool {
     tamarin_term::term::is_pair(t)
-        || is_inverse(t)
+        || tamarin_term::term::is_inverse(t)
         || sort_of_lnterm(t) == LSort::Pub
         || sort_of_lnterm(t) == LSort::Nat
-}
-
-fn is_inverse(t: &LNTerm) -> bool {
-    if let Term::App(FunSym::NoEq(sym), args) = t {
-        sym.name == b"inv" && args.len() == 1
-    } else { false }
 }
 
 // ---------------------------------------------------------------------

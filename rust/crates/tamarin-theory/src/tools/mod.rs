@@ -3,12 +3,10 @@
 pub mod abstract_interpretation;
 pub mod equation_store;
 pub mod injective_fact_instances;
-pub mod loop_breakers;
 pub mod rule_variants;
 pub mod subterm_store;
 
 pub use abstract_interpretation::EvaluationStyle;
 pub use equation_store::EquationStore;
-pub use loop_breakers::dfs_loop_breakers;
 pub use rule_variants::variants_proto_rule;
 pub use subterm_store::SubtermStore;

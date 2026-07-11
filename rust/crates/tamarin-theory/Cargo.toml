@@ -13,6 +13,7 @@ tamarin-term = { workspace = true }
 tamarin-parser = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
+indexmap = { workspace = true }
 fancy-regex = "0.18"
 
 [dev-dependencies]

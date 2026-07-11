@@ -262,6 +262,17 @@ pub fn is_pair<A>(t: &Term<A>) -> bool {
     }
 }
 
+/// `True` iff the term is a well-formed inverse `inv(_)`. Port of HS `isInverse`
+/// (Term.hs:174, `viewTerm2 -> FInv _`): the unary `inv` operator applied to one
+/// argument.
+pub fn is_inverse<A>(t: &Term<A>) -> bool {
+    match t {
+        Term::App(FunSym::NoEq(s), args) =>
+            s.name == crate::function_symbols::INV_SYM_STRING && args.len() == 1,
+        _ => false,
+    }
+}
+
 /// All "protected" subterms of `t`: subterms whose top symbol is a function
 /// that is neither a pair nor an AC operator. Port of HS `allProtSubterms`
 /// (Term.hs:239) — pre-order, descending through pairs/AC operators.

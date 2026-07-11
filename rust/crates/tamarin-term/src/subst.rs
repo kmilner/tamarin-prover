@@ -52,6 +52,14 @@ where
         Subst { map: m }
     }
 
+    /// Take the underlying mapping out of the (invariant-checked) `Subst`.
+    /// Crate-internal: lets pure re-tagging conversions (`free_to_fresh_raw`
+    /// and the `compose_vfresh` no-range-var collapse) move/clone the map
+    /// wholesale instead of round-tripping through `to_list`/`from_list`.
+    pub(crate) fn into_map(self) -> BTreeMap<V, VTerm<C, V>> {
+        self.map
+    }
+
     pub fn dom(&self) -> impl Iterator<Item = &V> { self.map.keys() }
     pub fn range(&self) -> impl Iterator<Item = &VTerm<C, V>> { self.map.values() }
     /// Borrowing iterator over the `(var, term)` mappings in domain (key)
@@ -229,6 +237,85 @@ fn apply_lit_map_changed<C: Ord + Clone, V: Ord + Clone>(
     }
 }
 
+/// Pass-invariant hashed lookup view over a [`Subst`].
+///
+/// [`apply_vterm_map_changed`] pays a `BTreeMap` descent per `Lit::Var`
+/// leaf — `LVar`-style keys compare idx-then-sort-then-name, so each probe
+/// is ~log n pointer-chasing node hops of multi-field compares.
+/// Whole-system passes (`subst_system_once`, `rename_precise_system`
+/// Phase 2) apply ONE fixed substitution to every term of every
+/// node/goal/edge/subterm-constraint, so they build this `FxHash` view once
+/// per pass and pay a single hash probe per leaf instead.
+///
+/// Value-identity: the view borrows the same `(var, term)` entries as the
+/// backing `BTreeMap` (`Hash`/`Eq` on `V` agree with the map's key
+/// equality), and [`Self::apply_changed`] mirrors
+/// [`apply_vterm_map_changed`]'s recursion and `None`-when-unchanged
+/// convention exactly — only the leaf-probe container differs, which is
+/// invisible to callers.  The view is consumed by keyed `get` only (never
+/// iterated), so the hash order cannot reach output.
+///
+/// Memory: a pass-local of `subst.len()` borrowed pointer pairs, dropped
+/// with the pass — no persistence, no growth across steps.
+pub struct SubstView<'a, C, V> {
+    map: tamarin_utils::FastMap<&'a V, &'a VTerm<C, V>>,
+}
+
+impl<'a, C, V> SubstView<'a, C, V>
+where
+    C: Ord + Clone,
+    V: Ord + Clone + std::hash::Hash,
+{
+    /// Build the view for one whole-system pass over `s`.
+    pub fn new(s: &'a Subst<C, V>) -> Self {
+        let mut map = tamarin_utils::FastMap::with_capacity_and_hasher(
+            s.map.len(),
+            Default::default(),
+        );
+        for (k, t) in s.map.iter() {
+            map.insert(k, t);
+        }
+        SubstView { map }
+    }
+
+    pub fn is_empty(&self) -> bool { self.map.is_empty() }
+
+    /// Keyed image probe — the hashed counterpart of [`Subst::image_of`].
+    pub fn image_of(&self, v: &V) -> Option<&'a VTerm<C, V>> {
+        self.map.get(v).copied()
+    }
+
+    /// [`apply_vterm_map`] against the view: same empty-map fast path, same
+    /// reuse-original-on-unchanged behaviour, byte-identical output.
+    pub fn apply(&self, t: VTerm<C, V>) -> VTerm<C, V> {
+        if self.map.is_empty() {
+            return t;
+        }
+        match self.apply_changed(&t) {
+            Some(changed) => changed,
+            None => t,
+        }
+    }
+
+    /// [`apply_vterm_map_changed`] against the view: identical recursion,
+    /// identical `Some`-iff-rebuilt convention; only the per-leaf probe
+    /// container differs.
+    pub fn apply_changed(&self, t: &VTerm<C, V>) -> Option<VTerm<C, V>> {
+        match t {
+            Term::Lit(Lit::Var(v)) => self.map.get(v).map(|img| (*img).clone()),
+            Term::Lit(Lit::Con(_)) => None,
+            Term::App(fsym, args) => {
+                cow_map_vec(&args[..], |a| self.apply_changed(a)).map(|mapped| match fsym {
+                    FunSym::Ac(o) => f_app_ac(*o, mapped),
+                    FunSym::C(o) => f_app_c(*o, mapped),
+                    FunSym::NoEq(o) => f_app_no_eq(o.clone(), mapped),
+                    FunSym::List => f_app_list(mapped),
+                })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +365,33 @@ mod tests {
         } else {
             panic!("expected AC application");
         }
+    }
+
+    /// `SubstView` is a pure probe-container swap: `apply_changed`/`apply`
+    /// must agree with the `BTreeMap` path on every term shape — hit,
+    /// miss, nested rebuild, AC re-normalisation, and the
+    /// `None`-when-unchanged convention.
+    #[test]
+    fn subst_view_matches_btree_apply() {
+        let s: Subst<C, V> = Subst::from_list(vec![
+            ("x", const_term(7)),
+            ("y", var_term("z")),
+        ]);
+        let view = SubstView::new(&s);
+        let terms: Vec<VTerm<C, V>> = vec![
+            var_term("x"),                                            // hit (leaf)
+            var_term("w"),                                            // miss (leaf)
+            const_term(3),                                            // constant
+            f_app_no_eq(pair_sym(), vec![var_term("x"), var_term("w")]), // partial rebuild
+            f_app_no_eq(pair_sym(), vec![var_term("w"), const_term(1)]), // unchanged app
+            f_app_ac(AcSym::Mult, vec![var_term("y"), const_term(0)]),   // AC re-sort
+        ];
+        for t in terms {
+            assert_eq!(view.apply_changed(&t), apply_vterm_changed(&s, &t));
+            assert_eq!(view.apply(t.clone()), apply_vterm(&s, t));
+        }
+        assert_eq!(view.image_of(&"x"), s.image_of(&"x"));
+        assert_eq!(view.image_of(&"w"), s.image_of(&"w"));
     }
 
     #[test]

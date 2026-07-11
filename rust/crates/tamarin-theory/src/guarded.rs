@@ -35,7 +35,7 @@ pub use crate::guarded_types::{
 // Guarded data type
 // =============================================================================
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Quant { All, Ex }
 
 // ===========================================================================
@@ -507,7 +507,10 @@ pub fn cmp_fact(a: &GFact, b: &GFact) -> std::cmp::Ordering {
 /// variable leaf inside an atom is either `Bound(n)` (DeBruijn index into
 /// the enclosing binder list) or `Free(LVar)`. Bindings carry only name +
 /// sort — DeBruijn position determines identity.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Hash` is derived alongside the derived `PartialEq` (equal values hash
+/// equal), enabling the implied-formula dedup's `fx_hash_one` prefilter.
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Guarded {
     /// One atomic predicate (may contain Bound vars only when nested under
     /// a sufficient number of `GGuarded` binders).
@@ -1454,18 +1457,50 @@ fn gnot_atom(a: &GAtom) -> Guarded {
 /// `subst_guarded` (e.g. witness-LVar canonicalisation below).
 ///
 /// Keyed by the *interned* `&'static str` name (see [`tamarin_term::intern`]):
-/// `LVar.name` is already interned, so LVar-sourced builds key with zero alloc,
-/// and parser-`VarSpec`-sourced builds/lookups intern via `intern_str` (a
-/// read-locked pool probe, no allocation).  Key equality is unchanged —
+/// `LVar.name` is already interned, so LVar-sourced builds key with zero
+/// alloc, and the (rare, construction-time) parser-`VarSpec`-sourced inserts
+/// intern via `intern_str`.  The per-leaf *lookups* on the substitution-apply
+/// hot path (`subst_term` / `subst_gterm_cow`) do NOT intern: they probe with
+/// the borrowed [`VarSubstKey`], which hashes and compares by content exactly
+/// like the owned key — skipping the intern pool entirely (its probe plus the
+/// map's own hash cost ~3% of stateverif at 1 core, and its lock traffic
+/// ping-pongs across workers at 16).  Key equality is unchanged —
 /// `&str`/`String` both hash/compare by content — so the key set is identical
 /// to a `(String, u64)` map.
 ///
-/// Hashed by `FxBuildHasher` rather than the std `RandomState`.  This is
-/// byte-safe: no `VarSubst` is ever iterated toward output — every consumer is a
-/// keyed `get`/`insert`/`is_empty`/`len` (the `subst_*` fns, `collect_witness_vars`,
+/// `IndexMap` (Fx-hashed) rather than a std `HashMap`: `IndexMap` supports
+/// the borrowed-key `Equivalent` probe above, and its iteration order is
+/// insertion order (deterministic).  Byte-safe: no `VarSubst` is ever
+/// iterated toward output — every consumer is a keyed
+/// `get`/`insert`/`is_empty`/`len` (the `subst_*` fns, `collect_witness_vars`,
 /// `match_atom_via_maude`), and the sole iteration (`combine_substs`' union) is
 /// order-independent in both its `Some`/`None` outcome and its resulting map.
-pub type VarSubst = tamarin_utils::FastMap<(&'static str, u64), p::Term>;
+pub type VarSubst =
+    indexmap::IndexMap<(&'static str, u64), p::Term, rustc_hash::FxBuildHasher>;
+
+/// Borrowed lookup key for [`VarSubst`]: probes by *content* so the
+/// substitution-apply leaves need not intern the leaf's name first.
+///
+/// Hash-consistency with the owned `(&'static str, u64)` key is by
+/// construction: the derived tuple `Hash` feeds `self.0.hash(state)` then
+/// `self.1.hash(state)`, and this impl performs the identical two calls on
+/// the identical value types (`&str`, `u64`), so equal content ⇒ equal hash
+/// under any hasher.  `Equivalent` compares the same two fields, so a probe
+/// hits exactly the entries the interned-key probe would.
+struct VarSubstKey<'a>(&'a str, u64);
+
+impl std::hash::Hash for VarSubstKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+        self.1.hash(state);
+    }
+}
+
+impl indexmap::Equivalent<(&'static str, u64)> for VarSubstKey<'_> {
+    fn equivalent(&self, key: &(&'static str, u64)) -> bool {
+        self.1 == key.1 && self.0 == key.0
+    }
+}
 
 /// Rewrite every Maude-witness LVar named `x` (any idx) to its canonical
 /// `idx == 0` form.  Used to dedup implied formulas in
@@ -1821,6 +1856,10 @@ fn collect_witness_vars(g: &Guarded, out: &mut VarSubst) {
     // variants); we keep only the "x"-named leaves, canonicalising idx→0.
     // `out` is keyed by (interned name, idx), so visitation order is
     // irrelevant to the resulting map.
+    //
+    // Every accepted leaf has name == "x", so intern the key root once
+    // (loop-invariant hoist) instead of per leaf.
+    let x_name: &'static str = tamarin_term::intern::intern_str("x");
     for_each_free_var_in_guarded(g, &mut |v| {
         if v.name == "x" {
             let canonical = p::VarSpec {
@@ -1829,8 +1868,7 @@ fn collect_witness_vars(g: &Guarded, out: &mut VarSubst) {
                 sort: v.sort,
                 typ: v.typ.clone(),
             };
-            out.insert((tamarin_term::intern::intern_str(&v.name), v.idx),
-                p::Term::Var(canonical));
+            out.insert((x_name, v.idx), p::Term::Var(canonical));
         }
     });
 }
@@ -1859,8 +1897,9 @@ pub fn subst_term(t: &p::Term, s: &VarSubst) -> p::Term {
     use p::Term;
     match t {
         Term::Var(v) => {
-            let key = (tamarin_term::intern::intern_str(&v.name), v.idx);
-            if let Some(target) = s.get(&key) {
+            // Content-keyed probe (`VarSubstKey`): no intern-pool traffic,
+            // no allocation — one hash of the (name, idx) pair.
+            if let Some(target) = s.get(&VarSubstKey(&v.name, v.idx)) {
                 target.clone()
             } else {
                 Term::Var(v.clone())
@@ -2005,10 +2044,9 @@ fn subst_gfact_cow(f: &GFact, s: &VarSubst) -> Option<GFact> {
 fn subst_gterm_cow(t: &GTerm, s: &VarSubst) -> Option<GTerm> {
     match t {
         GTerm::Var(BVar::Free(v)) => {
-            // Intern the leaf name to the shared pool key (read-locked probe,
-            // no allocation) instead of cloning a fresh `String` per lookup.
-            let key = (tamarin_term::intern::intern_str(&v.name), v.idx);
-            match s.get(&key) {
+            // Content-keyed probe (`VarSubstKey`): no intern-pool traffic,
+            // no allocation — one hash of the (name, idx) pair.
+            match s.get(&VarSubstKey(&v.name, v.idx)) {
                 None => None,
                 // Value-equality COW, mirroring the term side's compare-based
                 // COW (`map_free_term_cow`, lterm.rs:547-549 `if &nl != l`):

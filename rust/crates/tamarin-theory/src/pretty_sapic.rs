@@ -141,7 +141,6 @@ fn sapic_term_to_doc(
                 .beside(Doc::text(")"))
         }
         VTerm::App(FunSym::NoEq(sym), ts) if ts.is_empty() && *sym == nat_one_sym() => {
-            let _ = ts;
             Doc::text("%1")
         }
         VTerm::App(FunSym::NoEq(sym), _) if *sym == pair_sym() => {

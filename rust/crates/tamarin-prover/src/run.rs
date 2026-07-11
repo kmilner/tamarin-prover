@@ -1416,34 +1416,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
     Ok(overall_status)
 }
 
-/// Compute and store `variant_substs` + `abstracted_rule` on every
-/// `OpenProtoRule` whose RHS contains reducible-headed sub-terms.
-/// Mirrors HS's `variantsProtoRule` pre-computation performed during
-/// `closeTheory`.  Rules with no reducible-headed sub-terms (the common
-/// case for `pair/fst/snd` signatures) get an empty variants list,
-/// which the pretty-printer treats as "trivial AC variant".
-///
-/// HS-parallel: `lib/theory/src/Prover.hs:195`
-///   `(closeTheoryItem <$> L.get thyItems thy0) \`using\` parList rdeepseq`
-/// HS evaluates the per-item `closeTheoryItem` (which calls
-/// `variantsProtoRule`) in parallel via `parList rdeepseq`, preserving
-/// list order.  We mirror via rayon: each item is processed in its own
-/// task, results re-assembled in source order.
-///
-/// Determinism: `abstract_rule_and_variants` allocates fresh vars via
-/// `MaudeHandle::with_fresh_counter_from(avoid_max)` (per-call counter),
-/// so concurrent calls don't share counter state.  Maude IPC is
-/// serialised inside `MaudeHandle::inner` (Arc<Mutex>) — workers
-/// queue on Maude but don't corrupt it.
-///
-/// When `pool` is `Some`, each parallel task acquires its own Maude
-/// subprocess for the duration of one rule, so the M parallel
-/// `abstract_rule_and_variants` calls run on independent subprocesses
-/// instead of contending on the single shared `maude`'s IPC mutex.
-/// Per-call `with_fresh_counter_from(avoid_max)` already guarantees
-/// HS-faithful witness allocation regardless of which pool member
-/// handles a given rule, so output is byte-identical to the
-/// single-Maude path.
 /// Install rayon's global worker pool to the size requested via
 /// `--processors=N` (or a sensible default).
 ///

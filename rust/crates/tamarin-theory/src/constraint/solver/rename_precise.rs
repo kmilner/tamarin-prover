@@ -36,13 +36,16 @@ use crate::guarded::{subst_guarded_cow, VarSubst};
 /// Mirrors Haskell's `renamePrecise` over the `System` record.
 pub fn rename_precise_system(sys: &mut System) {
     // Rewrites every free LVar through a deterministic alpha-rename;
-    // the resulting max-var-idx is almost always smaller.  Invalidate the
-    // full cache unconditionally — non-node fields (edges, goals, formulas,
-    // eq-store, ...) are always rewritten.  The node-component cache is
-    // invalidated ONLY on the real node rewrite in Phase 2 step 1: an
-    // all-identity node rename leaves the nodes byte-identical, so the
-    // node-component max is unchanged and its cache stays valid.
-    sys.invalidate_max_var_idx_cache();
+    // the resulting max-var-idx is almost always smaller.  The full
+    // cache is invalidated after Phase 1, and only when some binding is
+    // a genuine remap (`state.changed`): an all-identity rename leaves
+    // every value byte-identical — Phase 2 then only re-sorts fields and
+    // dedups EQUAL values (the HS `S.fromList` effects), neither of
+    // which can change the max free-var idx, so the cache stays exact.
+    // The node-component cache is invalidated ONLY on the real node
+    // rewrite in Phase 2 step 1: an all-identity NODE rename (a weaker
+    // condition, snapshotted as `nodes_identity` below) already leaves
+    // the nodes byte-identical even when later fields are remapped.
     let mut state = RenameState::new();
 
     // ----------------------------------------------------------------------
@@ -70,7 +73,7 @@ pub fn rename_precise_system(sys: &mut System) {
     // counters in *visit* order, so the newly-grafted Gen_Step gets the
     // FIRST fresh "vr" slot if walked first / LAST if walked last.  For
     // Helper_Loop_and_success this controls whether vr.0 ends up Check
-    // (HS pattern) or Gen_Step (Rust pre-fix pattern), which in turn flips
+    // (HS pattern) or Gen_Step (the unsorted-walk pattern), which in turn flips
     // impliedFormulas' sysActions iteration order and the Disj goal-nrs.
     let mut nodes_sorted: Vec<&(crate::constraint::constraints::NodeId, crate::rule::RuleACInst)>
         = sys.nodes.iter().collect();
@@ -140,12 +143,12 @@ pub fn rename_precise_system(sys: &mut System) {
         c.big.for_each_free(&mut |v| { state.import(v); });
     }
     // eq_store.subst: visit keys (dom) and values (range).  RS's
-    // `Subst` is `BTreeMap`-backed, so `to_list()` already returns
-    // pairs in ascending-key order — matches HS's `HasFrees (LSubst c)
-    // = foldFrees f . sMap` walking `M.Map LVar Term` ascending
-    // (SubstVFree.hs:221).
-    for (k, t) in sys.eq_store.subst.to_list() {
-        state.import(&k);
+    // `Subst` is `BTreeMap`-backed, so the borrowing `iter()` already
+    // yields pairs in ascending-key order — matches HS's `HasFrees
+    // (LSubst c) = foldFrees f . sMap` walking `M.Map LVar Term`
+    // ascending (SubstVFree.hs:221).
+    for (k, t) in sys.eq_store.subst.iter() {
+        state.import(k);
         t.for_each_free(&mut |v| { state.import(v); });
     }
     // eq_store.conj: HS-faithful `HasFrees (SubstVFresh n LVar)` only
@@ -162,8 +165,11 @@ pub fn rename_precise_system(sys: &mut System) {
             = d.substs.iter().collect();
         substs_sorted.sort();
         for s in substs_sorted {
-            for (k, _t) in s.to_list() {
-                state.import(&k);
+            // Borrowing `dom()` walks the same BTreeMap keys in the same
+            // ascending order as `to_list()`, without cloning every
+            // (key, range-term) pair only to discard it.
+            for k in s.dom() {
+                state.import(k);
                 // Note: value vars NOT imported (HS-faithful).
             }
         }
@@ -208,14 +214,28 @@ pub fn rename_precise_system(sys: &mut System) {
     // guarded formulas we use the parser-level `VarSubst`.
     // ----------------------------------------------------------------------
 
+    // `state.changed` covers EVERY field (Phase 1 walks them all), so a
+    // false value proves the whole rename is the identity — see the
+    // invalidation note at the top of this function.
+    let any_remap = state.changed;
     let map = state.into_map();
     if map.is_empty() { return; }
+    if any_remap {
+        sys.invalidate_max_var_idx_cache();
+    }
 
     let term_subst: Subst<tamarin_term::lterm::Name, LVar> = Subst::from_list(
         map.iter().map(|(old, new)| {
             (old.clone(), Term::Lit(Lit::Var(new.clone())))
         }),
     );
+    // Hashed leaf-lookup view over the pass-invariant rename subst
+    // (`SubstView`): Phase 2 applies this ONE fixed var→var substitution to
+    // every goal/eq-store/subterm-store term, so a single FxHash probe per
+    // `Lit::Var` leaf replaces the `BTreeMap` descent — identical lookups,
+    // byte-identical output.  (`from_list` above already drops identity
+    // `x ~> x` entries, so the view's hit set matches the map's exactly.)
+    let term_view = tamarin_term::subst::SubstView::new(&term_subst);
     let formula_subst: VarSubst = map.iter().map(|(old, new)| {
         let sort = lvar_sort_to_sort_hint(new.sort);
         (
@@ -327,7 +347,7 @@ pub fn rename_precise_system(sys: &mut System) {
     // 5. Goals — per-variant rewrite.
     let goals = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.goals));
     let apply_term = |t: LNTerm| -> LNTerm {
-        tamarin_term::subst::apply_vterm(&term_subst, t)
+        term_view.apply(t)
     };
     let apply_fact = |fa: crate::fact::LNFact| -> crate::fact::LNFact {
         crate::fact::Fact {

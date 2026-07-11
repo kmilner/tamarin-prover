@@ -800,6 +800,58 @@ pub fn abstract_rule_and_variants(
     Ok(Some((abstracted_rule, final_substs)))
 }
 
+/// HS-faithful `renamePrecise` (RuleVariants.hs:78) applied to a protocol
+/// rule that has NO reducible-headed sub-terms (so no AC-variant narrowing).
+/// `variantsProtoRule` runs `renamePrecise` on EVERY closed rule, which
+/// re-indexes each variable to a PER-NAME fresh index — packing distinct-named
+/// variables that share no index dependency onto the same low index (e.g. a
+/// SAPiC `lock` + `v` become `lock.0` + `v.0`, not `lock.0` + `v.1`).  Returns
+/// the repacked rule iff `renamePrecise` actually rewrites at least one var;
+/// `None` when the rule is already in per-name precise normal form (so the
+/// caller can leave `abstracted_rule` unset and use the rule as-is).
+///
+/// For these rules the variant disjunction is always the trivial
+/// `[emptySubstVFresh]` (empty domain), so repacking the rule body cannot
+/// misalign any variant substitution.
+pub fn rename_precise_rule_if_changed(rule: &ProtoRuleE) -> Option<ProtoRuleE> {
+    if !rule_renames_under_precise(rule) {
+        return None;
+    }
+    let (packed, _substs) =
+        rename_precise_rule_with_variants(rule.clone(), vec![LNSubstVFresh::empty()]);
+    Some(packed)
+}
+
+/// Would HS's `renamePrecise` (per-name fresh indices, RuleVariants.hs:64)
+/// rewrite any of this rule's free vars?  True iff some var's renamePrecise
+/// index differs from its original — the realistic trigger being two free
+/// vars sharing a name (e.g. `~ltk` and `ltk` → the second becomes `ltk.1`).
+/// Walks vars in the SAME order as `rename_precise_rule_with_variants` (the
+/// variant disjunction has no keys for the trivial-disjunction case, so it
+/// reduces to prems, concs, acts, new_vars).
+fn rule_renames_under_precise(rule: &ProtoRuleE) -> bool {
+    use tamarin_term::lterm::HasFrees;
+    use tamarin_utils::fresh::PreciseFreshState;
+    use std::collections::HashMap;
+    let mut vars: Vec<LVar> = Vec::new();
+    {
+        let mut collect = |v: &LVar| vars.push(v.clone());
+        for f in &rule.premises { for t in &f.terms { t.for_each_free(&mut collect); } }
+        for f in &rule.conclusions { for t in &f.terms { t.for_each_free(&mut collect); } }
+        for f in &rule.actions { for t in &f.terms { t.for_each_free(&mut collect); } }
+        for t in &rule.new_vars { t.for_each_free(&mut collect); }
+    }
+    let mut state = PreciseFreshState::nothing_used();
+    let mut map: HashMap<LVar, LVar> = HashMap::new();
+    for v in &vars {
+        if map.contains_key(v) { continue; }
+        let idx = state.fresh_ident(v.name);
+        if idx != v.idx { return true; }
+        map.insert(v.clone(), LVar { name: v.name, sort: v.sort, idx });
+    }
+    false
+}
+
 /// Apply HS-style `renamePrecise` to a rule + its variant disjunction
 /// substs.  Mirrors HS `Precise.evalFresh (renamePrecise x) Precise.nothingUsed`
 /// applied to a `Rule ProtoRuleACInfo` (variants live INSIDE info).
@@ -826,58 +878,6 @@ pub fn abstract_rule_and_variants(
 /// HS leaves alone, diverging downstream variable idxs and AC-sorted
 /// variant order (symptom on JKL_TS1_2004: `Sessk_reveal_case_3` vs HS
 /// `Sessk_reveal_case_4`).
-/// Would HS's `renamePrecise` (per-name fresh indices, RuleVariants.hs:64)
-/// rewrite any of this rule's free vars?  True iff some var's renamePrecise
-/// index differs from its original — the realistic trigger being two free
-/// vars sharing a name (e.g. `~ltk` and `ltk` → the second becomes `ltk.1`).
-/// Walks vars in the SAME order as `rename_precise_rule_with_variants` (the
-/// variant disjunction has no keys for the trivial-disjunction case, so it
-/// reduces to prems, concs, acts, new_vars).
-/// HS-faithful `renamePrecise` (RuleVariants.hs:78) applied to a protocol
-/// rule that has NO reducible-headed sub-terms (so no AC-variant narrowing).
-/// `variantsProtoRule` runs `renamePrecise` on EVERY closed rule, which
-/// re-indexes each variable to a PER-NAME fresh index — packing distinct-named
-/// variables that share no index dependency onto the same low index (e.g. a
-/// SAPiC `lock` + `v` become `lock.0` + `v.0`, not `lock.0` + `v.1`).  Returns
-/// the repacked rule iff `renamePrecise` actually rewrites at least one var;
-/// `None` when the rule is already in per-name precise normal form (so the
-/// caller can leave `abstracted_rule` unset and use the rule as-is).
-///
-/// For these rules the variant disjunction is always the trivial
-/// `[emptySubstVFresh]` (empty domain), so repacking the rule body cannot
-/// misalign any variant substitution.
-pub fn rename_precise_rule_if_changed(rule: &ProtoRuleE) -> Option<ProtoRuleE> {
-    if !rule_renames_under_precise(rule) {
-        return None;
-    }
-    let (packed, _substs) =
-        rename_precise_rule_with_variants(rule.clone(), vec![LNSubstVFresh::empty()]);
-    Some(packed)
-}
-
-fn rule_renames_under_precise(rule: &ProtoRuleE) -> bool {
-    use tamarin_term::lterm::HasFrees;
-    use tamarin_utils::fresh::PreciseFreshState;
-    use std::collections::HashMap;
-    let mut vars: Vec<LVar> = Vec::new();
-    {
-        let mut collect = |v: &LVar| vars.push(v.clone());
-        for f in &rule.premises { for t in &f.terms { t.for_each_free(&mut collect); } }
-        for f in &rule.conclusions { for t in &f.terms { t.for_each_free(&mut collect); } }
-        for f in &rule.actions { for t in &f.terms { t.for_each_free(&mut collect); } }
-        for t in &rule.new_vars { t.for_each_free(&mut collect); }
-    }
-    let mut state = PreciseFreshState::nothing_used();
-    let mut map: HashMap<LVar, LVar> = HashMap::new();
-    for v in &vars {
-        if map.contains_key(v) { continue; }
-        let idx = state.fresh_ident(v.name);
-        if idx != v.idx { return true; }
-        map.insert(v.clone(), LVar { name: v.name, sort: v.sort, idx });
-    }
-    false
-}
-
 fn rename_precise_rule_with_variants(
     rule: ProtoRuleE,
     substs: Vec<LNSubstVFresh>,

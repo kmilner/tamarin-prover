@@ -1070,11 +1070,12 @@ impl EquationStore {
             if d.substs.is_empty() { continue; }
             let first = &d.substs[0];
             // For each (v, t) in first where t is a constant, check
-            // every other subst maps v to the same t.
-            for (v, t) in first.to_list() {
-                if !is_constant_term(&t) { continue; }
+            // every other subst maps v to the same t.  Borrowing scan —
+            // entries are cloned only on the (rare) match.
+            for (v, t) in first.iter() {
+                if !is_constant_term(t) { continue; }
                 let common = d.substs.iter().all(|s| {
-                    s.image_of(&v).map(|got| got == &t).unwrap_or(false)
+                    s.image_of(v).map(|got| got == t).unwrap_or(false)
                 });
                 if common {
                     common_mapping = Some((v.clone(), t.clone(), idx));
@@ -1172,12 +1173,16 @@ impl EquationStore {
             if d.substs.is_empty() { continue; }
             let first = &d.substs[0];
             // Find all (v, v') pairs in `first` with same image, v < v'.
+            // Borrowing scan (same entry order as `to_list`); pairs are
+            // cloned only when pushed.
             let pairs: Vec<(LVar, LVar)> = {
-                let entries = first.to_list();
+                let entries: Vec<(&LVar, &LNTerm)> = first.iter().collect();
                 let mut out = Vec::new();
                 for (i, (v, t)) in entries.iter().enumerate() {
                     for (v2, t2) in entries.iter().skip(i + 1) {
-                        if t == t2 && v < v2 { out.push((v.clone(), v2.clone())); }
+                        if t == t2 && v < v2 {
+                            out.push(((*v).clone(), (*v2).clone()));
+                        }
                     }
                 }
                 out
@@ -1278,8 +1283,9 @@ impl EquationStore {
         for (idx, d) in self.conj.iter().enumerate() {
             if d.substs.is_empty() { continue; }
             let first = &d.substs[0];
-            for (v, t) in first.to_list() {
-                let lx = match &t {
+            // Borrowing scan — entries are cloned only on match.
+            for (v, t) in first.iter() {
+                let lx = match t {
                     Term::Lit(Lit::Var(lx)) => lx.clone(),
                     _ => continue,
                 };
@@ -1292,7 +1298,7 @@ impl EquationStore {
                 let mut lvs: Vec<LVar> = vec![lx.clone()];
                 let mut all_match = true;
                 for other in d.substs.iter().skip(1) {
-                    match other.image_of(&v) {
+                    match other.image_of(v) {
                         Some(Term::Lit(Lit::Var(ly))) if ly.sort == lx.sort => {
                             lvs.push(ly.clone());
                         }
@@ -1374,15 +1380,16 @@ impl EquationStore {
         'outer: for (idx, d) in self.conj.iter().enumerate() {
             if d.substs.is_empty() { continue; }
             let first = &d.substs[0];
-            for (v, t) in first.to_list() {
-                let (op, args0) = match &t {
+            // Borrowing scan — entries are cloned only on match.
+            for (v, t) in first.iter() {
+                let (op, args0) = match t {
                     Term::App(o, a) => (o.clone(), a.to_vec()),
                     _ => continue,
                 };
                 let mut argss: Vec<Vec<LNTerm>> = vec![args0];
                 let mut ok = true;
                 for other in d.substs.iter().skip(1) {
-                    match other.image_of(&v) {
+                    match other.image_of(v) {
                         Some(Term::App(o2, a2)) if o2 == &op => {
                             argss.push(a2.to_vec());
                         }
@@ -1889,12 +1896,25 @@ impl EquationStore {
         asubst: &LNSubst,
     ) -> Result<(), AddEqsError> {
         let __aes_caller = std::panic::Location::caller();
-        // Domain/range disjointness check.
-        let dom: BTreeSet<LVar> = asubst.dom().cloned().collect();
-        let range_vars: BTreeSet<LVar> = asubst.range()
-            .flat_map(tamarin_term::vterm::vars_vterm)
-            .collect();
-        if dom.intersection(&range_vars).next().is_some() {
+        // Domain/range disjointness check.  Streaming: walk the range terms
+        // in place and probe each free var against the domain map directly
+        // (`image_of` = `BTreeMap::get`) — same boolean as the eager
+        // dom-set ∩ range-var-set intersection, without materialising two
+        // `BTreeSet`s (plus a `vars_vterm` Vec per range term) per call on
+        // the common disjoint path.
+        let mut dom_range_overlap = false;
+        {
+            use tamarin_term::lterm::HasFrees;
+            for t in asubst.range() {
+                t.for_each_free(&mut |v| {
+                    if !dom_range_overlap && asubst.image_of(v).is_some() {
+                        dom_range_overlap = true;
+                    }
+                });
+                if dom_range_overlap { break; }
+            }
+        }
+        if dom_range_overlap {
             return Err(AddEqsError::Maude(
                 "applyEqStore: dom and vrange not disjoint".into()));
         }
@@ -1962,9 +1982,28 @@ impl EquationStore {
         use tamarin_term::term::Term;
         use tamarin_term::vterm::Lit;
         let fresh_base = self.fresh_baseline();
-        let new_subst_range_vars: BTreeSet<LVar> = new_subst.range()
-            .flat_map(tamarin_term::vterm::vars_vterm)
-            .collect();
+        // Range vars of the composed subst.  Consumed only by membership
+        // probes (`contains`) and — via `new_subst_range_max` — by the
+        // per-variant `avoid_max` fold, so a hash set built with an in-place
+        // walk replaces the eager BTreeSet (`vars_vterm` allocated a
+        // sorted/deduped Vec per range term).  The max is hoisted here once
+        // instead of re-folding the whole set per variant.
+        let mut new_subst_range_vars: tamarin_utils::FastSet<LVar> =
+            Default::default();
+        let mut new_subst_range_max: u64 = 0;
+        {
+            use tamarin_term::lterm::HasFrees;
+            for t in new_subst.range() {
+                t.for_each_free(&mut |v| {
+                    if v.idx > new_subst_range_max {
+                        new_subst_range_max = v.idx;
+                    }
+                    if !new_subst_range_vars.contains(v) {
+                        new_subst_range_vars.insert(v.clone());
+                    }
+                });
+            }
+        }
         let mut new_conj: Vec<EqDisj> = Vec::with_capacity(self.conj.len());
         // HS-faithful per-variant fresh-state isolation.  In HS, each
         // `applyBound` call runs `renameAvoiding (range) avoidSet` →
@@ -1999,7 +2038,11 @@ impl EquationStore {
             let mut new_substs: Vec<LNSubstVFresh> = Vec::new();
             for s in &d.substs {
                 let dbg_in = if dbg_call { Some(s.to_list()) } else { None };
-                let bindings: Vec<(LVar, LNTerm)> = s.to_list();
+                // Borrowing view of the variant's entries: every consumer
+                // below either reads through the refs or clones exactly the
+                // parts it keeps, so the eager `to_list` pair clone per
+                // variant was pure churn.
+                let bindings: Vec<(&LVar, &LNTerm)> = s.iter().collect();
                 if bindings.is_empty() {
                     // Empty subst (identity) — preserves.
                     new_substs.push(s.clone());
@@ -2010,13 +2053,11 @@ impl EquationStore {
                     continue;
                 }
                 // Compute avoid_max = max idx across (domVFresh s ∪
-                // varsRange newsubst).
+                // varsRange newsubst); the newsubst side is the hoisted
+                // per-call `new_subst_range_max`.
                 let avoid_max: u64 = {
-                    let mut m: u64 = 0;
+                    let mut m: u64 = new_subst_range_max;
                     for (k, _) in &bindings { if k.idx > m { m = k.idx; } }
-                    for v in &new_subst_range_vars {
-                        if v.idx > m { m = v.idx; }
-                    }
                     m
                 };
                 // Find min idx across all RHS terms' vars.
@@ -2056,7 +2097,7 @@ impl EquationStore {
                     let shift: i128 = fresh_start - (min as i128);
                     if shift != 0 {
                         use tamarin_term::lterm::HasFrees;
-                        bindings.iter().map(|(_, t)| {
+                        bindings.iter().map(|&(_, t)| {
                             t.clone().map_free(&mut |v| {
                                 let new_idx: i128 = (v.idx as i128) + shift;
                                 let new_idx_u64 = if new_idx < 0 { 0 }
@@ -2066,16 +2107,16 @@ impl EquationStore {
                             })
                         }).collect()
                     } else {
-                        bindings.iter().map(|(_, t)| t.clone()).collect()
+                        bindings.iter().map(|&(_, t)| t.clone()).collect()
                     }
                 } else {
-                    bindings.iter().map(|(_, t)| t.clone()).collect()
+                    bindings.iter().map(|&(_, t)| t.clone()).collect()
                 };
                 // Build equations.  LHS = `apply new_subst (Var lv)`,
                 // RHS = renamed `t`.
                 let eqs: Vec<Equal<LNTerm>> = bindings.iter()
                     .zip(renamed_rhs)
-                    .map(|((lv, _), t)| {
+                    .map(|(&(lv, _), t)| {
                         let lv_t = Term::Lit(Lit::Var(lv.clone()));
                         Equal {
                             lhs: tamarin_term::subst::apply_vterm(&new_subst, lv_t),
@@ -2188,8 +2229,8 @@ impl EquationStore {
                 // it, the next aes call's uniform RHS shift treats it as a
                 // witness and renames it, breaking the binding to the
                 // rule's premise (Client_auth Ltk vs In ltkS desync).
-                let orig_dom: BTreeSet<LVar> = bindings.iter()
-                    .map(|(k, _)| k.clone())
+                let orig_dom: tamarin_utils::FastSet<LVar> = bindings.iter()
+                    .map(|&(k, _)| k.clone())
                     .collect();
                 for raw in unifiers {
                     // TAM_DBG_RAW_UNIFIER=1: dump Maude's raw output.
@@ -2245,7 +2286,10 @@ impl EquationStore {
                     use tamarin_term::term::Term;
                     use tamarin_term::vterm::Lit;
                     // Compute current subst's domain (after restrict).
-                    let current_dom: BTreeSet<LVar> = raw.iter()
+                    // Membership-only (like `orig_dom` and `seen` below —
+                    // `to_lift` carries the byte-visible order), so hash
+                    // sets replace the per-unifier BTreeSet builds.
+                    let current_dom: tamarin_utils::FastSet<LVar> = raw.iter()
                         .map(|(k, _)| k.clone())
                         .collect();
                     // `orig_dom` (this variant's ORIGINAL bindings.keys —
@@ -2256,7 +2300,7 @@ impl EquationStore {
                     // in the current domain.  These are the ones to
                     // lift.
                     let mut to_lift: Vec<LVar> = Vec::new();
-                    let mut seen: BTreeSet<LVar> = BTreeSet::new();
+                    let mut seen: tamarin_utils::FastSet<LVar> = Default::default();
                     for (_, t) in &raw {
                         t.for_each_free(&mut |v: &LVar| {
                             let is_system = new_subst_range_vars.contains(v)

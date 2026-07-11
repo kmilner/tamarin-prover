@@ -164,8 +164,8 @@ impl<'a> TreeParser<'a> {
         if self.try_kw("UNFINISHABLE") { return Ok(ParsedMethod::Unfinishable); }
         // SOLVED is intentionally NOT a proofMethod: HS `proofMethod`
         // (Proof.hs:76-85) never lists it; it is handled only at the
-        // skeleton level (`solvedProof`, Proof.hs:102-103) — see
-        // `proof_skeleton` line 77.
+        // skeleton level (`solvedProof`, Proof.hs:102-103) — see the
+        // `SOLVED` branch of `proof_skeleton`.
         if self.try_kw("solve") {
             // `solve( <goal-text> )`.  HS parses an inner `goal`; we
             // capture the parenthesised text verbatim and best-effort

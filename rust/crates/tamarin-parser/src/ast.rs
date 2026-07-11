@@ -481,7 +481,7 @@ pub struct Fact {
     pub annotations: Vec<FactAnnotation>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum FactAnnotation {
     SolveFirst,
     SolveLast,
@@ -549,7 +549,7 @@ pub enum Term {
     PatMatch(Box<Term>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Exp,    // ^
     Mult,   // *

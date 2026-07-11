@@ -342,10 +342,10 @@ impl<'ctx> Reduction<'ctx> {
         let fa_prem = self.sys.nodes.iter()
             .find(|(n, _)| n == &e.tgt.0)
             .and_then(|(_, r)| r.premises.get(e.tgt.1.0).cloned());
-        // When either fact is missing (rule lookup failed) the tail
-        // does a raw insert — `insert_edge_tail`'s `None` path mirrors
-        // the old fall-through.  Shouldn't happen in practice unless the
-        // caller passes an edge for a node that's not in the system.
+        // When either fact is missing (rule lookup failed),
+        // `insert_edge_tail`'s `None` path does a raw insert.  Shouldn't
+        // happen in practice unless the caller passes an edge for a node
+        // that's not in the system.
         self.insert_edge_tail(site, e, fa_conc.as_ref(), fa_prem.as_ref())
     }
 
@@ -493,10 +493,25 @@ impl<'ctx> Reduction<'ctx> {
     fn subst_system_once(&mut self) {
         if self.sys.eq_store.subst.is_empty() { return; }
         let subst = self.sys.eq_store.subst.clone();
+        // Hashed leaf-lookup view over the pass-invariant `subst`
+        // (`SubstView`): every term walk below probes this one fixed map at
+        // every `Lit::Var` leaf, so a single FxHash probe replaces the
+        // `BTreeMap` descent — same entries, same lookup results,
+        // byte-identical output.  Pass-local; dropped with the pass.
+        let subst_view = tamarin_term::subst::SubstView::new(&subst);
         // Substitution rewrites every term/fact/rule under the current
         // subst — vars in the domain get replaced (possibly by vars
-        // with smaller idx), so max-var-idx can LOWER.  Invalidate.
-        self.sys.invalidate_max_var_idx_cache();
+        // with smaller idx), so max-var-idx can LOWER.  Invalidation of
+        // `max_var_idx_cache` is CONDITIONAL per section below: most
+        // passes are idempotent re-applications (the subst was already
+        // applied by an earlier pass), where every rewrite is a value
+        // no-op and the pass only re-sorts / dedups EQUAL values —
+        // neither of which can change the max free-var idx.  Each
+        // section tracks "did any value actually change" (via the same
+        // COW `None`-when-unchanged contracts the rewrites already use)
+        // and invalidates only then, so an identity pass keeps both
+        // caches valid and the dozens of `bounds_max` calls per proof
+        // step stay O(1) hits instead of full re-walks.
         // Build the parser-AST `VarSubst` ONCE for the whole pass.  It is
         // derived purely from `subst` (fixed above), so it is identical
         // for every `Disj` goal AND the formula/lemma substitution below.
@@ -524,13 +539,14 @@ impl<'ctx> Reduction<'ctx> {
             crate::guarded::VarSubst::default()
         };
         let map_var = |v: tamarin_term::lterm::LVar| -> tamarin_term::lterm::LVar {
-            let id_term = tamarin_term::term::Term::Lit(
-                tamarin_term::vterm::Lit::Var(v.clone()));
-            let mapped = tamarin_term::subst::apply_vterm(&subst, id_term);
-            if let tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(w)) = mapped {
-                w
-            } else {
-                v
+            // Keyed image probe: a Var→Var binding renames the id; an
+            // app-headed or absent image keeps the original var — exactly
+            // the former `apply_vterm` on a `Lit::Var` term, minus the
+            // temporary term construction.
+            match subst_view.image_of(&v) {
+                Some(tamarin_term::term::Term::Lit(
+                    tamarin_term::vterm::Lit::Var(w))) => w.clone(),
+                _ => v,
             }
         };
         // 1. Nodes: rewrite node ids and rule contents. When two
@@ -608,7 +624,7 @@ impl<'ctx> Reduction<'ctx> {
         let apply_to_fact = |fa: &crate::fact::LNFact| -> Option<crate::fact::LNFact> {
             let mut new_terms: Option<Vec<tamarin_term::lterm::LNTerm>> = None;
             for (i, t) in fa.terms.iter().enumerate() {
-                if let Some(changed) = tamarin_term::subst::apply_vterm_changed(&subst, t) {
+                if let Some(changed) = subst_view.apply_changed(t) {
                     new_terms.get_or_insert_with(|| fa.terms.clone())[i] = changed;
                 }
             }
@@ -641,10 +657,17 @@ impl<'ctx> Reduction<'ctx> {
         // RS mirrors HS in two passes: Pass 1 renames node-ids only (rules stay
         // un-substituted so rule_eqs at collision time see the raw rules), Pass 2
         // applies the fact-term substitution.
+        // Cache-invalidation change bit for the node section: set when a
+        // node id is actually renamed, two nodes collide (one entry is
+        // dropped), or a rule's contents are rewritten in Pass 2.  When it
+        // stays `false`, the node multiset is value-identical (Pass 1's
+        // sort is order-only), so both max caches remain exact.
+        let mut nodes_value_changed = false;
         let mut id_renamed_nodes: Vec<(crate::constraint::constraints::NodeId, RuleACInst)> = Vec::new();
         for (id, rule) in nodes {
             let id_orig = id.clone();
             let new_id = map_var(id);
+            if new_id != id_orig { nodes_value_changed = true; }
             if tamarin_utils::env_gate!("TAM_DBG_SUBST_NODE_RENAME") && new_id != id_orig {
                 let path = crate::constraint::solver::trace::case_path_string();
                 let rule_name = rule_case_name(&rule);
@@ -736,7 +759,7 @@ impl<'ctx> Reduction<'ctx> {
             -> Option<Vec<tamarin_term::lterm::LNTerm>> {
             let mut out: Option<Vec<tamarin_term::lterm::LNTerm>> = None;
             for (i, t) in terms.iter().enumerate() {
-                if let Some(changed) = tamarin_term::subst::apply_vterm_changed(&subst, t) {
+                if let Some(changed) = subst_view.apply_changed(t) {
                     out.get_or_insert_with(|| terms.to_vec())[i] = changed;
                 }
             }
@@ -758,6 +781,7 @@ impl<'ctx> Reduction<'ctx> {
             {
                 continue;
             }
+            nodes_value_changed = true;
             *rule = crate::rule::Rule {
                 info: rule.info.clone(),
                 premises: new_premises.unwrap_or_else(|| rule.premises.clone()),
@@ -772,9 +796,13 @@ impl<'ctx> Reduction<'ctx> {
         }
         // subst_system rewrites node terms (and may merge colliding node
         // ids) — the node max can DROP, so invalidate the node component
-        // too, not just the full cache.
-        self.sys.invalidate_max_var_idx_cache();
-        self.sys.invalidate_node_max_cache();
+        // too, not just the full cache.  Conditional: an identity pass
+        // (no id renamed, no collision, every rule COW-unchanged) leaves
+        // the node multiset value-identical, so both caches stay exact.
+        if nodes_value_changed || collisions > 0 {
+            self.sys.invalidate_max_var_idx_cache();
+            self.sys.invalidate_node_max_cache();
+        }
         self.sys.nodes = std::sync::Arc::new(new_nodes);
         if shape_mismatch {
             // Force a `gfalse` formula so `has_false_formula` picks up
@@ -797,10 +825,16 @@ impl<'ctx> Reduction<'ctx> {
                 self.changed = ChangeIndicator::Changed;
             }
         }
-        // 2. Edges: rewrite both endpoints' node ids.
+        // 2. Edges: rewrite both endpoints' node ids.  Track value
+        // changes for the conditional cache invalidation — the sort +
+        // dedup below only reorder / drop EQUAL values, which cannot
+        // change the max free-var idx.
+        let mut edges_value_changed = false;
         for e in self.sys.edges.iter_mut() {
-            e.src.0 = map_var(e.src.0.clone());
-            e.tgt.0 = map_var(e.tgt.0.clone());
+            let new_src = map_var(e.src.0.clone());
+            if new_src != e.src.0 { edges_value_changed = true; e.src.0 = new_src; }
+            let new_tgt = map_var(e.tgt.0.clone());
+            if new_tgt != e.tgt.0 { edges_value_changed = true; e.tgt.0 = new_tgt; }
         }
         // Full (non-adjacent) dedup: see comment in
         // simplify::apply_node_eqs.  Vec::dedup() only removes
@@ -809,12 +843,17 @@ impl<'ctx> Reduction<'ctx> {
         let mut tmp: Vec<_> = std::mem::take(&mut self.sys.edges);
         tmp.sort();
         tmp.dedup();
-        self.sys.invalidate_max_var_idx_cache();
+        if edges_value_changed {
+            self.sys.invalidate_max_var_idx_cache();
+        }
         self.sys.edges = tmp;
         // 3. Last-atom.
         if let Some(last) = self.sys.last_atom.take() {
-            self.sys.invalidate_max_var_idx_cache();
-            self.sys.last_atom = Some(map_var(last));
+            let new_last = map_var(last.clone());
+            if new_last != last {
+                self.sys.invalidate_max_var_idx_cache();
+            }
+            self.sys.last_atom = Some(new_last);
         }
         // 4. Less atoms.
         //
@@ -853,13 +892,22 @@ impl<'ctx> Reduction<'ctx> {
             crate::constraint::constraints::NodeId,
             crate::constraint::constraints::NodeId,
         )> = tamarin_utils::FastSet::default();
+        // Change bit for the conditional cache invalidation — the dedup
+        // drops only atoms whose image EQUALS a kept one, so an
+        // all-identity rewrite cannot change the max free-var idx.
+        let mut less_value_changed = false;
         for la in std::mem::take(&mut self.sys.less_atoms) {
             let mut la = la;
-            la.smaller = map_var(la.smaller.clone());
-            la.larger  = map_var(la.larger.clone());
+            let new_smaller = map_var(la.smaller.clone());
+            if new_smaller != la.smaller { less_value_changed = true; la.smaller = new_smaller; }
+            let new_larger = map_var(la.larger.clone());
+            if new_larger != la.larger { less_value_changed = true; la.larger = new_larger; }
             if seen_less.insert((la.smaller.clone(), la.larger.clone())) {
                 new_less.push(la);
             }
+        }
+        if less_value_changed {
+            self.sys.invalidate_max_var_idx_cache();
         }
         self.sys.less_atoms = new_less;
         // 5. Goals: rewrite the Goal's free vars. Goals are deduped
@@ -887,10 +935,6 @@ impl<'ctx> Reduction<'ctx> {
         // HS's `substGoals` applies subst via the `Apply` instance and
         // does NOT normalise; `normDG` runs only inside impliedOrInitial
         // (System.hs:1283).
-        let apply_term = |t: tamarin_term::lterm::LNTerm|
-            -> tamarin_term::lterm::LNTerm {
-            tamarin_term::subst::apply_vterm(&subst, t)
-        };
         let mut new_goals: Vec<(Goal, crate::constraint::system::GoalStatus)>
             = Vec::with_capacity(goals.len());
         // Dedup keys, kept parallel to `new_goals`: precomputing each
@@ -898,19 +942,56 @@ impl<'ctx> Reduction<'ctx> {
         // it for every accumulated goal on every iteration) keeps the
         // merge below from being quadratic in canonicalisation cost.
         let mut new_goal_keys: Vec<Goal> = Vec::with_capacity(goals.len());
+        // Change bit for the goal section's conditional cache
+        // invalidation (`Cell` because several closures below set it
+        // while the main loop also writes it).  Goal merges and
+        // `normalise_disj_list` dedups drop only values EQUAL to kept
+        // ones, and the pre-loop sort is order-only — neither can change
+        // the max free-var idx, so only genuine term/id rewrites count.
+        let goals_value_changed = std::cell::Cell::new(false);
         // Apply full term substitution to a fact's term list — required
         // when the eq-store maps a var to a non-var term (e.g.
         // `m → h(...)` from an Eq restriction), in which case
         // `map_var` falls back to identity and the goal's terms never
         // get rewritten.  Mirrors Haskell's `substFacts` in
         // `substSystem`.
+        // COW: rewrite only the terms the subst actually changes and keep
+        // the original fact when none do — value-identical to the former
+        // unconditional rebuild (mirrors `apply_to_fact` in the node
+        // section) and doubles as the change bit.
         let apply_fact = |fa: crate::fact::LNFact| -> crate::fact::LNFact {
-            crate::fact::Fact {
-                tag: fa.tag,
-                annotations: fa.annotations,
-                terms: fa.terms.into_iter()
-                    .map(&apply_term)
-                    .collect(),
+            let mut new_terms: Option<Vec<tamarin_term::lterm::LNTerm>> = None;
+            for (i, t) in fa.terms.iter().enumerate() {
+                if let Some(changed) = tamarin_term::subst::apply_vterm_changed(&subst, t) {
+                    new_terms.get_or_insert_with(|| fa.terms.clone())[i] = changed;
+                }
+            }
+            match new_terms {
+                Some(terms) => {
+                    goals_value_changed.set(true);
+                    crate::fact::Fact {
+                        tag: fa.tag,
+                        annotations: fa.annotations,
+                        terms,
+                    }
+                }
+                None => fa,
+            }
+        };
+        // `map_var` twin that records a genuine node-id rewrite.  Direct
+        // binding lookup, value-equivalent to `map_var` on a bare var:
+        // no binding, or a non-Var image, keeps `v` (exactly `map_var`'s
+        // `else { v }` fallback); a Var image is a genuine rename
+        // (`from_list` drops trivial `x ~> x` entries, so `w != v`).
+        let map_var_tracked = |v: crate::constraint::constraints::NodeId|
+            -> crate::constraint::constraints::NodeId {
+            match subst.image_of(&v) {
+                Some(tamarin_term::term::Term::Lit(
+                    tamarin_term::vterm::Lit::Var(w))) => {
+                    goals_value_changed.set(true);
+                    w.clone()
+                }
+                _ => v,
             }
         };
         // Mirrors Haskell's `substGoals` (Reduction.hs:637-651) — for
@@ -930,9 +1011,16 @@ impl<'ctx> Reduction<'ctx> {
             let needs_reinsert = if let Goal::Action(_, fa) = &g {
                 if fa.tag == crate::fact::FactTag::Ku && !st.solved {
                     if let Some(m_pre) = fa.terms.first() {
-                        let m_post = apply_term(m_pre.clone());
+                        // Guard-first COW probe: `apply_changed == None` ⇔
+                        // the former `m_post != *m_pre` compare was false
+                        // with `m_post` the reused original, so the walk is
+                        // skipped for the dominant non-msg-var case and the
+                        // deep compare runs only on an actual rebuild (a
+                        // rebuild can still be value-equal via AC re-sort,
+                        // so the compare itself is kept).
                         (tamarin_term::lterm::is_msg_var(m_pre) || is_product_or_union(m_pre))
-                            && m_post != *m_pre
+                            && subst_view.apply_changed(m_pre)
+                                .is_some_and(|m_post| m_post != *m_pre)
                     } else { false }
                 } else { false }
             } else { false };
@@ -952,13 +1040,13 @@ impl<'ctx> Reduction<'ctx> {
             // + Destroy_charn + Loop_charn).
             let g2 = match g {
                 Goal::Action(i, fa) =>
-                    Goal::Action(map_var(i), apply_fact(fa)),
+                    Goal::Action(map_var_tracked(i), apply_fact(fa)),
                 Goal::Premise(p, fa) =>
-                    Goal::Premise((map_var(p.0), p.1), apply_fact(fa)),
+                    Goal::Premise((map_var_tracked(p.0), p.1), apply_fact(fa)),
                 Goal::Chain(c, p) =>
                     Goal::Chain(
-                        (map_var(c.0), c.1),
-                        (map_var(p.0), p.1)),
+                        (map_var_tracked(c.0), c.1),
+                        (map_var_tracked(p.0), p.1)),
                 Goal::Disj(d) => {
                     if parser_subst.is_empty() {
                         Goal::Disj(d)
@@ -975,10 +1063,19 @@ impl<'ctx> Reduction<'ctx> {
                                 let mut cur = match crate::guarded::subst_guarded_cow(
                                     &alt, &parser_subst)
                                 {
-                                    None => return crate::guarded::
+                                    None => return match crate::guarded::
                                         canonicalize_ac_in_guarded_cow(&alt)
-                                        .unwrap_or(alt),
-                                    Some(s0) => s0,
+                                    {
+                                        Some(c) => {
+                                            goals_value_changed.set(true);
+                                            c
+                                        }
+                                        None => alt,
+                                    },
+                                    Some(s0) => {
+                                        goals_value_changed.set(true);
+                                        s0
+                                    }
                                 };
                                 for _ in 0..15 {
                                     match crate::guarded::subst_guarded_cow(
@@ -1010,7 +1107,19 @@ impl<'ctx> Reduction<'ctx> {
                     }
                 },
                 Goal::Split(s) => Goal::Split(s),
-                Goal::Subterm((s, t)) => Goal::Subterm((apply_term(s), apply_term(t))),
+                Goal::Subterm((s, t)) => {
+                    // COW twin of `apply_term` with change tracking (same
+                    // `None`-when-unchanged contract as `apply_fact`).
+                    let ns = match tamarin_term::subst::apply_vterm_changed(&subst, &s) {
+                        Some(n) => { goals_value_changed.set(true); n }
+                        None => s,
+                    };
+                    let nt = match tamarin_term::subst::apply_vterm_changed(&subst, &t) {
+                        Some(n) => { goals_value_changed.set(true); n }
+                        None => t,
+                    };
+                    Goal::Subterm((ns, nt))
+                }
             };
             if needs_reinsert {
                 if let Goal::Action(i, fa) = &g2 {
@@ -1053,7 +1162,11 @@ impl<'ctx> Reduction<'ctx> {
                 }
             }
         }
-        self.sys.invalidate_max_var_idx_cache();
+        // Conditional: a `needs_reinsert` removal always implies a changed
+        // Action fact (`m_post != m_pre`), so it is covered by the flag.
+        if goals_value_changed.get() {
+            self.sys.invalidate_max_var_idx_cache();
+        }
         self.sys.goals = std::sync::Arc::new(new_goals);
         for (i, fa, st) in to_insert_action {
             self.insert_goal_with_loop_flag(Goal::Action(i, fa), st.looping);
@@ -1130,20 +1243,39 @@ impl<'ctx> Reduction<'ctx> {
                 // equal, and the raw rebuild keeps both copies.
                 Some(crate::guarded::normalise_stored_formula_owned(cur))
             };
+            // Change bit for the conditional cache invalidation — the
+            // `dedup_preserve_order` calls below drop only formulas EQUAL
+            // to kept ones, which cannot change the max free-var idx.
+            let mut formulas_value_changed = false;
             for f in self.sys.formulas.iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
-                    if new_f != **f { *f = std::sync::Arc::new(new_f); self.changed = ChangeIndicator::Changed; }
+                    if new_f != **f {
+                        *f = std::sync::Arc::new(new_f);
+                        self.changed = ChangeIndicator::Changed;
+                        formulas_value_changed = true;
+                    }
                 }
             }
             for f in self.sys.solved_formulas.iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
-                    if new_f != **f { *f = std::sync::Arc::new(new_f); self.changed = ChangeIndicator::Changed; }
+                    if new_f != **f {
+                        *f = std::sync::Arc::new(new_f);
+                        self.changed = ChangeIndicator::Changed;
+                        formulas_value_changed = true;
+                    }
                 }
             }
             for f in self.sys.lemmas.iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
-                    if new_f != **f { *f = std::sync::Arc::new(new_f); self.changed = ChangeIndicator::Changed; }
+                    if new_f != **f {
+                        *f = std::sync::Arc::new(new_f);
+                        self.changed = ChangeIndicator::Changed;
+                        formulas_value_changed = true;
+                    }
                 }
+            }
+            if formulas_value_changed {
+                self.sys.invalidate_max_var_idx_cache();
             }
             // HS-faithful: `substFormulas`/`substSolvedFormulas`/`substLemmas`
             // apply via `Apply LNSubst (Set Guarded)` (Reduction.hs:593-595),
@@ -1199,34 +1331,38 @@ impl<'ctx> Reduction<'ctx> {
         // `Apply LNSubst SubtermStore` doesn't normalise — neither do
         // we.  (`apply_term`'s normalise path is only used when the
         // eager-normalise env var is set; HS-default is non-normalising.)
+        // COW probe + compare-on-rebuild: `apply_changed == None` ⇔ the
+        // former eager apply returned the original term, making the old `!=`
+        // compare false — so both the pre-apply clone and the deep compare
+        // are skipped on unchanged terms.  On `Some`, the value compare is
+        // KEPT (an AC re-sort can rebuild a value-equal term, and
+        // `changed_sst` must track VALUE change exactly as before).
         let mut changed_sst = false;
         let pos_subs = std::mem::take(&mut self.sys.subterm_store_mut().subterms);
         let mut new_subs = Vec::with_capacity(pos_subs.len());
-        for c in pos_subs {
-            let new_small = tamarin_term::subst::apply_vterm(&subst, c.small.clone());
-            let new_big = tamarin_term::subst::apply_vterm(&subst, c.big.clone());
-            if new_small != c.small || new_big != c.big {
-                changed_sst = true;
+        for mut c in pos_subs {
+            if let Some(new_small) = subst_view.apply_changed(&c.small) {
+                if new_small != c.small { changed_sst = true; }
+                c.small = new_small;
             }
-            new_subs.push(crate::tools::subterm_store::SubtermConstraint {
-                small: new_small,
-                big: new_big,
-                propagated: c.propagated,
-            });
+            if let Some(new_big) = subst_view.apply_changed(&c.big) {
+                if new_big != c.big { changed_sst = true; }
+                c.big = new_big;
+            }
+            new_subs.push(c);
         }
         let solved = std::mem::take(&mut self.sys.subterm_store_mut().solved_subterms);
         let mut new_solved = Vec::with_capacity(solved.len());
-        for c in solved {
-            let new_small = tamarin_term::subst::apply_vterm(&subst, c.small.clone());
-            let new_big = tamarin_term::subst::apply_vterm(&subst, c.big.clone());
-            if new_small != c.small || new_big != c.big {
-                changed_sst = true;
+        for mut c in solved {
+            if let Some(new_small) = subst_view.apply_changed(&c.small) {
+                if new_small != c.small { changed_sst = true; }
+                c.small = new_small;
             }
-            new_solved.push(crate::tools::subterm_store::SubtermConstraint {
-                small: new_small,
-                big: new_big,
-                propagated: c.propagated,
-            });
+            if let Some(new_big) = subst_view.apply_changed(&c.big) {
+                if new_big != c.big { changed_sst = true; }
+                c.big = new_big;
+            }
+            new_solved.push(c);
         }
         // negSubterms (HS field `a`) get substituted too; oldNegSubterms
         // (field `e`) do NOT — this is what re-arms the simpSplitNegSt
@@ -1235,13 +1371,16 @@ impl<'ctx> Reduction<'ctx> {
         let negs = std::mem::take(&mut self.sys.subterm_store_mut().neg_subterms);
         let mut new_negs: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> =
             Vec::with_capacity(negs.len());
-        for (s, t) in negs {
-            let new_s = tamarin_term::subst::apply_vterm(&subst, s.clone());
-            let new_t = tamarin_term::subst::apply_vterm(&subst, t.clone());
-            if new_s != s || new_t != t {
-                changed_sst = true;
+        for (mut s, mut t) in negs {
+            if let Some(new_s) = subst_view.apply_changed(&s) {
+                if new_s != s { changed_sst = true; }
+                s = new_s;
             }
-            let pair = (new_s, new_t);
+            if let Some(new_t) = subst_view.apply_changed(&t) {
+                if new_t != t { changed_sst = true; }
+                t = new_t;
+            }
+            let pair = (s, t);
             if !new_negs.contains(&pair) { new_negs.push(pair); }
         }
         new_negs.sort();
@@ -1416,8 +1555,8 @@ impl<'ctx> Reduction<'ctx> {
             // no-goals variant): `simp_singleton_avoiding` reads it only
             // under the three debug gates — the fold calls
             // `fresh_to_free_avoiding`, which ignores it — so build it only
-            // when a gate is on.  The debug-branch body is byte-for-byte the
-            // old inline walk so debug traces stay identical.
+            // when a gate is on.  The debug-branch body performs the full
+            // inline walk, so debug traces stay identical.
             let sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> =
                 if preserve_dbg_gates_enabled() {
                     let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
@@ -2061,10 +2200,10 @@ impl<'ctx> Reduction<'ctx> {
                         // slightly_weaker_invariant: when the IH-body
                         // Conj decomposes, the nested ¬Less / ¬Eq
                         // arrive here with mark=False; HS keeps
-                        // sSolvedFormulas at 3, RS previously bumped
-                        // it to 4 (+ ¬Less, ¬Eq) → IH-Disj reads as
-                        // already-solved, skeleton replay picks the
-                        // wrong open goal.
+                        // sSolvedFormulas at 3, and without the `mark`
+                        // guard RS would bump it to 4 (+ ¬Less, ¬Eq) →
+                        // IH-Disj reads as already-solved, skeleton
+                        // replay picks the wrong open goal.
                         if mark && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
                             self.sys.solved_formulas.push(std::sync::Arc::new(g.clone()));
@@ -3432,20 +3571,13 @@ fn illegal_coerce(p_rule: &RuleACInst, fa_conc: &crate::fact::LNFact) -> bool {
     if !is_coerce_rule_inst(p_rule) { return false; }
     if fa_conc.terms.len() != 1 { return false; }
     let t = &fa_conc.terms[0];
-    is_pair(t) || is_inverse(t) || is_product(t)
+    is_pair(t) || tamarin_term::term::is_inverse(t) || is_product(t)
 }
 
 fn is_pair(t: &tamarin_term::lterm::LNTerm) -> bool {
     use tamarin_term::function_symbols::FunSym;
     if let tamarin_term::term::Term::App(FunSym::NoEq(s), args) = t {
         return s.name == b"pair" && args.len() == 2;
-    }
-    false
-}
-fn is_inverse(t: &tamarin_term::lterm::LNTerm) -> bool {
-    use tamarin_term::function_symbols::{FunSym, INV_SYM_STRING};
-    if let tamarin_term::term::Term::App(FunSym::NoEq(s), args) = t {
-        return s.name == INV_SYM_STRING && args.len() == 1;
     }
     false
 }
@@ -3597,9 +3729,10 @@ pub fn bounds_max(sys: &System) -> u64 {
         if bounds_max_verify_enabled() {
             let actual = bounds_max_uncached(sys);
             if v != actual {
+                bounds_max_dump_fields(sys);
                 panic!(
-                    "bounds_max cache mismatch: cache={}, actual={}",
-                    v, actual,
+                    "bounds_max cache mismatch: cache={}, actual={} (nodes={}, rest={})",
+                    v, actual, bounds_max_nodes(sys), bounds_max_rest(sys),
                 );
             }
         }
@@ -3633,6 +3766,72 @@ pub fn bounds_max(sys: &System) -> u64 {
         sys.max_var_idx_cache.set(Some(v));
     }
     v
+}
+
+/// Verify-failure diagnostic: print the per-field max breakdown so a
+/// cache mismatch identifies WHICH field the stale cache missed.  Only
+/// called from the `TAM_RS_VERIFY_BOUNDS_CACHE` panic paths.
+fn bounds_max_dump_fields(sys: &System) {
+    let mut m_edges = 0u64;
+    for e in &sys.edges {
+        bm_lvar(&e.src.0, &mut m_edges);
+        bm_lvar(&e.tgt.0, &mut m_edges);
+    }
+    let mut m_less = 0u64;
+    for l in &sys.less_atoms {
+        bm_lvar(&l.smaller, &mut m_less);
+        bm_lvar(&l.larger, &mut m_less);
+    }
+    let mut m_last = 0u64;
+    if let Some(la) = &sys.last_atom { bm_lvar(la, &mut m_last); }
+    let mut m_st = 0u64;
+    for c in sys.subterm_store.subterms.iter()
+        .chain(sys.subterm_store.solved_subterms.iter())
+    {
+        bm_term(&c.small, &mut m_st);
+        bm_term(&c.big, &mut m_st);
+    }
+    for (s, t) in &sys.subterm_store.neg_subterms {
+        bm_term(s, &mut m_st);
+        bm_term(t, &mut m_st);
+    }
+    let mut m_goals = 0u64;
+    for (g, _) in sys.goals.iter() {
+        use crate::constraint::constraints::Goal;
+        match g {
+            Goal::Action(i, fa) => { bm_lvar(i, &mut m_goals); bm_fact(fa, &mut m_goals); }
+            Goal::Premise(p, fa) => { bm_lvar(&p.0, &mut m_goals); bm_fact(fa, &mut m_goals); }
+            Goal::Chain(c, p) => { bm_lvar(&c.0, &mut m_goals); bm_lvar(&p.0, &mut m_goals); }
+            Goal::Subterm((s, t)) => { bm_term(s, &mut m_goals); bm_term(t, &mut m_goals); }
+            Goal::Disj(_) | Goal::Split(_) => {}
+        }
+    }
+    let mut m_formulas = 0u64;
+    for f in sys.formulas.iter()
+        .chain(sys.solved_formulas.iter())
+        .chain(sys.lemmas.iter())
+    {
+        let n = crate::guarded::max_var_idx(f);
+        if n > m_formulas { m_formulas = n; }
+    }
+    let mut m_eq = 0u64;
+    for v in sys.eq_store.subst.dom() {
+        if v.idx > m_eq { m_eq = v.idx; }
+    }
+    for t in sys.eq_store.subst.range() { bm_term(t, &mut m_eq); }
+    let mut m_conj = 0u64;
+    for d in &sys.eq_store.conj {
+        for s in &d.substs {
+            for v in s.dom() {
+                if v.idx > m_conj { m_conj = v.idx; }
+            }
+        }
+    }
+    eprintln!(
+        "[BOUNDS_VERIFY] nodes={} edges={} less={} last={} subterm={} goals={} formulas={} eq_subst={} eq_conj_dom={}",
+        bounds_max_nodes(sys), m_edges, m_less, m_last, m_st, m_goals,
+        m_formulas, m_eq, m_conj,
+    );
 }
 
 #[inline]
@@ -4004,6 +4203,15 @@ fn fanout_arm_systems(outcome: SolveOutcome, base: System) -> Vec<System> {
         SolveOutcome::Cases(arms) => {
             arms.into_iter().map(|arm_eq| {
                 let mut s = base.clone();
+                // The arm store carries fresh Maude witnesses (and lost
+                // `base`'s taken-out store), so `base`'s copied max-var
+                // cache is stale in BOTH directions — invalidate.  (Was a
+                // latent stale-LOW window: Joux hit it under
+                // TAM_RS_VERIFY_BOUNDS_CACHE even before the conditional
+                // subst_system invalidation landed, masked in output only
+                // because `new_inheriting` takes `max(avoid, inherit_next)`
+                // and the forked counter already covered the witnesses.)
+                s.invalidate_max_var_idx_cache();
                 s.eq_store = std::sync::Arc::new(arm_eq);
                 s
             }).collect()

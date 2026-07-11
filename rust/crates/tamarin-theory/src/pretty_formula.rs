@@ -614,23 +614,21 @@ fn collect_free_vars_term(t: &p::Term, bound: &[String], state: &mut PreciseFres
 /// (Bound vars are positional, not named) and inserts (name, idx+1) into
 /// the Precise state.  Mirrors HS `avoidPreciseVars . frees`.
 fn avoid_precise_guarded(g: &Guarded) -> PreciseFreshState {
-    use crate::guarded_types::{collect_free_atom};
+    use crate::guarded_types::collect_free_atom;
     let mut state = PreciseFreshState::nothing_used();
+    // Seed one atom's free vars into the Precise state (HS `avoidPreciseVars`).
+    fn seed_atom_frees(a: &crate::guarded::GAtom, state: &mut PreciseFreshState) {
+        let mut frees = Vec::new();
+        collect_free_atom(a, &mut frees);
+        for v in frees { avoid_precise_insert(state, &v.name, v.idx); }
+    }
     fn walk(g: &Guarded, state: &mut PreciseFreshState) {
         match g {
-            Guarded::Atom(a) => {
-                let mut frees = Vec::new();
-                collect_free_atom(a, &mut frees);
-                for v in frees { avoid_precise_insert(state, &v.name, v.idx); }
-            }
+            Guarded::Atom(a) => seed_atom_frees(a, state),
             Guarded::Disj(xs) | Guarded::Conj(xs) =>
                 for x in xs { walk(x, state); },
             Guarded::GGuarded { guards, body, .. } => {
-                for a in guards {
-                    let mut frees = Vec::new();
-                    collect_free_atom(a, &mut frees);
-                    for v in frees { avoid_precise_insert(state, &v.name, v.idx); }
-                }
+                for a in guards { seed_atom_frees(a, state); }
                 walk(body, state);
             }
         }

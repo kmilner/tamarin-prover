@@ -123,12 +123,12 @@ pub fn parse_variants_reply(reply: &[u8]) -> Result<Vec<MSubst>, ParseError> {
     loop {
         if c.eat_str(b"No more variants.") { break; }
         if !c.eat_str(b"Variant ") {
-            // optional `#`
             return Err(ParseError(format!(
                 "expected `Variant ` or `No more variants.`; got {:?}",
                 String::from_utf8_lossy(&c.rest()[..c.rest().len().min(40)])
             )));
         }
+        // Maude prints `Variant #N`; the `#` is optional.
         let _ = c.eat(b'#');
         let _ = c.read_decimal().ok_or_else(|| ParseError("variant id".into()))?;
         let _ = c.skip_eol();

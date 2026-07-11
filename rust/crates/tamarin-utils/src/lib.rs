@@ -33,3 +33,14 @@ pub mod unicode;
 pub type FastMap<K, V> = std::collections::HashMap<K, V, rustc_hash::FxBuildHasher>;
 /// Fast non-cryptographic hash set — see [`FastMap`].
 pub type FastSet<K> = std::collections::HashSet<K, rustc_hash::FxBuildHasher>;
+
+/// Hash one value with the same `FxBuildHasher` the [`FastMap`]/[`FastSet`]
+/// aliases use.  For hash-prefilter patterns over deep ASTs: `Hash`/`Eq`
+/// consistency guarantees equal values hash equal, so
+/// `fx_hash_one(a) != fx_hash_one(b)` proves `a != b` and the deep equality
+/// walk only runs on hash agreement.  The hash itself must never reach
+/// observable output — it is a filter, not an ordering key.
+pub fn fx_hash_one<T: std::hash::Hash + ?Sized>(value: &T) -> u64 {
+    use std::hash::BuildHasher as _;
+    rustc_hash::FxBuildHasher.hash_one(value)
+}

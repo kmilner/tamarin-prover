@@ -142,7 +142,7 @@ fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &FunSig) -> bool {
                     }
                     // inv(mult(...)) where any factor is inverse → reducible
                     if let Term::App(FunSym::Ac(AcSym::Mult), inner_args) = &args[0] {
-                        if inner_args.iter().any(is_inverse) { return false; }
+                        if inner_args.iter().any(crate::term::is_inverse) { return false; }
                     }
                     // inv(one) → reducible
                     if is_nullary(&args[0], ONE_SYM_STRING) { return false; }
@@ -207,11 +207,6 @@ fn is_nullary(t: &LNTerm, name: &[u8]) -> bool {
     } else { false }
 }
 
-fn is_inverse(t: &LNTerm) -> bool {
-    use crate::function_symbols::INV_SYM_STRING;
-    if let Term::App(FunSym::NoEq(s), _) = t { s.name == INV_SYM_STRING } else { false }
-}
-
 fn is_product(t: &LNTerm) -> bool {
     matches!(t, Term::App(FunSym::Ac(AcSym::Mult), _))
 }
@@ -226,7 +221,7 @@ fn invalid_mult(ts: &[LNTerm]) -> bool {
     use crate::function_symbols::AcSym;
     // Partition into (inverses, non-inverses).
     let (inverses, factors): (Vec<&LNTerm>, Vec<&LNTerm>) =
-        ts.iter().partition(|t| is_inverse(t));
+        ts.iter().partition(|t| crate::term::is_inverse(t));
     match inverses.len() {
         0 => false,
         1 => {

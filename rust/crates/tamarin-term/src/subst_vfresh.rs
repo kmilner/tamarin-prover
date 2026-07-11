@@ -214,12 +214,14 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
     /// vs_new uniformly, preserving relative ordering — mirrors HS's
     /// `rename` semantics (LTerm.hs:607-614).
     pub fn extend_with_renaming(&self, vs: &[LVar]) -> Self {
-        use std::collections::BTreeSet;
-        let dom: BTreeSet<LVar> = self.dom().cloned().collect();
+        // Domain probes go straight to the map (`image_of` = `BTreeMap::get`)
+        // and the first-appearance dedup uses a hash `seen` set: both are
+        // membership-only, so neither needs the ordered `BTreeSet` builds the
+        // eager version materialised per call.  `vs_new` carries the order.
         let mut vs_new: Vec<LVar> = Vec::new();
-        let mut seen: BTreeSet<LVar> = BTreeSet::new();
+        let mut seen: tamarin_utils::FastSet<LVar> = Default::default();
         for v in vs {
-            if dom.contains(v) { continue; }
+            if self.image_of(v).is_some() { continue; }
             if seen.insert(v.clone()) {
                 vs_new.push(v.clone());
             }
@@ -228,10 +230,18 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
             return self.clone();
         }
         // Fresh state: `evalFreshAvoiding (varsRangeVFresh s)` =
-        //   succ . maxIdx . vars (or 0 if empty).
-        let avoid = self.vars_range();
-        let fresh_start: u64 = avoid.iter().map(|v| v.idx).max()
-            .map(|m| m + 1).unwrap_or(0);
+        //   succ . maxIdx . vars (or 0 if empty).  Only the max idx is
+        //   consumed, so fold it over the range terms directly instead of
+        //   materialising the sorted/deduped `vars_range` list (dedup and
+        //   order are irrelevant to a max).
+        let mut avoid_max: Option<u64> = None;
+        for t in self.range() {
+            use crate::lterm::HasFrees;
+            t.for_each_free(&mut |v: &LVar| {
+                avoid_max = Some(avoid_max.map_or(v.idx, |m| m.max(v.idx)));
+            });
+        }
+        let fresh_start: u64 = avoid_max.map(|m| m + 1).unwrap_or(0);
         // HS's `rename`: minVar, maxVar; freshStart from monad; shift =
         // freshStart - minVar; new idx = old idx + shift (signed).
         let vs_min: u64 = vs_new.iter().map(|v| v.idx).min().unwrap();
@@ -250,9 +260,15 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
                 (v.clone(), Term::Lit(Lit::Var(v_new)))
             })
             .collect();
-        let mut combined: Vec<(LVar, VTerm<C, LVar>)> = self.to_list();
-        combined.extend(new_entries);
-        Self::from_list(combined)
+        // `from_list(to_list() ++ new_entries)` rebuilt the whole map from a
+        // Vec; the keys are disjoint (`vs_new` excludes `dom self`), so
+        // cloning the map and inserting the new entries yields the identical
+        // BTreeMap without the intermediate Vec + re-sort.
+        let mut map = self.map.clone();
+        for (v, t) in new_entries {
+            map.insert(v, t);
+        }
+        SubstVFresh { map }
     }
 
     /// HS-faithful `freshToFreeAvoidingFast`:  rename all range vars
@@ -273,20 +289,22 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
     pub fn fresh_to_free_uniform_shift(&self, fresh_start: u64)
         -> crate::subst::Subst<C, LVar>
     {
-        use std::collections::BTreeMap;
         use crate::subst::Subst;
         // Collect ALL distinct range vars in insertion order.
         let range_vars: Vec<LVar> = distinct_range_vars(self.range());
         if range_vars.is_empty() {
-            // No range vars to rename — just downgrade.
-            let pairs: Vec<(LVar, VTerm<C, LVar>)> = self.to_list();
-            return Subst::from_list(pairs);
+            // No range vars to rename — just downgrade (through `from_list`,
+            // which drops trivial `x ~> x` mappings exactly as before).
+            return Subst::from_list(self.iter().map(|(v, t)| (v.clone(), t.clone())));
         }
         // HS: `evalFreshAvoiding t` initial counter = succ . maxIdx . frees t,
         // precomputed by the caller and handed in as `fresh_start`.
         let min_idx = range_vars.iter().map(|v| v.idx).min().unwrap();
         let shift: i128 = fresh_start as i128 - min_idx as i128;
-        let mut rename: BTreeMap<LVar, LVar> = BTreeMap::new();
+        // Lookup-only rename table: keyed by LVar (interned name, sort, idx),
+        // probed once per var occurrence in the range walk below — a hash map
+        // beats per-occurrence BTree descents and is never iterated.
+        let mut rename: tamarin_utils::FastMap<LVar, LVar> = Default::default();
         for old in &range_vars {
             let new_idx = shifted_idx(old.idx, shift);
             let new = LVar {
@@ -296,10 +314,12 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
             };
             rename.insert(old.clone(), new);
         }
-        let mut pairs: Vec<(LVar, VTerm<C, LVar>)> = Vec::new();
-        for (v, t) in self.to_list() {
-            let renamed = rename_lvars_in_vterm(&t, &rename);
-            pairs.push((v, renamed));
+        let mut pairs: Vec<(LVar, VTerm<C, LVar>)> = Vec::with_capacity(self.len());
+        // Borrowing walk: every range term is rebuilt by the rename anyway,
+        // so cloning the entries first (`to_list`) was pure churn.
+        for (v, t) in self.iter() {
+            let renamed = rename_lvars_in_vterm(t, &rename);
+            pairs.push((v.clone(), renamed));
         }
         Subst::from_list(pairs)
     }
@@ -470,11 +490,13 @@ fn rename_lvars_with_hint<C: Ord + Clone, F: FnMut(u64) -> u64>(
 /// `freeToFreshRaw`: re-tag a free `Subst`'s entries as a `SubstVFresh`.
 /// Mirrors HS `Term.Substitution.freeToFreshRaw` (Substitution.hs:84-85):
 /// considers all variables in the range as fresh.  No structural change —
-/// just a type-level reinterpretation.
+/// just a type-level reinterpretation, so the owned map moves across
+/// wholesale (`SubstVFresh::from_list` does no trivial-drop; the
+/// `from_list(to_list)` round-trip rebuilt the identical map from clones).
 pub fn free_to_fresh_raw<C: Ord + Clone>(s: crate::subst::Subst<C, LVar>)
     -> LSubstVFresh<C>
 {
-    LSubstVFresh::from_list(s.to_list())
+    LSubstVFresh { map: s.into_map() }
 }
 
 /// `composeVFresh s1_0 s2` (Substitution.hs:41-47).  Dispatches to a
@@ -541,11 +563,11 @@ fn compose_vfresh_empty_s1<C>(s2: &crate::subst::Subst<C, LVar>) -> LSubstVFresh
 where
     C: Ord + Clone,
 {
-    use std::collections::BTreeSet;
     // Distinct range vars of s2 (varsRange s2), plus the max idx over all of
     // s2's free vars (its avoid set; frees s2 walks BOTH domain and range).
+    // The `seen` set is membership-only (`range_vars` carries the order).
     let mut range_vars: Vec<LVar> = Vec::new();
-    let mut seen: BTreeSet<LVar> = BTreeSet::new();
+    let mut seen: tamarin_utils::FastSet<LVar> = Default::default();
     let mut max_idx: Option<u64> = None;
     for v in s2.dom() {
         max_idx = Some(max_idx.map_or(v.idx, |m| m.max(v.idx)));
@@ -560,9 +582,11 @@ where
     }
     // No range vars ⇒ nothing to rename: extendWithRenaming is a no-op and
     // freshToFreeAvoidingFast is the identity, so composeVFresh collapses to
-    // `freeToFreshRaw s2`.
+    // `freeToFreshRaw s2` — a pure re-tag, so clone the map wholesale
+    // (`SubstVFresh::from_list` does no trivial-drop; the entries are
+    // identical to the `from_list(to_list)` round-trip).
     if range_vars.is_empty() {
-        return LSubstVFresh::from_list(s2.to_list());
+        return SubstVFresh { map: s2.clone().into_map() };
     }
     let vs_min: u64 = range_vars.iter().map(|v| v.idx).min().unwrap();
     // `fresh_start` = succ . maxIdx . frees s2 (= maxIdx over dom+range + 1).
@@ -590,14 +614,38 @@ where
     }
     // `compose`'s second arm: s1's own bindings whose domain s2 does not
     // rebind, added unconditionally (w' ≠ w, so never trivial anyway).
-    let dom: BTreeSet<&LVar> = s2.dom().collect();
+    // Probe s2's map directly (`image_of` = `BTreeMap::get`) instead of
+    // materialising a domain set for a handful of membership tests.
     for w in &range_vars {
-        if !dom.contains(w) {
+        if s2.image_of(w).is_none() {
             // `s1_map[w]` exists for every range var by construction.
             out.push((w.clone(), s1_map[w].clone()));
         }
     }
     LSubstVFresh::from_list(out)
+}
+
+/// Collect all distinct range vars in first-appearance order.
+///
+/// Walks the given range terms (each expanded via `vars_vterm`, whose per-term
+/// order is preserved) and keeps only the first occurrence of each var, guarded
+/// by a `seen` set.  Shared by `fresh_to_free_uniform_shift` and
+/// `compose_vfresh_general`, which differ only in which subst's range is walked.
+/// The `seen` set is membership-only (`out` carries the byte-visible order),
+/// so a hash set replaces the per-occurrence BTree insert.
+fn distinct_range_vars<'a, C: 'a>(
+    range: impl Iterator<Item = &'a VTerm<C, LVar>>,
+) -> Vec<LVar> {
+    let mut out: Vec<LVar> = Vec::new();
+    let mut seen: tamarin_utils::FastSet<LVar> = Default::default();
+    for t in range {
+        for v in crate::vterm::vars_vterm(t) {
+            if seen.insert(v.clone()) {
+                out.push(v);
+            }
+        }
+    }
+    out
 }
 
 /// `composeVFresh s1 s2`: composes the fresh substitution `s1` with the
@@ -626,27 +674,6 @@ where
 /// (RuleVariants.hs:74-77).  Without this pipeline, two variants whose
 /// Maude-back-conversion shapes happen to collide will end up with
 /// structurally-identical range vars and collapse at `perform_split`.
-/// Collect all distinct range vars in first-appearance order.
-///
-/// Walks the given range terms (each expanded via `vars_vterm`, whose per-term
-/// order is preserved) and keeps only the first occurrence of each var, guarded
-/// by a `seen` set.  Shared by `fresh_to_free_uniform_shift` and
-/// `compose_vfresh_general`, which differ only in which subst's range is walked.
-fn distinct_range_vars<'a, C: 'a>(
-    range: impl Iterator<Item = &'a VTerm<C, LVar>>,
-) -> Vec<LVar> {
-    let mut out: Vec<LVar> = Vec::new();
-    let mut seen: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
-    for t in range {
-        for v in crate::vterm::vars_vterm(t) {
-            if seen.insert(v.clone()) {
-                out.push(v);
-            }
-        }
-    }
-    out
-}
-
 fn compose_vfresh_general<C>(
     s1_0: &LSubstVFresh<C>,
     s2: &crate::subst::Subst<C, LVar>,
@@ -676,9 +703,11 @@ where
     let mut bump = |idx: u64| { max_idx = Some(max_idx.map_or(idx, |m| m.max(idx))); };
     // s2's domain
     for v in s2.dom() { bump(v.idx); }
-    // s2's range vars
+    // s2's range vars — visited in place (`for_each_free`); `vars_vterm`'s
+    // per-term sort/dedup Vec is irrelevant to a max.
     for t in s2.range() {
-        for v in crate::vterm::vars_vterm(t) { bump(v.idx); }
+        use crate::lterm::HasFrees;
+        t.for_each_free(&mut |v: &LVar| bump(v.idx));
     }
     // s1_0's domain keys ONLY (HS-faithful: frees of a SubstVFresh = keys).
     for v in s1_0.dom() { bump(v.idx); }
@@ -691,7 +720,7 @@ where
 /// Walk a VTerm, applying a LVar→LVar rename.
 fn rename_lvars_in_vterm<C: Clone>(
     t: &VTerm<C, LVar>,
-    rename: &BTreeMap<LVar, LVar>,
+    rename: &tamarin_utils::FastMap<LVar, LVar>,
 ) -> VTerm<C, LVar> {
     match t {
         Term::Lit(Lit::Var(v)) => {

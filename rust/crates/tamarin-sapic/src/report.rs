@@ -234,7 +234,7 @@ fn subst(loc: &Option<SapicTerm>, t: &SapicTerm) -> SapicTerm {
                 if s.name == b"report" && args.len() == 1 {
                     let inner = subst(&Some(loc.clone()), &args[0]);
                     return tamarin_term::term::f_app_no_eq(
-                        sapic_rep_sym(),
+                        tamarin_term::builtin::rep_sym(),
                         vec![inner, loc.clone()],
                     );
                 }
@@ -249,12 +249,6 @@ fn subst(loc: &Option<SapicTerm>, t: &SapicTerm) -> SapicTerm {
             }
         }
     }
-}
-
-/// `repSym` as a `NoEqSym` over the SAPIC term universe (same symbol as
-/// `tamarin_term::builtin::rep_sym`, private binary constructor).
-fn sapic_rep_sym() -> tamarin_term::function_symbols::NoEqSym {
-    tamarin_term::builtin::rep_sym()
 }
 
 #[cfg(test)]
