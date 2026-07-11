@@ -1,16 +1,30 @@
 # tamarin-prover (Rust port)
 
-In-progress Rust port of the [Tamarin Prover](https://tamarin-prover.github.io/).
-The Haskell sources under `../lib/` and `../src/` remain canonical; this port
-mirrors them function-for-function, targeting **byte-identical raw `--prove`
-output** against the Haskell prover.
+A Rust port of the [Tamarin Prover](https://tamarin-prover.github.io/) that
+reproduces the Haskell prover's output byte-for-byte — and is 2–37× faster
+on several-fold less memory.
+
+- **Parity:** byte-identical `--prove` output with the Haskell prover on a
+  402-file corpus — every theory under `examples/` that uses only ported
+  features. Stored proofs replay and validate across provers in both
+  directions, and the interactive web UI agrees page-for-page with the
+  Haskell server across ≈380 theories / ≈120,000 crawled pages.
+- **Performance:** 2–37× faster across 1–16 cores with several-fold less
+  peak memory (≈4–26× at one core) — see [Performance](#performance).
+- **Not yet ported:** observational equivalence (`--diff`) and the
+  accountability frontend — see [Not yet ported](#not-yet-ported).
+- **Verification:** [TESTING.md](TESTING.md) documents the parity-gate
+  ladder and divergence-debugging tools.
+
+The Haskell sources under `../lib/` and `../src/` remain canonical; the port
+mirrors them function-for-function. Crate dependency order:
 
 ```
 utils → term → parser → theory → {sapic, server} → tamarin-prover
 ```
 
-(`accountability` and `export` are standalone placeholder crates, not yet wired
-into the binary — see *Not yet ported*.)
+(`accountability` and `export` are standalone placeholder crates, not yet
+wired into the binary.)
 
 ## Build
 
@@ -22,25 +36,12 @@ cargo test               # Rust unit + integration tests
 
 The release profile uses `lto = "fat"` and `codegen-units = 1`.
 
-## Status
+## Parity status
 
-The correctness criterion is byte-identical raw `--prove` output, ignoring the
-volatile header lines (Git revision, compile time, processing time).
-
-The parity gate (`scripts/corpus_file_diff.sh`, corpus in
-`scripts/parity_corpus.txt`) compares the Rust port against the Haskell prover
-on a 402-file corpus: the theories under `examples/` that use only ported
-features and that Haskell proves — each under its canonical invocation.
-Files whose upstream case-study recipe requires extra arguments run with
-exactly those arguments on both provers (`scripts/file_flags.tsv`: the
-`--auto-sources` spore suite, the seqdfs regression, the cwd-relative
-default-oracle test). This spans `classic/`, `ake/`, `sp14/`, the `csf*/`
-series, `features/`, `loops/`, `post17/`, `regression/`, `related_work/`,
-the multiset-rewrite theories in `csf18-xor/`, `jcs19-xor/`, `idbased/`,
-`eurosp19-eccDAA/`, `esorics23-bluetooth/`, `csf20-disputeResolution/`,
-`fm24-cardpayments/`, `wisec21-5G-handover/`, `wireguard/`, the POIDC and
-`thesis-LaraSchmid-evoting/` corpora, and 79 SAPiC `process:` theories from
-`sapic/`.
+The correctness criterion is byte-identical raw `--prove` output, ignoring
+the volatile header lines (Git revision, compile time, processing time).
+The batch gate (`scripts/corpus_file_diff.sh`, corpus in
+`scripts/parity_corpus.txt`) currently reports:
 
 | Result | Files | Meaning |
 |--------|------:|---------|
@@ -48,51 +49,36 @@ the multiset-rewrite theories in `csf18-xor/`, `jcs19-xor/`, `idbased/`,
 | DIFF  |   0 | — |
 | SKIP  |   0 | — |
 
-Every theory in the corpus is reproduced byte-for-byte: no rendering,
-proof-search, or verdict divergence remains. Theories outside the corpus
-require an unported feature — accountability (`accounts for`) or
-observational equivalence (`--diff`) — or are excluded by upstream's own
-regression suite as non-terminating (the same files upstream's Makefile
-omits or marks "not finished"). Observational-equivalence (`--diff`)
-theories re-enter once that mode is ported.
+The corpus spans every feature-complete theory family under `examples/` —
+classic and AKE protocols, XOR / bilinear-pairing / multiset theories, the
+auto-sources suites, and 77 SAPiC `process:` theories — each run under its
+canonical upstream invocation (`scripts/file_flags.tsv`). Theories outside
+the corpus need an unported feature (accountability, `--diff`) or are the
+same files upstream's own regression suite excludes as non-terminating.
 
-Stored proofs are validated, not just displayed: loading a proof-carrying file
-runs the same proof-checking pass as the Haskell prover, replaying every stored
-step against a freshly derived constraint system (`--prove` additionally
-re-derives pruned or unverified subtrees). Proof files are cross-compatible in
-both directions — a proof exported by either prover parses, replays, and
-validates on the other, with byte-identical analysis output from either
-loader.
+Stored proofs are validated, not just displayed: loading a proof-carrying
+file replays every stored step against a freshly derived constraint system,
+and proof files are cross-compatible in both directions with byte-identical
+analysis output from either loader.
 
-The interactive web UI (`interactive` subcommand) is verified against the
-Haskell server by a semantic crawl gate (`scripts/web_parity.sh`): both
-servers are booted on the same theory, every proof-tree, constraint-system,
-graph and source page is crawled — autoproving each lemma along the way —
-and compared after normalisation. Across the crawlable corpus (≈380
-theories, ≈120,000 pages) the two UIs agree page-for-page except for a
-small documented residue that renders *identical* proof states with
-different internal counter values: fresh-variable witness indices and
-goal-creation numbers shown in constraint-system diagnostic views, plus the
-graph renderer's term-abbreviation picks on a few AC-heavy theories. These
-stem from Haskell's Maude round-trip emitting redundant identity unifiers
-that the Rust port resolves inline; they never appear in proof scripts,
-proof structure, or verdicts.
+The interactive web UI (`interactive` subcommand) is verified by a semantic
+crawl gate (`scripts/web_parity.sh`): both servers are booted on the same
+theory, every proof-tree, constraint-system, graph and source page is
+crawled — autoproving each lemma along the way — and compared after
+normalisation. The two UIs agree page-for-page except for a small documented
+residue that renders *identical* proof states with different internal
+counter values (fresh-variable witness indices, goal-creation numbers,
+term-abbreviation picks on a few AC-heavy theories); these never appear in
+proof scripts, proof structure, or verdicts.
 
 ## Performance
 
 Wall-clock time and peak memory for both provers on seven representative
 theories, proving all lemmas (`--derivcheck-timeout=30`) on x86_64 Linux,
-24 cores (GHC 9.6.7, Maude 3.5.1). Haskell runs at `+RTS -N{1,4,16}`, the Rust port at
-`--processors={1,4,16}`. The theories are `NSPK3` (classic protocol), `Joux`
-(bilinear pairing), `stateverif_left_right` (SAPiC, auto-sources), `Yubikey`
-(SAPiC `process:` frontend — pure-state + multiset counters), `gcm` (key
-wrapping; natural-numbers and multiset), `wireguard` (deep proof search), and
-`CCITT_X509_3` (auto-sources with stored-proof replay).
-
-The tables below are generated by `scripts/bench.sh`; regenerate them in place
-with `scripts/bench.sh --write` (see the marker comment for details). The RS
-columns annotate each value with its change versus Haskell in parentheses
-(negative = faster / less memory).
+24 cores (GHC 9.6.7, Maude 3.5.1); Haskell at `+RTS -N{1,4,16}`, the Rust
+port at `--processors={1,4,16}`. Tables are generated by `scripts/bench.sh`
+(regenerate in place with `scripts/bench.sh --write`); the RS columns show
+the change versus Haskell (negative = faster / less memory).
 
 <!-- BENCH:START — auto-generated by rust/scripts/bench.sh; do not edit by hand.
 
@@ -150,70 +136,59 @@ TIMEOUT, DERIV, HS_PATH, RS_PATH env vars (see the scripts/bench.sh header).
 <!-- BENCH:END -->
 
 Memory is the maximum resident set of the prover process; Maude runs as a
-separate subprocess on both sides and is excluded. Across all theories and core
-counts the Rust port is 2–37× faster, and uses several-fold less memory — from
-≈4–26× at one core down to ≈2–10× at sixteen, where lemma-level parallelism
-keeps several constraint systems live at once.
+separate subprocess on both sides and is excluded. Across all theories and
+core counts the Rust port is 2–37× faster and uses several-fold less memory
+— ≈4–26× at one core, ≈2–10× at sixteen.
 
-The port parallelises at two levels, both via rayon. Independent lemmas of a
-theory are proved concurrently; within a lemma, the proof-search fan-out and
-source saturation run in parallel over a pool of Maude subprocesses.
-`--processors=N` sets the worker-thread count and `--maude-processes=M`
-(default `N`) the Maude pool size. Multi-lemma theories gain the most across
-cores (`wireguard` roughly halves from one to sixteen); theories dominated by
-source saturation also speed up at a single core, because the refined sources
-are computed once and reused across all of a theory's lemmas (`gcm`, `Yubikey`).
+The port parallelises at two levels, both via rayon: independent lemmas are
+proved concurrently, and within a lemma the proof-search fan-out and source
+saturation run in parallel over a pool of Maude subprocesses
+(`--processors=N` sets the worker count, `--maude-processes=M`, default `N`,
+the pool size). Multi-lemma theories gain the most across cores; theories
+dominated by source saturation also speed up at a single core because
+refined sources are computed once and shared across lemmas.
 
 ## Implemented
 
 - **Parser:** full `.spthy` grammar — `macros:`, `predicates:`, `equations:`,
-  `restrictions:`, `tactics:`, `heuristic:`, `#define`/`#include` preprocessing,
-  multi-line comments, Unicode symbols.
-- **Elaborator:** rule signatures, lemma formulas → guarded form, macro
-  expansion, predicate → restriction expansion, restriction insertion,
-  source-kind classification.
+  `restrictions:`, `tactics:`, `heuristic:`, `#define`/`#include`
+  preprocessing, multi-line comments, Unicode symbols.
+- **Elaborator:** rule signatures, lemma formulas → guarded form, macro and
+  predicate expansion, restriction insertion, source-kind classification.
 - **Builtins:** `hashing`, `symmetric-encryption`, `asymmetric-encryption`,
-  `signing`, `revealing-signing`, `diffie-hellman`, `xor`, `bilinear-pairing`,
-  `multiset`, `natural-numbers`, `subterm`, `locations-report`, plus custom
-  functions and equations.
+  `signing`, `revealing-signing`, `diffie-hellman`, `xor`,
+  `bilinear-pairing`, `multiset`, `natural-numbers`, `subterm`,
+  `locations-report`, plus custom functions and equations.
 - **Solver:** full constraint-system port — simplification, source
-  refinement/saturation, chain extension, contradiction detection, induction,
-  stored-proof replay with plain-load proof validation, and AC-modulo
-  unification via pooled Maude.
-- **`--auto-sources`:** automatic sources-lemma generation — annotates rules
-  with `AUTO_IN_*`/`AUTO_OUT_*` actions and synthesises the `AUTO_typing`
-  sources lemma when the refined sources contain partial deconstructions
+  refinement/saturation, chain extension, contradiction detection,
+  induction, stored-proof replay with plain-load proof validation, and
+  AC-modulo unification via pooled Maude.
+- **`--auto-sources`:** automatic sources-lemma generation
   (HS `addAutoSourcesLemma`).
-- **SAPiC `process:`** — the process-calculus frontend: translation of a
-  `process:` block (and `let` process definitions) to multiset-rewrite rules,
-  byte-identical to HS `Sapic.translate`. Covers the core constructs (`0`, `|`,
-  `+`, `!`, `new`, `in`/`out`, `event`, conditionals), mutable state
-  (`insert`/`delete`/`lookup`), `lock`/`unlock`, process calls + `let`
-  bindings/destructors, secret/private channels, the progress + reliable-channel
-  translations, `report()`/`locations-report`, and the opt-in
-  `--translation-state-optimisation` pure-state path (`annotatePureStates`,
-  `newStateChannel` rules + forced-injective `L_PureState`/`L_CellLocked`).
-- **Heuristics:** smart (`s`/`S`), goal-number (`C`/`c`), injective (`i`/`I`),
-  SAPiC (`p`/`P`), oracle (`o`/`O`), and `tactic:` rankings — selected by the
-  in-file `heuristic:`/`tactic:` annotation or per-lemma attribute, or overridden
-  for every lemma by the CLI `--heuristic` (HS `selectHeuristic`).
+- **SAPiC `process:`** — the process-calculus frontend, byte-identical to HS
+  `Sapic.translate`: core constructs, mutable state, locks, `let`
+  bindings/destructors, secret/private channels, progress and
+  reliable-channel translations, `report()`, and the opt-in
+  `--translation-state-optimisation` pure-state path.
+- **Heuristics:** smart (`s`/`S`), goal-number (`C`/`c`), injective
+  (`i`/`I`), SAPiC (`p`/`P`), oracle (`o`/`O`), and `tactic:` rankings —
+  per-file, per-lemma, or CLI-overridden (HS `selectHeuristic`).
 - **CLI:** `--prove`/`--lemma`, `--bound`, `--heuristic`, `--oraclename`,
-  `--oracle-only`, `--processors`, `--maude-processes`, `--derivcheck-timeout`,
-  `-D` defines, `--parse-only`, `--precompute-only`, `-O/--output`, `--quiet`,
-  `-v/--verbose`, `--quit-on-warning`; exit codes and summary lines mirror HS.
+  `--oracle-only`, `--processors`, `--maude-processes`,
+  `--derivcheck-timeout`, `-D` defines, `--parse-only`,
+  `--precompute-only`, `-O/--output`, `--quiet`, `-v/--verbose`,
+  `--quit-on-warning`; exit codes and summary lines mirror HS.
 - **Subcommands:** `interactive` (HTTP server), `variants` (DH/BP
   intruder-rule variants dump), `test` (install self-check).
 
 ## Not yet ported
 
 - **`diff(...)` / `--diff`** — observational-equivalence mode.
-- **Accountability (`accounts for` / `verdictfunction`)** — the accountability
-  frontend that expands a verdict lemma into case sub-lemmas; the surrounding
-  multiset-rewrite theory parses, but the accountability lemma is not expanded.
-- Other parse-only CLI flags: `--saturation`, `--open-chains`,
-  `--partial-evaluation`, `--stop-on-trace` (RS already defaults to DFS, as HS
-  does), `--replication-bound`; `--output-json`/`--output-dot` write stubs and
-  `--output-module=proverif|deepsec|…` errors.
+- **Accountability (`accounts for` / `verdictfunction`)** — the surrounding
+  theory parses, but the verdict lemma is not expanded into case sub-lemmas.
+- Parse-only CLI flags: `--saturation`, `--open-chains`,
+  `--partial-evaluation`, `--stop-on-trace`, `--replication-bound`;
+  `--output-json`/`--output-dot` write stubs and `--output-module=…` errors.
 
 Theories using these features are tracked in `scripts/file_flags.tsv` and
 re-enter the gate automatically once the feature lands.
@@ -231,36 +206,15 @@ crates/
   tamarin-export/         ProVerif / DeepSec / SPDL export (placeholder)
   tamarin-server/         interactive HTTP server (Axum)
   tamarin-prover/         the binary: CLI parser + run dispatch
-scripts/
-  diff_proof_raw.sh       per-lemma raw HS↔RS --prove diff (exit 0 = identical)
-  corpus_file_diff.sh     per-file corpus parity gate vs cached HS → RESULTS_TSV
-  web_parity.sh           interactive-mode parity gate (boot + crawl + semantic diff)
-  web_crawl.py …          crawler / page canonicaliser / differ used by web_parity.sh
-  file_flags.tsv          canonical per-file flags for theories needing them
-  bench.sh                RS-vs-HS wall-clock + memory tables
+scripts/                  parity gates, benchmarks, divergence-debugging tools
+                          (see TESTING.md for the full index)
 tests/                    cross-crate integration fixtures
 ```
 
 ## Testing
 
-Parity against Haskell is the correctness gate:
-
-```
-cd rust
-scripts/diff_proof_raw.sh ../examples/classic/NSPK3.spthy injective_agree   # one lemma
-RESULTS_TSV=/tmp/gate.tsv ALLOWLIST=<filelist> scripts/corpus_file_diff.sh  # corpus gate (cached HS)
-RESULTS_TSV=/tmp/web.tsv  ALLOWLIST=<filelist> scripts/web_parity.sh        # interactive-mode parity (crawl + semantic diff)
-cargo test                                                                  # Rust unit + integration
-```
-
-`diff_proof_raw.sh` rebuilds the binary first (set `TAM_RS_NO_AUTO_BUILD=1` to
-skip); the corpus gate runs the prebuilt binary against a content-keyed HS cache.
-
-Lock-step HS-vs-RS Maude command tracing:
-
-```
-TAM_DBG_MAUDE_IO=full TAM_DBG_MAUDE_IO_FILTER=unify \
-  target/release/tamarin-prover --prove <file>
-```
-
-See `crates/tamarin-term/src/maude_proc.rs` for the env-gated trace points.
+`cargo test` runs the Rust suites; parity against the Haskell prover is the
+real correctness gate — `scripts/corpus_file_diff.sh` for batch mode,
+`scripts/web_parity.sh` for the interactive UI. See
+[TESTING.md](TESTING.md) for the full verification ladder, the gate
+environment reference, and the divergence-debugging toolbox.

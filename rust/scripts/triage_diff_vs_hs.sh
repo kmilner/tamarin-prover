@@ -6,7 +6,7 @@
 #   d_post < d_pre  -> IMPROVED ;  d_post > d_pre -> REGRESSED ;
 #   d_post==d_pre but content differs -> CHANGED(check) ; both 0 -> already-match
 set -u
-ROOT="${ROOT:-/home/parallels/tamarin-prover-2}"
+ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 CORPUS="${CORPUS:-$ROOT/examples}"
 PRE="${PRE:-/tmp/rs-prepatch}"; POST="${POST:-/tmp/rs-patched}"
 DERIV="${DERIV:-30}"; FT="${FT:-300}"

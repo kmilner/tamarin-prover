@@ -1,152 +1,185 @@
 # Testing the Rust port
 
-Quick reference for the tests, probes, and scripts used to measure HS↔Rust
-parity during the port.
+How the port is verified against the Haskell prover, from unit tests up to
+full-corpus byte parity. Commands run from `rust/` unless noted; `../` is the
+repo root.
 
-All commands assume CWD is the repo root (`/home/parallels/tamarin-prover-2`)
-unless noted.
-
-## Build prerequisites
-
-```bash
-# Rust binaries (release build for probes; debug is fine for development)
-cd rust
-cargo build --release --bin tamarin-prover
-cargo build --release --example dump_proof
-cargo build --release --example probe_lemma   # for /tmp/probe_targets.sh
-cd ..
-
-# Haskell binary (one-time)
-stack build
-```
-
-Auto-discovered Haskell paths: scripts walk
-`.stack-work/install/*/*/*/bin/tamarin-prover` and
-`.stack-work/dist/*/ghc-*/build/tamarin-prover/tamarin-prover` first,
-then fall through to `tamarin-prover` in `$PATH`.
-
-## Primary metric: corpus proof-skeleton match probe
-
-The canonical metric for HS↔Rust proof-tree parity. Walks the corpus dirs
-under `/home/parallels/tamarin-prover/examples/`, proves each lemma with
-both provers, and counts structural matches.
+**Prerequisites:** the Haskell binary (`stack build` at the repo root —
+parity scripts auto-discover it under `.stack-work/`, falling back to
+`tamarin-prover` on `PATH`), and `maude` on `PATH` (`dot` too, for graph
+pages in the web gate). On hosts where these come from linuxbrew they are
+often *not* on `PATH` by default:
 
 ```bash
-cd rust
-cargo test --test oracle_solver corpus_proof_skeleton_match_probe --release -- --nocapture
+export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
 ```
 
-Runtime ~40s. Default thread count is fine; the previously-required
-`MALLOC_TRIM_THRESHOLD_=0 MALLOC_MMAP_THRESHOLD_=131072
-RAYON_NUM_THREADS=2` workarounds are no longer needed.
+The correctness criterion everywhere is **byte-identical raw `--prove`
+output**, after stripping only the environment-volatile header lines
+(Git revision, compile time, processing time).
 
-Output format:
+## The verification ladder
 
-```
-corpus structural-match: 110/117 (7 struct-divergent, 0 no-haskell-skel, 3 incomparable)
-structural divergences:
-  <file>::<lemma> — diverge line N: ours="..." theirs="..."
-```
+| Step | Command | Checks |
+|---|---|---|
+| 1 | `cargo test` | Rust unit + integration suites (~1000 tests) |
+| 2 | `scripts/diff_proof_raw.sh <file> <lemma>` | one lemma, raw HS↔RS diff |
+| 3 | `scripts/corpus_file_diff.sh` | the batch gate: 402-file corpus, byte parity |
+| 4 | `scripts/web_parity.sh` | interactive-mode gate: crawl + semantic diff |
+| 5 | `scripts/bench.sh` | performance tables (see README) |
 
-The numerator counts lemmas whose canonicalized Rust proof tree matches
-HS's byte-for-byte. The `incomparable` bucket is lemmas where HS doesn't
-emit a usable proof skeleton (timeouts, unsupported features). A
-`[verdict: ours=X theirs=Y]` annotation flags wrong-verdict divergences.
-
-## Per-lemma proof-tree diff
-
-For investigating a single lemma's structural divergence:
+## Rust test suite
 
 ```bash
-rust/scripts/diff_proof_tree.sh <theory.spthy> <lemma_name>
+cargo test                                           # whole workspace
+cargo test -p tamarin-theory --test oracle_solver    # solver vs corpus fixtures (needs maude)
 ```
 
-Prints `<lemma>: N diff lines (HS: H, RS: R)`. `N=0` means byte-identical
-canonicalized trees.
-
-To pass env vars to the Rust run (useful for diagnostics):
+`oracle_solver` also carries heavyweight corpus probes behind `#[ignore]`,
+run explicitly when needed:
 
 ```bash
-rust/scripts/diff_proof_tree.sh <theory.spthy> <lemma> "TAM_RS_TRACE_N6=1"
+cargo test --test oracle_solver corpus_proof_skeleton_match_probe --release -- --ignored --nocapture
 ```
 
-To inspect the actual diff content:
+- `corpus_verdict_match_coverage_probe` — verdict agreement sweep.
+- `corpus_proof_skeleton_match_probe` — canonicalised proof-tree comparison
+  per lemma. Historically the primary metric; superseded by the byte gate
+  below, which subsumes it.
+
+## Single-lemma parity
 
 ```bash
-rust/scripts/diff_proof_tree.sh examples/Tutorial.spthy Client_auth
-diff /tmp/tmp.*/hs.canon /tmp/tmp.*/rs.canon   # (the temp dir is cleaned up — capture stdout to keep it)
+scripts/diff_proof_raw.sh ../examples/classic/NSPK3.spthy injective_agree
 ```
 
-Or use the canonicalizer directly:
+Raw byte-for-byte diff of one lemma's `--prove` output; exit 0 = identical.
+Rebuilds the Rust binary first (set `TAM_RS_NO_AUTO_BUILD=1` to use the
+existing build).
+
+## Corpus gate (the batch parity metric)
 
 ```bash
-rust/target/release/examples/dump_proof <theory.spthy> <lemma> | python3 rust/scripts/canon_proof_tree.py
+ALLOWLIST=scripts/parity_corpus.txt RESULTS_TSV=/tmp/gate.tsv scripts/corpus_file_diff.sh
+awk -F'\t' '{print $2}' /tmp/gate.tsv | sort | uniq -c     # expect: 402 MATCH
 ```
 
-## Local corpus sweep
+Whole-file `--prove` diff over the canonical 402-file corpus
+(`scripts/parity_corpus.txt`). Two strictly sequential phases: Haskell
+output is computed once per file-content hash and cached under
+`scripts/.hs_file_cache/`; the Rust binary is then diffed against the cache
+— so re-runs after Rust-only changes skip the Haskell side entirely.
+Theories whose upstream recipe needs extra arguments get them from
+`scripts/file_flags.tsv`, applied identically to both provers.
 
-A hand-picked corpus sweep around the lemma sets we use during port
-development (Tutorial, KAS2, NSPK3, NSLPK3 variants, TESLA_Scheme1,
-Minimal_Crypto_API):
+Env knobs (full list in the script header): `ALLOWLIST` (one relative path
+per line), `RESULTS_TSV`, `JOBS` (default 4), `FILE_TIMEOUT` (300 s),
+`CORPUS_ROOT`, `CACHE`, `HS_PATH`, `RS_PATH`.
+
+**Cache-staleness trap:** the HS cache is keyed on theory content only. If
+the *Haskell binary's* behavior changes, the cache is silently stale —
+point `CACHE` at a fresh directory after any accepted Haskell-side change.
+
+## Refactor inertness (RS-vs-RS)
+
+For "this refactor must not change output" checks, no Haskell needed:
 
 ```bash
-rust/scripts/corpus_diff_proof_trees.sh
+PRE=/tmp/rs-prepatch POST=/tmp/rs-patched scripts/rs_vs_rs_diff.sh
 ```
 
-Prints `PASS: N` / `FAIL: N` plus the failing lemmas. Used for quick
-local regression checks; the full corpus probe (above) is the canonical
-metric.
+Runs two Rust binaries (pre/post) over every example and diffs stripped
+stdout; agreement everywhere means the change is behaviorally inert and
+inherits the baseline's HS-faithfulness by transitivity.
+`scripts/triage_diff_vs_hs.sh` then 3-way-triages any DIFF files against
+fresh Haskell output (moved toward HS or away?).
 
-## Byte-level trace comparison
-
-For investigating exact divergence points within a single lemma. Both
-provers emit a `[STATE]` line at every proof-method expand. Diffing
-those lines pinpoints the first byte-of-divergence in the search.
+## Web-parity gate (interactive mode)
 
 ```bash
-# Capture HS trace:
-TAM_HS_TRACE_STATE_EQS=1 tamarin-prover --prove=<lemma> <file> 2>&1 \
-    | grep '^\[STATE\]' > /tmp/hs.trace
-
-# Capture Rust trace:
-TAM_RS_TRACE_STATE_EQS=1 rust/target/release/tamarin-prover \
-    --prove=<lemma> <file> 2>&1 | grep '^\[STATE\]' > /tmp/rs.trace
-
-# Compare:
-diff /tmp/hs.trace /tmp/rs.trace | head -60
+ALLOWLIST=<filelist> RESULTS_TSV=/tmp/web.tsv scripts/web_parity.sh
 ```
 
-See `memory/project_byte_level_trace_investigation.md` for the worked
-example (Responder_secrecy 54→10 diff lines).
+Boots both servers on the same theory (HS on port 3021, RS on 3022), crawls
+every proof-tree / constraint-system / graph / source page — autoproving
+each lemma along the way — and diffs the pages semantically
+(`web_crawl.py` / `web_normalize.py` / `web_diff.py`). HS crawl manifests
+are cached content-keyed under `scripts/.web_hs_cache/` (same staleness
+trap as above). Env knobs: `FILE_TIMEOUT`, `READY_TIMEOUT`, `HS_PORT`,
+`RS_PORT`, `MAX_NODES`, `CACHE`, `DIFFDIR`.
 
-## Useful env-var flags
+The known cosmetic residue (identical proof states rendered with different
+internal counter values on a few AC-heavy theories — see the README) lives
+in `scripts/websweep_residual.txt`; a page-level DIFF is only actionable if
+its file is not in that list or the diff is structural.
 
-The Rust prover's solving behavior is not configurable by env var. The
-flags below are pure diagnostic dumps, off by default:
+## Debugging a divergence
 
-### Diagnostic dumps (off by default)
+Work top-down: which lemma → which proof step → which solver call.
+
+**Proof-tree diff** (canonicalised, per lemma):
+
+```bash
+scripts/diff_proof_tree.sh ../examples/Tutorial.spthy Client_auth
+scripts/diff_proof_tree.sh <file> <lemma> "TAM_RS_DBG_APPLY_EQ_STORE=1"   # extra env for the RS run
+target/release/examples/dump_proof <file> <lemma> | python3 scripts/canon_proof_tree.py
+```
+
+`scripts/corpus_diff_proof_trees.sh` runs the same diff over a hand-picked
+regression corpus (PASS/FAIL tally); `scripts/corpus_full_trace_diff.sh`
+does it for every lemma in the corpus.
+
+**Proof-search state trace** — both provers emit a `[STATE]` line at every
+proof-method expansion; diffing them pinpoints the first divergence:
+
+```bash
+TAM_HS_TRACE_STATE=1 <hs-binary>                 --prove=<lemma> <file> 2>&1 | grep '^\[STATE\]' > /tmp/hs.trace
+TAM_RS_TRACE_STATE=1 target/release/tamarin-prover --prove=<lemma> <file> 2>&1 | grep '^\[STATE\]' > /tmp/rs.trace
+diff /tmp/hs.trace /tmp/rs.trace | head
+```
+
+**Maude IPC trace** — lock-step command/response comparison:
+
+```bash
+TAM_DBG_MAUDE_IO=full TAM_DBG_MAUDE_IO_FILTER=unify target/release/tamarin-prover --prove <file>
+scripts/diff_maude_io.sh <file> <lemma>       # side-by-side HS↔RS Maude traffic
+scripts/diff_aes_calls.sh <file> <lemma>      # apply_eq_store call counts per site
+```
+
+See `crates/tamarin-term/src/maude_proc.rs` for the env-gated trace points.
+
+**Diagnostic env flags** (all off by default; solving behavior is never
+env-configurable — these only dump). `TAM_HS_*` work on the instrumented
+Haskell build, the rest on the Rust binary:
 
 | Variable | Effect |
 |---|---|
-| `TAM_DBG_REFINE=1` | source-case refine inputs/outputs |
-| `TAM_DBG_VARIANTS=1` | protocol rule variants at theory load |
-| `TAM_DBG_PERFORM_SPLIT=1` | perform_split's S.toList output |
-| `TAM_DBG_BRANCH_DROP=1` | saturate branches dropped via contras |
+| `TAM_DBG_PERFORM_SPLIT=1` | perform_split case lists (RS) |
+| `TAM_HS_DBG_PERFORM_SPLIT=1` | same, HS side |
+| `TAM_RS_DBG_APPLY_EQ_STORE=1` | applyEqStore IN/OUT (RS) |
+| `TAM_HS_DBG_APPLY_EQ_STORE=1` | same, HS side |
 | `TAM_DBG_AES_VARIANTS=1` | apply_eq_store variant before→after counts |
-| `TAM_RS_DBG_APPLY_EQ_STORE=1` | applyEqStore IN/OUT (paired with HS's) |
-| `TAM_HS_DBG_APPLY_EQ_STORE=1` | HS-side applyEqStore trace |
 | `TAM_HS_TRACE_CHAINS=1` | HS-side solveChain enter/extend |
-| `TAM_HS_DBG_PERFORM_SPLIT=1` | HS-side perform_split |
+| `TAM_RS_VERIFY_BOUNDS_CACHE=1` | panic if the bounds_max cache diverges from a full recompute |
 
-`TAM_HS_*` flags only work with the HS binary; `TAM_RS_*` / `TAM_DBG_*`
-with the Rust one. (This list is not exhaustive — grep the source for
-`TAM_DBG_`/`TAM_RS_DBG_` for the full set.)
+The list is not exhaustive — grep the sources for `TAM_DBG_` / `TAM_RS_` /
+`TAM_HS_` for the full set.
 
-## Files
+## Script index
 
-- `rust/scripts/canon_proof_tree.py` — proof-tree canonicalizer
-- `rust/scripts/diff_proof_tree.sh` — single-lemma HS↔Rust diff
-- `rust/scripts/corpus_diff_proof_trees.sh` — hand-picked corpus sweep
-- `rust/scripts/canonicalize_trace.py` — pre-existing trace canonicalizer
-- `rust/scripts/diff_trace.py` — pre-existing trace diff helper
-- `rust/crates/tamarin-theory/tests/oracle_solver.rs` — corpus probe test
+| Script | Purpose |
+|---|---|
+| `corpus_file_diff.sh` | the batch byte gate (cached HS, per-file) |
+| `parity_corpus.txt` | canonical 402-file corpus list |
+| `file_flags.tsv` | per-file extra prover flags (both sides) |
+| `diff_proof_raw.sh` | one lemma, raw HS↔RS diff |
+| `corpus_raw_diff.sh` | raw per-lemma diff across the corpus |
+| `rs_vs_rs_diff.sh` / `triage_diff_vs_hs.sh` | refactor-inertness sweep + 3-way triage |
+| `compare_parity_tsv.py` | compare two gate TSVs by (file, lemma) |
+| `parity_check.sh` | quick raw check of specific files |
+| `web_parity.sh` (+ `web_crawl.py`, `web_normalize.py`, `web_diff.py`) | interactive-mode gate |
+| `websweep_residual.txt` | known cosmetic web residue |
+| `diff_proof_tree.sh` / `canon_proof_tree.py` / `corpus_diff_proof_trees.sh` / `corpus_full_trace_diff.sh` | canonicalised proof-tree diffs |
+| `diff_maude_io.sh` / `diff_aes_calls.sh` | Maude-IPC and eq-store call-site diffs |
+| `canonicalize_trace.py` / `diff_trace.py` | trace canonicaliser + differ |
+| `bench.sh` | RS-vs-HS wall-clock + memory tables (`--write` regenerates the README block) |

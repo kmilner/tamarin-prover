@@ -6,7 +6,7 @@
 # the baseline's HS-faithfulness by transitivity (covers even HS-timeout
 # monsters).  Where they differ, those exact files get an HS comparison.
 set -u
-ROOT="${ROOT:-/home/parallels/tamarin-prover-2}"
+ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 CORPUS="${CORPUS:-$ROOT/examples}"
 PRE="${PRE:-/tmp/rs-prepatch}"
 POST="${POST:-/tmp/rs-patched}"
