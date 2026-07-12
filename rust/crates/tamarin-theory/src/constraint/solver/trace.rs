@@ -92,6 +92,7 @@ pub fn current_op_label() -> String {
 /// the OUTERMOST caller's label sticks.  Use `OpLabelGuard::force`
 /// for cases where you want to override even an outer label
 /// (e.g. simp passes adding their own prefix).
+#[must_use = "dropping this guard immediately ends the scope it protects"]
 pub struct OpLabelGuard {
     prev: String,
 }
@@ -297,6 +298,9 @@ fn is_cse_deduplicated_label(label: &str) -> bool {
 /// Has this CSE-deduplicated label already been emitted in this
 /// program run?  Returns `true` if already seen (skip emission),
 /// `false` and records it if first time.
+// static emitted-label dedup set; membership only, never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn check_and_mark_emitted(label: &str) -> bool {
     use std::collections::HashSet;
     use std::sync::Mutex;

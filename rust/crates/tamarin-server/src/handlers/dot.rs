@@ -71,6 +71,15 @@
 //! with port names `p0`, `p1`, ..., `c0`, `c1`, ... so that edges from
 //! the `sEdges` set can target the correct slots.
 
+// every `HashMap`/`HashSet` in this DOT renderer is a
+// keyed-lookup / membership helper — `node_map` (node id -> rule, `.get`),
+// `has_outgoing` / `port_owner_ids` / `used_dot_ids` (`.contains` / `.insert`
+// dedup).  DOT output ORDER is driven by iterating the ordered
+// `repr.nodes` / `repr.edges` Vecs; these maps/sets are never iterated into
+// output.  Also off the batch `--prove` byte-parity surface (server graph UI).
+// std kept (byte-inert).
+#![allow(clippy::disallowed_types)]
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
@@ -95,6 +104,7 @@ use crate::graph::repr::{
     MissingHint, NodeType,
 };
 use crate::graph::simplify::{compress_system, simplify_system};
+use crate::graph::render_system::RenderSystem;
 
 // ---------------------------------------------------------------------
 // Public API
@@ -112,10 +122,15 @@ pub fn system_to_dot(sys: &System) -> String {
 /// abbreviation discovery before emitting DOT, mirroring Haskell's
 /// `systemToGraph` + `dotSystemCompact`.
 pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
-    // 1. Pre-render simplification.
-    let working = if opts.compress { compress_system(sys.clone()) } else { sys.clone() };
+    // 1. Pre-render simplification.  Clone-for-render boundary: from here on the
+    //    working copy is a `RenderSystem` (display-only, write-sealed) so it can
+    //    never be fed back into the prover — the compress/simplify passes mutate
+    //    it in ways that leave the `subst_system` stamps meaningless.
+    let working = RenderSystem::from_prover(sys.clone());
+    let working = if opts.compress { compress_system(working) } else { working };
     let working = simplify_system(opts.simplification_level, working);
-    // 2. Build the GraphRepr.
+    // 2. Build the GraphRepr.  `compute_basic_graph_repr` takes `&System`;
+    //    `&RenderSystem` derefs to it.
     let mut repr = compute_basic_graph_repr(&working);
     if opts.clustering_similar_names {
         add_intelligent_cluster_using_similar_names(&mut repr);
@@ -1652,9 +1667,9 @@ mod tests {
         let a = LVar::new("a", tamarin_term::lterm::LSort::Node, 0);
         let b = LVar::new("b", tamarin_term::lterm::LSort::Node, 0);
         let c = LVar::new("c", tamarin_term::lterm::LSort::Node, 0);
-        sys.less_atoms.push(LessAtom::new(a.clone(), b.clone(), Reason::Fresh));
-        sys.less_atoms.push(LessAtom::new(b.clone(), c.clone(), Reason::Fresh));
-        sys.less_atoms.push(LessAtom::new(a.clone(), c.clone(), Reason::Fresh));
+        sys.content_mut().less_atoms.push(LessAtom::new(a.clone(), b.clone(), Reason::Fresh));
+        sys.content_mut().less_atoms.push(LessAtom::new(b.clone(), c.clone(), Reason::Fresh));
+        sys.content_mut().less_atoms.push(LessAtom::new(a.clone(), c.clone(), Reason::Fresh));
         let opts_sl0 = crate::graph::GraphOptions {
             simplification_level: crate::graph::SimplificationLevel::SL0,
             compress: false,
@@ -1914,7 +1929,7 @@ mod tests {
         let v = LVar::new("v", LSort::Node, 0);
         sys.add_node(j.clone(), coerce);
         sys.add_node(v.clone(), isend);
-        sys.edges.push(Edge { src: (j.clone(), ConcIdx(0)), tgt: (v.clone(), PremIdx(0)) });
+        sys.content_mut().edges.push(Edge { src: (j.clone(), ConcIdx(0)), tgt: (v.clone(), PremIdx(0)) });
         let out = system_to_dot_with(&sys, &opts);
         // Outgoing coerce: `#j : coerce` (its `Act(..)` action is dropped).
         assert!(out.contains("label=\"#j : coerce\",shape=ellipse"),
@@ -1985,7 +2000,7 @@ mod tests {
         let mut sys = System::empty();
         let a = LVar::new("a", LSort::Node, 0);
         let b = LVar::new("b", LSort::Node, 0);
-        sys.less_atoms.push(LessAtom::new(a, b, Reason::Fresh));
+        sys.content_mut().less_atoms.push(LessAtom::new(a, b, Reason::Fresh));
         let opts = GraphOptions { compress: false, abbreviate: false,
             simplification_level: crate::graph::SimplificationLevel::SL0,
             ..GraphOptions::default() };

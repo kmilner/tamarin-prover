@@ -313,7 +313,11 @@ fn apply_m_comb(
         // output-inert.  If such a theory appears, route `Cond` through a
         // subst_cond_formula-style rewrite (and re-gate) rather than the
         // pass-through below.
-        other => Ok(other),
+        ProcessCombinator::Cond(f) => Ok(ProcessCombinator::Cond(f)),
+        // Parallel/Ndc carry no terms, so substitution is the identity.
+        // Enumerated (no wildcard) so a new term-carrying variant must decide
+        // its substitution here.
+        other @ (ProcessCombinator::Parallel | ProcessCombinator::Ndc) => Ok(other),
     }
 }
 

@@ -2,6 +2,13 @@
 //! parses the trailing wildcard path, and emits HTML or the JSON
 //! envelope the frontend expects.
 
+// the `HashMap<String, String>` here are
+// query-parameter maps (axum `Query` extractors + a keyed graph-options
+// lookup), consumed by key only — never iterated into output — and off the
+// batch `--prove` byte-parity surface (server UI only).  std kept: axum's
+// `Query<HashMap<..>>` requires the std type.
+#![allow(clippy::disallowed_types)]
+
 use std::sync::Arc;
 
 use axum::{

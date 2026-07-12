@@ -928,10 +928,10 @@ fn variants_intruder_with(
             maude.reduce(&applied).unwrap_or(applied)
         };
         let map_facts = |fs: &[LNFact]| -> Vec<LNFact> {
-            fs.iter().map(|f| LNFact {
-                tag: f.tag.clone(),
-                annotations: f.annotations.clone(),
-                terms: f.terms.iter().map(|t| norm_t(t.clone())).collect(),
+            fs.iter().map(|f| {
+                // norm/subst rebuild — frees can change; recompute the bloom.
+                let terms: Vec<LNTerm> = f.terms.iter().map(|t| norm_t(t.clone())).collect();
+                LNFact::fresh_annotated(f.tag.clone(), f.annotations.clone(), terms)
             }).collect()
         };
         let new_prems = map_facts(&ru.premises);
@@ -1151,11 +1151,9 @@ pub(crate) fn norm_rule(
         tamarin_term::norm::norm(maude, t).unwrap_or_else(|_| t.clone())
     };
     let norm_fact = |f: &LNFact| -> LNFact {
-        LNFact {
-            tag: f.tag.clone(),
-            annotations: f.annotations.clone(),
-            terms: f.terms.iter().map(&norm_t).collect(),
-        }
+        // norm rebuild — frees can change; recompute the bloom.
+        let terms: Vec<LNTerm> = f.terms.iter().map(&norm_t).collect();
+        LNFact::fresh_annotated(f.tag.clone(), f.annotations.clone(), terms)
     };
     Rule {
         info: ru.info.clone(),

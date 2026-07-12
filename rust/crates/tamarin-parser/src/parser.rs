@@ -1,5 +1,8 @@
 //! Recursive-descent parser for `.spthy` files.
 
+// flag-name set import; membership dedup only;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -418,6 +421,9 @@ fn remove_comment_block(cs: &[char], mut i: usize) -> usize {
 pub struct Parser<'a> {
     lx: Lexer<'a>,
     /// Defined preprocessor flags. Mutated by `#define` directives.
+    // parsed flag-name set; membership only, never iterated into output;
+    // std kept (byte-inert) — iteration order never reaches output.
+    #[allow(clippy::disallowed_types)]
     flags: HashSet<String>,
     /// Whether we're parsing a diff theory. Set only from the `Parser::new`
     /// argument supplied by the caller and echoed into `Theory::is_diff`;
@@ -439,6 +445,9 @@ pub struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     pub fn new(src: &'a str, flags: &[&str], is_diff: bool) -> Self {
+        // flag-name dedup set; .insert/.contains only;
+        // std kept (byte-inert) — iteration order never reaches output.
+        #[allow(clippy::disallowed_types)]
         let mut flags_set = HashSet::new();
         for f in flags { flags_set.insert((*f).to_string()); }
         // Always enable parse-time recognition of the operators. The parser is

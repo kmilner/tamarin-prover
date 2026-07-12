@@ -25,6 +25,65 @@ pub struct SubtermConstraint {
     pub propagated: bool,
 }
 
+/// An always-sorted, deduplicated set of `(LNTerm, LNTerm)` pairs, standing in
+/// for a Haskell `S.Set (LNTerm, LNTerm)`.  Membership and the
+/// `neg_subterms \ old_neg_subterms` change-detection `binary_search` it, which
+/// is only correct while it stays sorted, so the backing `Vec` is private and
+/// there is no `push` / `&mut Vec` / `iter_mut` accessor.  Every mutator
+/// (`insert`, `remove_at`, `rebuild_from`) re-establishes the sorted-unique
+/// invariant, making an unsorted state unconstructible; reads go through the
+/// slice `Deref`.  Derives mirror `SubtermStore`'s so it slots into the derived
+/// impls (order-sensitive `PartialEq` is exact because the set is always sorted).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SortedPairSet {
+    inner: Vec<(LNTerm, LNTerm)>,
+}
+
+impl SortedPairSet {
+    /// Collect any iterator into the set, establishing the sorted-unique
+    /// invariant (sort + dedup); the resulting set is independent of input
+    /// order.
+    pub fn rebuild_from<I: IntoIterator<Item = (LNTerm, LNTerm)>>(iter: I) -> Self {
+        let mut inner: Vec<(LNTerm, LNTerm)> = iter.into_iter().collect();
+        inner.sort();
+        inner.dedup();
+        SortedPairSet { inner }
+    }
+
+    /// Insert `pair` at its sorted position; returns true iff it was newly
+    /// added (already-present pairs leave the set unchanged).
+    pub fn insert(&mut self, pair: (LNTerm, LNTerm)) -> bool {
+        match self.inner.binary_search(&pair) {
+            Ok(_) => false,
+            Err(pos) => { self.inner.insert(pos, pair); true }
+        }
+    }
+
+    /// Remove the element at `pos` (a position obtained from a `binary_search`
+    /// on this set); removing at a sorted position keeps the remaining elements
+    /// sorted.
+    pub fn remove_at(&mut self, pos: usize) -> (LNTerm, LNTerm) {
+        self.inner.remove(pos)
+    }
+}
+
+impl std::ops::Deref for SortedPairSet {
+    type Target = [(LNTerm, LNTerm)];
+    fn deref(&self) -> &Self::Target { &self.inner }
+}
+
+impl IntoIterator for SortedPairSet {
+    type Item = (LNTerm, LNTerm);
+    type IntoIter = std::vec::IntoIter<(LNTerm, LNTerm)>;
+    fn into_iter(self) -> Self::IntoIter { self.inner.into_iter() }
+}
+
+impl<'a> IntoIterator for &'a SortedPairSet {
+    type Item = &'a (LNTerm, LNTerm);
+    type IntoIter = std::slice::Iter<'a, (LNTerm, LNTerm)>;
+    fn into_iter(self) -> Self::IntoIter { self.inner.iter() }
+}
+
 /// Subterm store. Mirrors HS's 5-field `SubtermStore`
 /// (SubtermStore.hs:90-96):
 ///   negSubterms / posSubterms / solvedSubterms / isContradictory /
@@ -38,13 +97,13 @@ pub struct SubtermStore {
     /// Negative subterm constraints `¬(small ⊏ big)` — HS `_negSubterms`
     /// (S.Set, so kept sorted by the LNTerm pair Ord for HS-faithful
     /// `S.toList` iteration order).
-    pub neg_subterms: Vec<(LNTerm, LNTerm)>,
+    pub neg_subterms: SortedPairSet,
     /// Copy of `neg_subterms` that is NOT changed by apply/HasFrees/
     /// add_neg — HS `_oldNegSubterms` (SubtermStore.hs:95).  Only the
     /// `simpSplitNegSt` pass updates it; the set difference
     /// `neg_subterms \ old_neg_subterms` is the change-detection
     /// mechanism deciding which negative subterms get (re-)split.
-    pub old_neg_subterms: Vec<(LNTerm, LNTerm)>,
+    pub old_neg_subterms: SortedPairSet,
 }
 
 impl SubtermStore {
@@ -59,11 +118,7 @@ impl SubtermStore {
     /// negSubterms.  Sorted insert keeps HS `S.toList` iteration order.
     /// Returns true if the pair was newly added.
     pub fn add_neg(&mut self, small: LNTerm, big: LNTerm) -> bool {
-        let pair = (small, big);
-        match self.neg_subterms.binary_search(&pair) {
-            Ok(_) => false,
-            Err(pos) => { self.neg_subterms.insert(pos, pair); true }
-        }
+        self.neg_subterms.insert((small, big))
     }
 
     pub fn is_false(&self) -> bool { self.contradictory }
@@ -89,13 +144,11 @@ impl SubtermStore {
             }
         }
         self.contradictory = self.contradictory || other.contradictory;
-        for (s, t) in &other.neg_subterms {
+        for (s, t) in other.neg_subterms.iter() {
             self.add_neg(s.clone(), t.clone());
         }
-        for p in &other.old_neg_subterms {
-            if let Err(pos) = self.old_neg_subterms.binary_search(p) {
-                self.old_neg_subterms.insert(pos, p.clone());
-            }
+        for p in other.old_neg_subterms.iter() {
+            self.old_neg_subterms.insert(p.clone());
         }
     }
 }

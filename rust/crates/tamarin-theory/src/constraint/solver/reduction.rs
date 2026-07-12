@@ -25,6 +25,78 @@ use crate::constraint::system::System;
 use crate::guarded::Guarded;
 use crate::rule::RuleACInst;
 
+/// The complete set of per-pass change signals raised by
+/// [`Reduction::subst_system_once`].  Built exactly ONCE, at the pass's
+/// aggregation point, from the section-local flags.  A struct LITERAL forces
+/// every field to be named, so a future section that computes a new signal but
+/// forgets to fold it in cannot construct this value (missing field → compile
+/// error); and [`PassSignals::raised`] EXHAUSTIVELY destructures `self`, so
+/// dropping a field from the OR is a compile error too.  Together these make
+/// "a section raised a change but the pass reported a no-op" — a silent
+/// skip-marker soundness bug — unrepresentable, at zero runtime cost (the
+/// value is a stack aggregate the OR consumes immediately).
+struct PassSignals {
+    /// A node id was rewritten by the subst, or a node's rule terms changed
+    /// value.
+    nodes_value_changed: bool,
+    /// Two distinct rules collapsed onto the same node id (`collisions > 0`).
+    collisions: bool,
+    /// A node collision produced length-mismatched premise/conclusion/action
+    /// lists (no model).
+    shape_mismatch: bool,
+    /// An edge endpoint was rewritten.
+    edges_value_changed: bool,
+    /// The `last(i)` atom's node id was rewritten.
+    last_atom_changed: bool,
+    /// A `less` atom endpoint was rewritten.
+    less_value_changed: bool,
+    /// A goal's terms changed value under the subst.
+    goals_value_changed: bool,
+    /// A formula changed value under the subst.
+    formulas_value_changed: bool,
+    /// A subterm-store entry changed value.
+    changed_sst: bool,
+    /// Node-merge rule equalities were queued (`!rule_eqs.is_empty()`).
+    had_rule_eqs: bool,
+    /// KU actions were queued for re-insertion (`!to_insert_action.is_empty()`).
+    had_insert_action: bool,
+}
+
+impl PassSignals {
+    /// `true` iff ANY signal fired — i.e. the pass was NOT a total no-op.
+    /// Exhaustively destructures `self` (no `..`) so dropping a field from the
+    /// OR is a compile error.  `#[must_use]`: this verdict is the pass's whole
+    /// output (it gates the verified-identity skip marker), so discarding it
+    /// would silently drop the change signal.
+    #[must_use]
+    fn raised(self) -> bool {
+        let PassSignals {
+            nodes_value_changed,
+            collisions,
+            shape_mismatch,
+            edges_value_changed,
+            last_atom_changed,
+            less_value_changed,
+            goals_value_changed,
+            formulas_value_changed,
+            changed_sst,
+            had_rule_eqs,
+            had_insert_action,
+        } = self;
+        nodes_value_changed
+            || collisions
+            || shape_mismatch
+            || edges_value_changed
+            || last_atom_changed
+            || less_value_changed
+            || goals_value_changed
+            || formulas_value_changed
+            || changed_sst
+            || had_rule_eqs
+            || had_insert_action
+    }
+}
+
 /// A reduction step takes a `System` and produces zero or more new
 /// systems. We keep it simple: explicit input/output rather than a
 /// monad transformer stack.
@@ -278,7 +350,7 @@ impl<'ctx> Reduction<'ctx> {
         let bot = crate::guarded::gfalse();
         let added_bot = if !crate::guarded::stores_contains(&self.sys.formulas, &bot) {
             self.sys.invalidate_max_var_idx_cache();
-            self.sys.formulas.push(std::sync::Arc::new(bot));
+            self.sys.formulas_mut().push(std::sync::Arc::new(bot));
             true
         } else {
             false
@@ -296,9 +368,9 @@ impl<'ctx> Reduction<'ctx> {
     /// the flip also implies a `self.changed` bump.
     fn set_eq_store_false(&mut self) -> bool {
         if !self.sys.eq_store.is_false() {
-            let s = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
+            let s = std::sync::Arc::unwrap_or_clone(self.sys.take_eq_store());
             self.sys.invalidate_max_var_idx_cache();
-            self.sys.eq_store = std::sync::Arc::new(s.set_false());
+            self.sys.set_eq_store(std::sync::Arc::new(s.set_false()));
             true
         } else {
             false
@@ -433,7 +505,7 @@ impl<'ctx> Reduction<'ctx> {
                 // Pure ADD (last_atom None→Some): the max can only rise
                 // by this node id — bump instead of invalidating.
                 self.sys.bump_cache_lvar(&i);
-                self.sys.last_atom = Some(i);
+                self.sys.set_last_atom(Some(i));
                 self.changed = ChangeIndicator::Changed;
                 Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged))
             }
@@ -477,21 +549,106 @@ impl<'ctx> Reduction<'ctx> {
         // mistakes for legitimate prem_idx_clash → spurious
         // Contradictory on legitimate witness paths
         // (TLS_Handshake::session_key_setup_possible root cause).
+        // Verified-identity skip: if the live
+        // (content_stamp, subst_stamp) still equals the marker a prior
+        // zero-signal pass set, that pass is an observed proof this pass is a
+        // total no-op at this exact (System, σ) — and nothing has mutated
+        // either input since (else a stamp would differ) — so skip the whole
+        // loop.  A plain early return touches nothing, which is exactly what a
+        // genuine zero-signal pass does (no `self.changed`, no cache
+        // invalidation, no eq_store growth, no goal-nr bump, no Maude).
+        let stats = subst_skip_stats_enabled();
+        if stats {
+            use std::sync::atomic::Ordering::Relaxed;
+            let calls = SUBST_SYSTEM_CALLS.fetch_add(1, Relaxed) + 1;
+            if calls % 50_000 == 0 {
+                eprintln!("[SUBST_SKIP_STATS] calls={} skips={}",
+                    calls, SUBST_SYSTEM_SKIPS.load(Relaxed));
+            }
+        }
+        if fp_stats_enabled() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let calls = FP_STATS_CALLS.fetch_add(1, Relaxed) + 1;
+            if calls % 5_000 == 0 {
+                let d = FP_FACT_DESCENTS.load(Relaxed);
+                let s = FP_FACT_SKIPS.load(Relaxed);
+                eprintln!("[FP_STATS] fact_descents={} fact_skips={} ({:.1}%)",
+                    d, s, if d == 0 { 0.0 } else { 100.0 * s as f64 / d as f64 });
+            }
+        }
+        if self.sys.subst_marker_matches() {
+            if stats {
+                SUBST_SYSTEM_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if verify_subst_skip_enabled() {
+                self.verify_subst_skip_is_noop();
+            }
+            return;
+        }
         let mut iter = 0u32;
         let cap = 32u32;
+        // Definitely assigned on the first (always-executed) loop iteration
+        // before the post-loop read.
+        let mut last_raised;
         loop {
             let before_subst_len = self.sys.eq_store.subst.len();
-            self.subst_system_once();
+            last_raised = self.subst_system_once();
             let after_subst_len = self.sys.eq_store.subst.len();
             if after_subst_len == before_subst_len { break; }
             iter += 1;
             if iter >= cap { break; }
         }
+        // Set the marker iff the FINAL executed pass raised NO signal: that
+        // pass is an observed proof that (content_stamp, subst_stamp) is a
+        // no-op point.  Any later content/subst mutation bumps a stamp, so the
+        // stored pair stops matching — no explicit clear needed.
+        if !last_raised {
+            self.sys.record_subst_marker();
+        }
+    }
+
+    /// Debug harness for the verified-identity skip: when the skip WOULD fire
+    /// and `TAM_RS_VERIFY_SUBST_SKIP=1`, run the full pass loop anyway and
+    /// `panic!` if it is not, in fact, a total no-op (any pass raised a signal,
+    /// or the resulting `System` differs by content/ORDER from the pre-pass
+    /// snapshot).  `System::eq` excludes the stamp Cells and compares every
+    /// `Vec`/`Option` field positionally, so this catches value, reorder AND
+    /// dedup bugs.  Certifies skip-CORRECTNESS (necessary, not a completeness
+    /// proof).
+    fn verify_subst_skip_is_noop(&mut self) {
+        // Force the cached-bloom fact skip OFF for this verification re-run
+        // : otherwise a wrong bloom skip reproduces in
+        // both the live pass and this re-run, so `self.sys == snapshot` would
+        // hold and mask the bug.  With the full descent forced, this oracle
+        // independently certifies BOTH the stamp machinery and the bloom.
+        let _fp_off = FpSkipDisableGuard::new();
+        let snapshot = self.sys.clone();
+        let mut iter = 0u32;
+        let cap = 32u32;
+        loop {
+            let before_subst_len = self.sys.eq_store.subst.len();
+            let raised = self.subst_system_once();
+            let after_subst_len = self.sys.eq_store.subst.len();
+            if raised {
+                panic!("TAM_RS_VERIFY_SUBST_SKIP: skipped subst_system pass \
+                        raised a change signal — under-bumped stamp");
+            }
+            if after_subst_len == before_subst_len { break; }
+            iter += 1;
+            if iter >= cap { break; }
+        }
+        if self.sys != snapshot {
+            panic!("TAM_RS_VERIFY_SUBST_SKIP: skipped subst_system changed the \
+                    System (value / order / dedup) — under-bumped stamp");
+        }
     }
 
     /// One pass of substSystem.  See [`subst_system`] for the loop wrapper.
-    fn subst_system_once(&mut self) {
-        if self.sys.eq_store.subst.is_empty() { return; }
+    /// Returns `true` iff this pass raised ANY change signal (value, order,
+    /// collision, rule-eq, or KU re-insert).  `subst_system` sets the
+    /// verified-identity skip marker only after a pass that returns `false`.
+    fn subst_system_once(&mut self) -> bool {
+        if self.sys.eq_store.subst.is_empty() { return false; }
         let subst = self.sys.eq_store.subst.clone();
         // Hashed leaf-lookup view over the pass-invariant `subst`
         // (`SubstView`): every term walk below probes this one fixed map at
@@ -499,6 +656,17 @@ impl<'ctx> Reduction<'ctx> {
         // `BTreeMap` descent — same entries, same lookup results,
         // byte-identical output.  Pass-local; dropped with the pass.
         let subst_view = tamarin_term::subst::SubstView::new(&subst);
+        // Cached-bloom fact skip.  `fp_skip` is the per-pass
+        // master enable (thread-local, verify oracle force-disables it);
+        // `verify_fp`/`fp_stats` are once-read env gates.  `dom_bloom` is the
+        // once-per-pass OR of the domain vars' bits — the SAME `var_bit` the
+        // cached fact bloom uses (shared site, no divergent hash).  `subst` is
+        // non-empty here (early-returned above), so `dom_bloom != 0`, which is
+        // why the `u64::MAX` default bloom always descends (`MAX & dom != 0`).
+        let fp_skip = FP_SKIP_ENABLED.with(|c| c.get());
+        let verify_fp = verify_fp_enabled();
+        let fp_stats = fp_stats_enabled();
+        let dom_bloom: u64 = subst.dom().fold(0u64, |b, v| b | crate::fact::var_bit(v));
         // Substitution rewrites every term/fact/rule under the current
         // subst — vars in the domain get replaced (possibly by vars
         // with smaller idx), so max-var-idx can LOWER.  Invalidation of
@@ -540,8 +708,8 @@ impl<'ctx> Reduction<'ctx> {
         };
         let map_var = |v: tamarin_term::lterm::LVar| -> tamarin_term::lterm::LVar {
             // Keyed image probe: a Var→Var binding renames the id; an
-            // app-headed or absent image keeps the original var — exactly
-            // the former `apply_vterm` on a `Lit::Var` term, minus the
+            // app-headed or absent image keeps the original var — the same
+            // result `apply_vterm` gives on a `Lit::Var` term, minus the
             // temporary term construction.
             match subst_view.image_of(&v) {
                 Some(tamarin_term::term::Term::Lit(
@@ -556,7 +724,7 @@ impl<'ctx> Reduction<'ctx> {
         //    equalities AFTER the rest of substSystem has run, so the
         //    triggered re-substitution sees a consistent state.
         let mut nodes = std::sync::Arc::unwrap_or_clone(
-            std::mem::take(&mut self.sys.nodes));
+            std::mem::take(&mut self.sys.content_mut_untracked().nodes));
         // HS-faithful node-merge keep-order: `substNodeIds` (Reduction.hs:629-634)
         // reads `M.toList sNodes` — SORTED by node-id — so when several nodes
         // collapse to one id (eq-store node-id binding), `setNodes`'
@@ -617,21 +785,36 @@ impl<'ctx> Reduction<'ctx> {
         // structurally unchanged (dropping the per-term `t.clone()`), and
         // return `None` when EVERY term is unchanged so the caller keeps the
         // original fact untouched — skipping the terms `Vec` collect and the
-        // tag/annotations clones.  Byte-identical to the former full-rebuild
-        // path: an unchanged term is already AC-normal, so the produced fact
-        // is structurally identical; only `Arc` identity differs, and nothing
-        // output-bearing observes `Arc` identity.
+        // tag/annotations clones.  Byte-safe: an unchanged term is already
+        // AC-normal, so a full rebuild would produce a structurally identical
+        // fact — only `Arc` identity differs, and nothing output-bearing
+        // observes `Arc` identity.
         let apply_to_fact = |fa: &crate::fact::LNFact| -> Option<crate::fact::LNFact> {
+            if fp_stats {
+                FP_FACT_DESCENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Cached-bloom fast path: if no free var of the fact
+            // shares a bit with any domain var, the fact contains no domain var
+            // (superset invariant), so every term returns `None` — return
+            // `None` (COW-unchanged), skipping the whole per-term descent.
+            if fp_skip && fa.bloom() & dom_bloom == 0 {
+                if verify_fp { verify_fact_unchanged(fa, &subst_view); }
+                if fp_stats {
+                    FP_FACT_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return None;
+            }
             let mut new_terms: Option<Vec<tamarin_term::lterm::LNTerm>> = None;
             for (i, t) in fa.terms.iter().enumerate() {
                 if let Some(changed) = subst_view.apply_changed(t) {
                     new_terms.get_or_insert_with(|| fa.terms.clone())[i] = changed;
                 }
             }
-            new_terms.map(|terms| crate::fact::LNFact {
-                tag: fa.tag.clone(),
-                annotations: fa.annotations.clone(),
-                terms,
+            new_terms.map(|terms| {
+                // Subst rebuild — frees change; the computing constructor
+                // recomputes the bloom from the post-subst terms internally
+                // (never copy `fa`'s bloom: the rebuild changes the free-var set).
+                crate::fact::LNFact::fresh_annotated(fa.tag.clone(), fa.annotations.clone(), terms)
             })
         };
         let dbg_set_nodes = tamarin_utils::env_gate!("TAM_DBG_SET_NODES");
@@ -772,8 +955,8 @@ impl<'ctx> Reduction<'ctx> {
             let new_new_vars = apply_to_new_vars(&rule.new_vars);
             // When every component is structurally unchanged, keep the
             // original rule value — no `Rule` rebuild, no `Vec` allocations.
-            // The produced System is identical to the former full-rebuild
-            // path (only `Arc` identity differs), so this is byte-neutral.
+            // A rebuild would produce a structurally identical rule (only
+            // `Arc` identity would differ), so keeping it is byte-neutral.
             if new_premises.is_none()
                 && new_conclusions.is_none()
                 && new_actions.is_none()
@@ -803,14 +986,14 @@ impl<'ctx> Reduction<'ctx> {
             self.sys.invalidate_max_var_idx_cache();
             self.sys.invalidate_node_max_cache();
         }
-        self.sys.nodes = std::sync::Arc::new(new_nodes);
+        self.sys.content_mut_untracked().nodes = std::sync::Arc::new(new_nodes);
         if shape_mismatch {
             // Force a `gfalse` formula so `has_false_formula` picks up
             // the contradiction in the next contradictions check.
             let bot = crate::guarded::gfalse();
             if !crate::guarded::stores_contains(&self.sys.formulas, &bot) {
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.formulas.push(std::sync::Arc::new(bot));
+                self.sys.content_mut_untracked().formulas.push(std::sync::Arc::new(bot));
                 self.changed = ChangeIndicator::Changed;
             }
             // Also flip `eq_store.is_false` so the simplify-time filter
@@ -830,7 +1013,7 @@ impl<'ctx> Reduction<'ctx> {
         // dedup below only reorder / drop EQUAL values, which cannot
         // change the max free-var idx.
         let mut edges_value_changed = false;
-        for e in self.sys.edges.iter_mut() {
+        for e in self.sys.content_mut_untracked().edges.iter_mut() {
             let new_src = map_var(e.src.0.clone());
             if new_src != e.src.0 { edges_value_changed = true; e.src.0 = new_src; }
             let new_tgt = map_var(e.tgt.0.clone());
@@ -840,20 +1023,22 @@ impl<'ctx> Reduction<'ctx> {
         // simplify::apply_node_eqs.  Vec::dedup() only removes
         // adjacent duplicates; after var-rename the duplicates may
         // be scattered, so we must sort first.
-        let mut tmp: Vec<_> = std::mem::take(&mut self.sys.edges);
+        let mut tmp: Vec<_> = std::mem::take(&mut self.sys.content_mut_untracked().edges);
         tmp.sort();
         tmp.dedup();
         if edges_value_changed {
             self.sys.invalidate_max_var_idx_cache();
         }
-        self.sys.edges = tmp;
+        self.sys.content_mut_untracked().edges = tmp;
         // 3. Last-atom.
-        if let Some(last) = self.sys.last_atom.take() {
+        let mut last_atom_changed = false;
+        if let Some(last) = self.sys.content_mut_untracked().last_atom.take() {
             let new_last = map_var(last.clone());
             if new_last != last {
+                last_atom_changed = true;
                 self.sys.invalidate_max_var_idx_cache();
             }
-            self.sys.last_atom = Some(new_last);
+            self.sys.content_mut_untracked().last_atom = Some(new_last);
         }
         // 4. Less atoms.
         //
@@ -896,7 +1081,7 @@ impl<'ctx> Reduction<'ctx> {
         // drops only atoms whose image EQUALS a kept one, so an
         // all-identity rewrite cannot change the max free-var idx.
         let mut less_value_changed = false;
-        for la in std::mem::take(&mut self.sys.less_atoms) {
+        for la in std::mem::take(&mut self.sys.content_mut_untracked().less_atoms) {
             let mut la = la;
             let new_smaller = map_var(la.smaller.clone());
             if new_smaller != la.smaller { less_value_changed = true; la.smaller = new_smaller; }
@@ -909,12 +1094,12 @@ impl<'ctx> Reduction<'ctx> {
         if less_value_changed {
             self.sys.invalidate_max_var_idx_cache();
         }
-        self.sys.less_atoms = new_less;
+        self.sys.content_mut_untracked().less_atoms = new_less;
         // 5. Goals: rewrite the Goal's free vars. Goals are deduped
         //    structurally; collapsed goals merge by keeping the first
         //    occurrence.
         let mut goals = std::sync::Arc::unwrap_or_clone(
-            std::mem::take(&mut self.sys.goals));
+            std::mem::take(&mut self.sys.content_mut_untracked().goals));
         // HS-faithful (Reduction.hs:637-651): `substGoals` iterates
         // `M.toList sGoals` which is Goal-Ord order (NodeId-first for
         // ActionG / PremiseG / ChainG).  The order matters because
@@ -956,10 +1141,23 @@ impl<'ctx> Reduction<'ctx> {
         // get rewritten.  Mirrors Haskell's `substFacts` in
         // `substSystem`.
         // COW: rewrite only the terms the subst actually changes and keep
-        // the original fact when none do — value-identical to the former
-        // unconditional rebuild (mirrors `apply_to_fact` in the node
-        // section) and doubles as the change bit.
+        // the original fact when none do — a full rebuild would be
+        // value-identical (mirrors `apply_to_fact` in the node section) —
+        // and let a performed rebuild double as the change bit.
         let apply_fact = |fa: crate::fact::LNFact| -> crate::fact::LNFact {
+            if fp_stats {
+                FP_FACT_DESCENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Cached-bloom fast path: unchanged fact ⇒ return `fa`
+            // as-is and do NOT set `goals_value_changed` (identical to the loop
+            // producing all-`None`).
+            if fp_skip && fa.bloom() & dom_bloom == 0 {
+                if verify_fp { verify_fact_unchanged(&fa, &subst_view); }
+                if fp_stats {
+                    FP_FACT_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return fa;
+            }
             let mut new_terms: Option<Vec<tamarin_term::lterm::LNTerm>> = None;
             for (i, t) in fa.terms.iter().enumerate() {
                 if let Some(changed) = tamarin_term::subst::apply_vterm_changed(&subst, t) {
@@ -969,11 +1167,10 @@ impl<'ctx> Reduction<'ctx> {
             match new_terms {
                 Some(terms) => {
                     goals_value_changed.set(true);
-                    crate::fact::Fact {
-                        tag: fa.tag,
-                        annotations: fa.annotations,
-                        terms,
-                    }
+                    // Subst rebuild — frees change; the computing constructor
+                    // recomputes the bloom from the post-subst terms internally
+                    // (never copy `fa`'s bloom: the rebuild changes the free-var set).
+                    crate::fact::Fact::fresh_annotated(fa.tag, fa.annotations, terms)
                 }
                 None => fa,
             }
@@ -1008,15 +1205,27 @@ impl<'ctx> Reduction<'ctx> {
                                        crate::constraint::system::GoalStatus)>
             = Vec::new();
         for (g, st) in goals {
+            // SKIP-SOUNDNESS PIN: the `!st.solved`
+            // read below is the SOLE consumer of goal STATUS anywhere in
+            // subst_system_once.  The verified-identity skip's `goals_mut`
+            // status-flip carve-out (status flips do NOT bump `content_stamp`)
+            // is sound ONLY because this guard also requires an ACTUAL apply
+            // change to the KU term (`apply_changed(...).is_some_and(m_post !=
+            // m_pre)`), which is impossible while σ is frozen and the term is
+            // already fully propagated — so a status flip alone can never alter
+            // pass output.  If you add a goal-STATUS read here or elsewhere in
+            // the pass, or relax the `apply_changed` gate, this carve-out's
+            // soundness argument no longer holds — either re-establish it or
+            // bump `content_stamp` on the `goals_mut` handout.
             let needs_reinsert = if let Goal::Action(_, fa) = &g {
                 if fa.tag == crate::fact::FactTag::Ku && !st.solved {
                     if let Some(m_pre) = fa.terms.first() {
-                        // Guard-first COW probe: `apply_changed == None` ⇔
-                        // the former `m_post != *m_pre` compare was false
-                        // with `m_post` the reused original, so the walk is
-                        // skipped for the dominant non-msg-var case and the
-                        // deep compare runs only on an actual rebuild (a
-                        // rebuild can still be value-equal via AC re-sort,
+                        // Guard-first COW probe: `apply_changed == None`
+                        // means the applied term equals `m_pre` (the original
+                        // is reused), so no deep compare is needed there; the
+                        // `m_post != m_pre` compare runs only on an actual
+                        // rebuild (a rebuild can still be value-equal via
+                        // an AC re-sort,
                         // so the compare itself is kept).
                         (tamarin_term::lterm::is_msg_var(m_pre) || is_product_or_union(m_pre))
                             && subst_view.apply_changed(m_pre)
@@ -1148,9 +1357,21 @@ impl<'ctx> Reduction<'ctx> {
                 let canon_g2 = crate::constraint::system::canonical_goal_for_dedup(&g2);
                 if let Some(i) = new_goal_keys.iter().position(|k| *k == *canon_g2) {
                     let st_old = &mut new_goals[i].1;
-                    st_old.solved = st_old.solved || st.solved;
-                    st_old.looping = st_old.looping || st.looping;
-                    st_old.nr = std::cmp::min(st_old.nr, st.nr);
+                    let merged_solved = st_old.solved || st.solved;
+                    let merged_looping = st_old.looping || st.looping;
+                    let merged_nr = std::cmp::min(st_old.nr, st.nr);
+                    // A status merge that changes a kept
+                    // goal's status is a real System mutation with no term
+                    // signal.  Flag it so the "zero change" verdict is exact.
+                    if merged_solved != st_old.solved
+                        || merged_looping != st_old.looping
+                        || merged_nr != st_old.nr
+                    {
+                        goals_value_changed.set(true);
+                    }
+                    st_old.solved = merged_solved;
+                    st_old.looping = merged_looping;
+                    st_old.nr = merged_nr;
                 } else {
                     // `new_goal_keys` is a parallel comparison-key cache; the
                     // ACTUAL goal stored is the original `g2` (into `new_goals`).
@@ -1167,7 +1388,8 @@ impl<'ctx> Reduction<'ctx> {
         if goals_value_changed.get() {
             self.sys.invalidate_max_var_idx_cache();
         }
-        self.sys.goals = std::sync::Arc::new(new_goals);
+        self.sys.content_mut_untracked().goals = std::sync::Arc::new(new_goals);
+        let had_insert_action = !to_insert_action.is_empty();
         for (i, fa, st) in to_insert_action {
             self.insert_goal_with_loop_flag(Goal::Action(i, fa), st.looping);
         }
@@ -1186,6 +1408,9 @@ impl<'ctx> Reduction<'ctx> {
         // surviving `All r. Rev(?key) @ r ==> ⊥` when the trace
         // contains `Rev(~k15) @ vr_14` — that's a soundness gap.
         let formula_subst: &crate::guarded::VarSubst = &parser_subst;
+        // Hoisted out of the `if` below so it is in scope for the `raised`
+        // return: set true iff a formula/solved-formula/lemma value changed.
+        let mut formulas_value_changed = false;
         if !formula_subst.is_empty() {
             // Iterate per-formula until subst_guarded reaches a fixpoint
             // — eq-store entries can form chains (e.g. `x:1 → x:13`,
@@ -1246,8 +1471,8 @@ impl<'ctx> Reduction<'ctx> {
             // Change bit for the conditional cache invalidation — the
             // `dedup_preserve_order` calls below drop only formulas EQUAL
             // to kept ones, which cannot change the max free-var idx.
-            let mut formulas_value_changed = false;
-            for f in self.sys.formulas.iter_mut() {
+            // (Declared above the enclosing `if` for the `raised` return.)
+            for f in self.sys.content_mut_untracked().formulas.iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
                     if new_f != **f {
                         *f = std::sync::Arc::new(new_f);
@@ -1256,7 +1481,7 @@ impl<'ctx> Reduction<'ctx> {
                     }
                 }
             }
-            for f in self.sys.solved_formulas.iter_mut() {
+            for f in self.sys.content_mut_untracked().solved_formulas.iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
                     if new_f != **f {
                         *f = std::sync::Arc::new(new_f);
@@ -1265,7 +1490,7 @@ impl<'ctx> Reduction<'ctx> {
                     }
                 }
             }
-            for f in self.sys.lemmas.iter_mut() {
+            for f in self.sys.content_mut_untracked().lemmas.iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
                     if new_f != **f {
                         *f = std::sync::Arc::new(new_f);
@@ -1303,9 +1528,9 @@ impl<'ctx> Reduction<'ctx> {
             // also differs).  This fix is a real HS-faithfulness gap that
             // happens to be load-bearing for many other lemmas via
             // formula-count parity.
-            dedup_preserve_order(&mut self.sys.formulas);
-            dedup_preserve_order(&mut self.sys.solved_formulas);
-            dedup_preserve_order(&mut self.sys.lemmas);
+            dedup_preserve_order(&mut self.sys.content_mut_untracked().formulas);
+            dedup_preserve_order(&mut self.sys.content_mut_untracked().solved_formulas);
+            dedup_preserve_order(&mut self.sys.content_mut_untracked().lemmas);
         }
         // 5b. SubtermStore substitution — port of Haskell's
         // `instance Apply LNSubst SubtermStore` (`SubtermStore.hs:560-561`):
@@ -1331,9 +1556,9 @@ impl<'ctx> Reduction<'ctx> {
         // `Apply LNSubst SubtermStore` doesn't normalise — neither do
         // we.  (`apply_term`'s normalise path is only used when the
         // eager-normalise env var is set; HS-default is non-normalising.)
-        // COW probe + compare-on-rebuild: `apply_changed == None` ⇔ the
-        // former eager apply returned the original term, making the old `!=`
-        // compare false — so both the pre-apply clone and the deep compare
+        // COW probe + compare-on-rebuild: `apply_changed == None` means
+        // applying the subst leaves the term unchanged, so an `!=` compare
+        // could not hold — both the pre-apply clone and the deep compare
         // are skipped on unchanged terms.  On `Some`, the value compare is
         // KEPT (an AC re-sort can rebuild a value-equal term, and
         // `changed_sst` must track VALUE change exactly as before).
@@ -1383,10 +1608,13 @@ impl<'ctx> Reduction<'ctx> {
             let pair = (s, t);
             if !new_negs.contains(&pair) { new_negs.push(pair); }
         }
-        new_negs.sort();
         self.sys.subterm_store_mut().subterms = new_subs;
         self.sys.subterm_store_mut().solved_subterms = new_solved;
-        self.sys.subterm_store_mut().neg_subterms = new_negs;
+        // `rebuild_from` establishes the sorted-unique set invariant on the
+        // rewritten pairs (the `contains` guard above already drops duplicates,
+        // so this contributes the sort).
+        self.sys.subterm_store_mut().neg_subterms =
+            crate::tools::subterm_store::SortedPairSet::rebuild_from(new_negs);
         if changed_sst {
             self.sys.invalidate_max_var_idx_cache();
             self.changed = ChangeIndicator::Changed;
@@ -1396,7 +1624,8 @@ impl<'ctx> Reduction<'ctx> {
         //    `solveRuleEqs SplitLater`). This may add new substitutions
         //    to the eq-store; if so we won't recurse here — the next
         //    simplify-loop iteration will pick them up.
-        if !rule_eqs.is_empty() {
+        let had_rule_eqs = !rule_eqs.is_empty();
+        if had_rule_eqs {
             if tamarin_utils::env_gate!("TAM_DBG_SUBST_RULE_EQS") {
                 let path = crate::constraint::solver::trace::case_path_string();
                 eprintln!("[subst_rule_eqs] path={} queueing {} rule_eqs from setNodes-style collision",
@@ -1463,6 +1692,37 @@ impl<'ctx> Reduction<'ctx> {
                 self.mark_contradictory();
             }
         }
+        // Did THIS pass raise ANY change signal?  The complete signal set is:
+        // value flags for all nine fields, the node-collision / shape /
+        // rule-eq / KU-reinsert signals, and the last-atom rewrite.
+        // `self.changed` alone is INSUFFICIENT (node/edge/less/goal/collision/
+        // last-atom rewrites do not set it), so OR the full list.  A `false`
+        // result certifies a total no-op (value AND order).  The section-local
+        // flags aggregate through the `PassSignals` literal (every field must
+        // be named) + `raised()` (exhaustive OR), so a section whose signal is
+        // not wired into the aggregate is a compile error, not a silent
+        // marker bug.
+        let raised = PassSignals {
+            nodes_value_changed,
+            collisions: collisions > 0,
+            shape_mismatch,
+            edges_value_changed,
+            last_atom_changed,
+            less_value_changed,
+            goals_value_changed: goals_value_changed.get(),
+            formulas_value_changed,
+            changed_sst,
+            had_rule_eqs,
+            had_insert_action,
+        }
+        .raised();
+        // Safe over-bump: a raised pass
+        // already bumped `content_stamp` via a cache helper / subterm_store_mut,
+        // but bump again for clarity so no stale marker can survive it.
+        if raised {
+            self.sys.bump_content_stamp();
+        }
+        raised
     }
 
     /// Install a rule's variant disjunction as a SplitG goal — mirrors
@@ -1580,17 +1840,17 @@ impl<'ctx> Reduction<'ctx> {
                     std::collections::BTreeSet::new()
                 };
             let maude = self.maude.clone();
-            let store = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
+            let store = std::sync::Arc::unwrap_or_clone(self.sys.take_eq_store());
             self.sys.invalidate_max_var_idx_cache();
             if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
                 eprintln!("[rs-fold] ARV-SIMP counter={}", maude.fresh_counter_peek());
             }
-            self.sys.eq_store = std::sync::Arc::new(store.simp_with_fresh_avoiding(
+            self.sys.set_eq_store(std::sync::Arc::new(store.simp_with_fresh_avoiding(
                 |_, _| false,
                 |n| maude.reserve_idxs(n),
                 &sys_vars,
                 Some(&maude),
-            ));
+            )));
             // eq_store simp can rewrite/drop subst entries → max may lower.
             self.sys.invalidate_max_var_idx_cache();
             // Check if our disj was folded (singleton case).  HS leaves
@@ -1864,7 +2124,7 @@ impl<'ctx> Reduction<'ctx> {
                         let mut it = arms.into_iter();
                         if let Some(first) = it.next() {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.eq_store = std::sync::Arc::new(first);
+                            self.sys.set_eq_store(std::sync::Arc::new(first));
                         }
                         for rest in it {
                             self.pending_eq_arms.push(rest);
@@ -1961,7 +2221,13 @@ impl<'ctx> Reduction<'ctx> {
         }
         match g.clone() {
             Guarded::Conj(items) => {
-                if mark { self.sys.solved_formulas.push(std::sync::Arc::new(g)); }
+                // A marked Conj can carry σ-domain free vars pushed between two
+                // simplify-loop `subst_system` calls; routing the push through
+                // `solved_formulas_mut()` bumps `content_stamp` on handout,
+                // breaking a stale skip marker.
+                if mark {
+                    self.sys.solved_formulas_mut().push(std::sync::Arc::new(g));
+                }
                 for it in items { self.insert_formula_inner(it, false); }
                 self.changed = ChangeIndicator::Changed;
             }
@@ -1997,7 +2263,7 @@ impl<'ctx> Reduction<'ctx> {
                 }
                 // Pure ADD (formula push): bump.
                 self.sys.bump_cache_guarded(&g);
-                self.sys.formulas.push(std::sync::Arc::new(g.clone()));
+                self.sys.formulas_mut().push(std::sync::Arc::new(g.clone()));
                 self.changed = ChangeIndicator::Changed;
                 let goal = Goal::Disj(crate::constraint::constraints::Disj::new(items));
                 self.insert_goal(goal);
@@ -2020,7 +2286,7 @@ impl<'ctx> Reduction<'ctx> {
                     || crate::constraint::solver::trace::guarded_repr(&g));
                 // Pure ADD (formula push): bump.
                 self.sys.bump_cache_guarded(&g);
-                self.sys.formulas.push(std::sync::Arc::new(g.clone()));
+                self.sys.formulas_mut().push(std::sync::Arc::new(g.clone()));
                 let goal = Goal::Disj(crate::constraint::constraints::Disj::new(items));
                 self.insert_goal(goal);
                 self.changed = ChangeIndicator::Changed;
@@ -2088,7 +2354,7 @@ impl<'ctx> Reduction<'ctx> {
                         // Pure ADD (solved-formula push under
                         // !already_solved): bump.
                         self.sys.bump_cache_guarded(&g);
-                        self.sys.solved_formulas.push(std::sync::Arc::new(g));
+                        self.sys.solved_formulas_mut().push(std::sync::Arc::new(g));
                         self.changed = ChangeIndicator::Changed;
                     }
                 }
@@ -2119,7 +2385,7 @@ impl<'ctx> Reduction<'ctx> {
                 // Pure ADD (solved-formula push, guarded by the
                 // `contains(&outer)` early-return above): bump.
                 self.sys.bump_cache_guarded(&outer);
-                self.sys.solved_formulas.push(std::sync::Arc::new(outer));
+                self.sys.solved_formulas_mut().push(std::sync::Arc::new(outer));
                 // HS (Reduction.hs:573) draws `xs <- mapM (uncurry freshLVar) ss`
                 // straight from the ambient MonadFresh counter — no clamp; the
                 // threaded counter is above every system var by construction
@@ -2206,7 +2472,7 @@ impl<'ctx> Reduction<'ctx> {
                         // replay picks the wrong open goal.
                         if mark && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.solved_formulas.push(std::sync::Arc::new(g.clone()));
+                            self.sys.solved_formulas_mut().push(std::sync::Arc::new(g.clone()));
                         }
                         let d = crate::guarded::Guarded::Disj(vec![
                             crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&AAtom::Eq(i.clone(), j.clone()))),
@@ -2220,7 +2486,7 @@ impl<'ctx> Reduction<'ctx> {
                         if !crate::guarded::stores_contains(&self.sys.formulas, &g)
                             && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.formulas.push(std::sync::Arc::new(g));
+                            self.sys.formulas_mut().push(std::sync::Arc::new(g));
                             self.changed = ChangeIndicator::Changed;
                         }
                     }
@@ -2233,7 +2499,7 @@ impl<'ctx> Reduction<'ctx> {
                         // ...` (Reduction.hs:491).
                         if mark && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.solved_formulas.push(std::sync::Arc::new(g.clone()));
+                            self.sys.solved_formulas_mut().push(std::sync::Arc::new(g.clone()));
                         }
                         let d = crate::guarded::Guarded::Disj(vec![
                             crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&AAtom::Less(i.clone(), j.clone()))),
@@ -2263,7 +2529,7 @@ impl<'ctx> Reduction<'ctx> {
                         // ...` (Reduction.hs:491).
                         if mark && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.solved_formulas.push(std::sync::Arc::new(g.clone()));
+                            self.sys.solved_formulas_mut().push(std::sync::Arc::new(g.clone()));
                         }
                         let last_node = match &self.sys.last_atom {
                             Some(j) => j.clone(),
@@ -2274,7 +2540,7 @@ impl<'ctx> Reduction<'ctx> {
                                     tamarin_term::lterm::LSort::Node,
                                     baseline.saturating_add(1));
                                 self.sys.invalidate_max_var_idx_cache();
-                                self.sys.last_atom = Some(j.clone());
+                                self.sys.set_last_atom(Some(j.clone()));
                                 j
                             }
                         };
@@ -2307,7 +2573,7 @@ impl<'ctx> Reduction<'ctx> {
                         // ...` (Reduction.hs:491).
                         if mark && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.solved_formulas.push(std::sync::Arc::new(g.clone()));
+                            self.sys.solved_formulas_mut().push(std::sync::Arc::new(g.clone()));
                         }
                         if let (Some(ts), Some(tb)) = (
                             crate::elaborate::term_to_lnterm(s),
@@ -2322,7 +2588,7 @@ impl<'ctx> Reduction<'ctx> {
                             // conversion can't represent — keep visible
                             // as a formula rather than dropping.
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.formulas.push(std::sync::Arc::new(g));
+                            self.sys.formulas_mut().push(std::sync::Arc::new(g));
                             self.changed = ChangeIndicator::Changed;
                         }
                     }
@@ -2331,7 +2597,7 @@ impl<'ctx> Reduction<'ctx> {
                         if !crate::guarded::stores_contains(&self.sys.formulas, &g)
                             && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.formulas.push(std::sync::Arc::new(g));
+                            self.sys.formulas_mut().push(std::sync::Arc::new(g));
                             self.changed = ChangeIndicator::Changed;
                         }
                     }
@@ -2350,7 +2616,7 @@ impl<'ctx> Reduction<'ctx> {
                 if !crate::guarded::stores_contains(&self.sys.formulas, &g)
                     && !crate::guarded::stores_contains(&self.sys.solved_formulas, &g) {
                     self.sys.invalidate_max_var_idx_cache();
-                    self.sys.formulas.push(std::sync::Arc::new(g));
+                    self.sys.formulas_mut().push(std::sync::Arc::new(g));
                     self.changed = ChangeIndicator::Changed;
                 }
             }
@@ -2386,10 +2652,10 @@ impl<'ctx> Reduction<'ctx> {
             let pos = self.sys.formulas.iter().position(|x| **x == f);
             if let Some(idx) = pos {
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.formulas.remove(idx);
+                self.sys.formulas_mut().remove(idx);
                 if !crate::guarded::stores_contains(&self.sys.solved_formulas, &f) {
                     self.sys.invalidate_max_var_idx_cache();
-                    self.sys.solved_formulas.push(std::sync::Arc::new(f));
+                    self.sys.solved_formulas_mut().push(std::sync::Arc::new(f));
                 }
                 self.changed = ChangeIndicator::Changed;
             }
@@ -2553,7 +2819,7 @@ impl<'ctx> Reduction<'ctx> {
         } else {
             std::collections::BTreeSet::new()
         };
-        let store = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
+        let store = std::sync::Arc::unwrap_or_clone(self.sys.take_eq_store());
         // Use `simp_with_fresh_avoiding` so singleton SplitG disjunctions
         // get folded into `subst` via `simp_singleton`.  Haskell's `simp`
         // (EquationStore.hs:361) calls `simpSingleton` as part of the
@@ -2566,8 +2832,9 @@ impl<'ctx> Reduction<'ctx> {
         // non-normal-terms predicate + system_vars.  Reused for both
         // the no-split branch and the per-arm SplitNow loop below.
         // `nf_checker.is_some()` iff `has_reducible` (built via
-        // `has_reducible.then(...)`), so passing `nf_checker.as_ref()`
-        // reproduces the former `if has_reducible` dispatch exactly.
+        // `has_reducible.then(...)`), so the checker's presence IS the
+        // reducible-symbol dispatch: `as_ref()` is `Some` exactly when
+        // the non-normal-terms check must run.
         let do_simp = |s: crate::tools::equation_store::EquationStore|
                 -> crate::tools::equation_store::EquationStore {
             simp_store(s, nf_checker.as_ref(), &maude_alloc, &system_vars)
@@ -2639,8 +2906,8 @@ impl<'ctx> Reduction<'ctx> {
                     // checks see it (mirrors HS noContradictoryEqStore
                     // firing mzero on every arm).
                     self.sys.invalidate_max_var_idx_cache();
-                    self.sys.eq_store = std::sync::Arc::new(crate::tools::equation_store::EquationStore::default()
-                        .set_false());
+                    self.sys.set_eq_store(std::sync::Arc::new(crate::tools::equation_store::EquationStore::default()
+                        .set_false()));
                     return Ok(SolveOutcome::Contradictory);
                 }
                 self.changed = ChangeIndicator::Changed;
@@ -2649,7 +2916,7 @@ impl<'ctx> Reduction<'ctx> {
                     // eq_store and return Linear (no caller-side fork
                     // needed).
                     self.sys.invalidate_max_var_idx_cache();
-                    self.sys.eq_store = std::sync::Arc::new(live_arms.into_iter().next().unwrap());
+                    self.sys.set_eq_store(std::sync::Arc::new(live_arms.into_iter().next().unwrap()));
                     Ok(SolveOutcome::Linear(ChangeIndicator::Changed))
                 } else {
                     if tamarin_utils::env_gate!("TAM_RS_DBG_STE_MULTI") {
@@ -2663,7 +2930,7 @@ impl<'ctx> Reduction<'ctx> {
             (Some(id), SplitStrategy::SplitLater) => {
                 // No split fanout — simp once on the combined store.
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.eq_store = std::sync::Arc::new(do_simp(store));
+                self.sys.set_eq_store(std::sync::Arc::new(do_simp(store)));
                 if self.sys.eq_store.is_false() {
                     return Ok(SolveOutcome::Contradictory);
                 }
@@ -2674,7 +2941,7 @@ impl<'ctx> Reduction<'ctx> {
             (None, _) => {
                 // No split — simp once.
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.eq_store = std::sync::Arc::new(do_simp(store));
+                self.sys.set_eq_store(std::sync::Arc::new(do_simp(store)));
                 if self.sys.eq_store.is_false() {
                     return Ok(SolveOutcome::Contradictory);
                 }
@@ -2751,25 +3018,23 @@ impl<'ctx> Reduction<'ctx> {
             return out;
         }
         let arm0_end = self.maude.fresh_counter_peek();
-        let arm0_store = std::mem::take(&mut self.sys.eq_store);
+        let arm0_store = self.sys.take_eq_store();
         let pending = std::mem::take(&mut self.pending_eq_arms);
         let mut new_pending = Vec::with_capacity(pending.len());
         for arm in pending {
             self.maude.reset_counter_to(fork_base);
             self.sys.invalidate_max_var_idx_cache();
-            self.sys.eq_store = std::sync::Arc::new(arm);
+            self.sys.set_eq_store(std::sync::Arc::new(arm));
             // Ignore the outcome: a contradictory arm keeps its `is_false`
             // store and is dropped at the `fan_out_on_pending_eq_arms`
             // is_false filter, exactly as HS's per-arm `noContradictory-
             // EqStore` mzero drops that arm from the `DisjT`.
             let _ = self.solve_node_id_eqs(eqs);
-            let updated = std::mem::replace(
-                &mut self.sys.eq_store,
-                std::sync::Arc::new(crate::tools::equation_store::EquationStore::default()));
+            let updated = self.sys.take_eq_store();
             new_pending.push(std::sync::Arc::unwrap_or_clone(updated));
         }
         self.sys.invalidate_max_var_idx_cache();
-        self.sys.eq_store = arm0_store;
+        self.sys.set_eq_store(arm0_store);
         self.pending_eq_arms = new_pending;
         // Restore arm0's post-merge counter (fan-out then re-seeds every
         // arm from this position, matching arm0's continuation).
@@ -2921,7 +3186,7 @@ impl<'ctx> Reduction<'ctx> {
         // rules) — node max can DROP, invalidate the node component too.
         self.sys.invalidate_max_var_idx_cache();
         self.sys.invalidate_node_max_cache();
-        self.sys.nodes = std::sync::Arc::new(canonical);
+        self.sys.content_mut_untracked().nodes = std::sync::Arc::new(canonical);
         if rule_eqs.is_empty() {
             return Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged));
         }
@@ -3028,13 +3293,13 @@ impl<'ctx> Reduction<'ctx> {
                 // Pure ADD (joinSets solved-formula merge under
                 // !contains): bump.
                 self.sys.bump_cache_guarded(f);
-                self.sys.solved_formulas.push(f.clone());
+                self.sys.solved_formulas_mut().push(f.clone());
             }
         }
         for l in &sys.lemmas {
             if !crate::guarded::stores_contains(&self.sys.lemmas, l) {
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.lemmas.push(l.clone());
+                self.sys.lemmas_mut().push(l.clone());
             }
         }
         for e in &sys.edges {
@@ -3199,7 +3464,7 @@ impl<'ctx> Reduction<'ctx> {
                 let mut arm_iter = arms.into_iter();
                 let arm0 = arm_iter.next().expect("Cases has >=2 arms");
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.eq_store = std::sync::Arc::new(arm0);
+                self.sys.set_eq_store(std::sync::Arc::new(arm0));
                 // Build per-arm fanout snapshots from the pre-step-12 sys.
                 // Each snapshot gets the arm's eq_store installed and
                 // step 13 (substSystem) applied locally.
@@ -3222,7 +3487,7 @@ impl<'ctx> Reduction<'ctx> {
                     for arm_i in arm_iter {
                         let mut arm_sys = snapshot.clone();
                         arm_sys.invalidate_max_var_idx_cache();
-                        arm_sys.eq_store = std::sync::Arc::new(arm_i);
+                        arm_sys.set_eq_store(std::sync::Arc::new(arm_i));
                         // Replicate step 13 substSystem locally on the
                         // arm-i sys by spinning a transient Reduction
                         // that CONTINUES the step's counter thread.
@@ -3449,8 +3714,8 @@ fn build_parser_subst_from_eq_store(
         // Bound chain length to avoid pathological cycles (shouldn't
         // happen post-compose, but defensive).  Borrowing COW step: the
         // helper returns `None` exactly when applying `subst` leaves `cur`
-        // structurally unchanged (the former `next == cur` fixpoint), so we
-        // return `cur` with no clone and no deep compare.
+        // structurally unchanged — the chain fixpoint — so we return `cur`
+        // with no clone and no deep compare.
         for _ in 0..32 {
             match tamarin_term::subst::apply_vterm_changed(subst, &cur) {
                 None => return cur,
@@ -3841,6 +4106,103 @@ fn bounds_max_verify_enabled() -> bool {
     *V.get_or_init(|| std::env::var("TAM_RS_VERIFY_BOUNDS_CACHE").is_ok())
 }
 
+/// Opt-in verifier for the verified-identity `subst_system` skip: when
+/// set, every would-skip runs the full pass on a clone and panics if
+/// it was not a total no-op.
+#[inline]
+fn verify_subst_skip_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_VERIFY_SUBST_SKIP").is_ok())
+}
+
+/// Opt-in skip-effectiveness counters (`TAM_RS_SUBST_SKIP_STATS=1`).  Gated so
+/// there is ZERO hot-path cost (one `OnceLock` bool load) when disabled.
+#[inline]
+fn subst_skip_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_SUBST_SKIP_STATS").is_ok())
+}
+pub(crate) static SUBST_SYSTEM_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SUBST_SYSTEM_SKIPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Master enable for the cached-bloom fact skip in `subst_system_once`
+    /// . Default `true`.  The verify oracle
+    /// `verify_subst_skip_is_noop` force-DISABLES it for its re-run so the
+    /// full per-term descent runs during verification — otherwise a wrong
+    /// bloom skip would reproduce identically in both the live pass and the
+    /// verify pass, masking itself.  With it disabled in verification, the
+    /// round-4 marker verifier is a TRUE independent oracle for the bloom.
+    static FP_SKIP_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// RAII guard: force the bloom skip off for the current thread, restoring the
+/// previous value on drop.  Used by [`verify_subst_skip_is_noop`].
+#[must_use = "dropping this guard immediately ends the scope it protects"]
+struct FpSkipDisableGuard(bool);
+impl FpSkipDisableGuard {
+    fn new() -> Self {
+        let prev = FP_SKIP_ENABLED.with(|c| { let p = c.get(); c.set(false); p });
+        FpSkipDisableGuard(prev)
+    }
+}
+impl Drop for FpSkipDisableGuard {
+    fn drop(&mut self) { FP_SKIP_ENABLED.with(|c| c.set(self.0)); }
+}
+
+/// Opt-in verifier for the cached-bloom fact skip (`TAM_RS_VERIFY_FP=1`).
+/// Read once per pass; when set, every bloom-miss skip ALSO runs
+/// the real per-term descent and panics on any real change — an independent
+/// oracle that fires at the skip site regardless of what the bloom said.
+#[inline]
+fn verify_fp_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_VERIFY_FP").is_ok())
+}
+
+/// Opt-in descent-skip counters for the cached-bloom fact skip
+/// (`TAM_RS_FP_STATS=1`).  Zero hot-path cost when unset.
+#[inline]
+fn fp_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_FP_STATS").is_ok())
+}
+/// Total fact descents reached in the two skippable sections (node + goal).
+pub(crate) static FP_FACT_DESCENTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Descents the bloom fast-path skipped (`bloom & dom == 0`).
+pub(crate) static FP_FACT_SKIPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// `subst_system` call counter for the FP-stats print cadence.
+pub(crate) static FP_STATS_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Verify oracle for one bloom-miss skip: run the real per-term
+/// descent via the pass `SubstView` and panic if any term actually changes —
+/// i.e. the fingerprint missed a domain var (unsound bit assignment).  Calls
+/// `apply_changed` DIRECTLY (never the bloom), so it is independent of the
+/// bloom decision it is checking.
+fn verify_fact_unchanged(
+    fa: &crate::fact::LNFact,
+    view: &tamarin_term::subst::SubstView<'_, tamarin_term::lterm::Name, tamarin_term::lterm::LVar>,
+) {
+    for t in &fa.terms {
+        if let Some(c) = view.apply_changed(t) {
+            if c != *t {
+                panic!("TAM_RS_VERIFY_FP: bloom-skip dropped a real change \
+                        (fact contained a domain var the fingerprint missed) \
+                        — unsound bit assignment");
+            }
+        }
+    }
+}
+
 #[inline]
 fn bounds_max_disable_enabled() -> bool {
     use std::sync::OnceLock;
@@ -4212,7 +4574,7 @@ fn fanout_arm_systems(outcome: SolveOutcome, base: System) -> Vec<System> {
                 // because `new_inheriting` takes `max(avoid, inherit_next)`
                 // and the forked counter already covered the witnesses.)
                 s.invalidate_max_var_idx_cache();
-                s.eq_store = std::sync::Arc::new(arm_eq);
+                s.set_eq_store(std::sync::Arc::new(arm_eq));
                 s
             }).collect()
         }
@@ -4944,7 +5306,7 @@ impl<'ctx> Reduction<'ctx> {
                     for arm_eq in pending {
                         let mut arm_sys = post_sys.clone();
                         arm_sys.invalidate_max_var_idx_cache();
-                        arm_sys.eq_store = std::sync::Arc::new(arm_eq);
+                        arm_sys.set_eq_store(std::sync::Arc::new(arm_eq));
                         cases.push((base_name.clone(), arm_sys));
                     }
                 }
@@ -5371,14 +5733,14 @@ impl<'ctx> Reduction<'ctx> {
                         Err(_) | Ok(SolveOutcome::Contradictory) => continue,
                         Ok(SolveOutcome::Cases(arms)) => arms,
                         Ok(SolveOutcome::Linear(_)) =>
-                            vec![(*sub.sys.eq_store).clone()],
+                            vec![(**sub.sys.eq_store).clone()],
                     };
                     let post_sys = sub.sys.clone();
                     let branch_counter = sub.maude.fresh_counter_peek();
                     for arm_eq in arm_eq_stores {
                         let mut sys = post_sys.clone();
                         sys.invalidate_max_var_idx_cache();
-                        sys.eq_store = std::sync::Arc::new(arm_eq);
+                        sys.set_eq_store(std::sync::Arc::new(arm_eq));
                         for (existing, status) in sys.goals_mut().iter_mut() {
                             if existing == &g && !status.solved {
                                 status.solved = true;
@@ -5550,7 +5912,7 @@ impl<'ctx> Reduction<'ctx> {
                                         for arm_eq in arms {
                                             let mut arm_sys = template.clone();
                                             arm_sys.invalidate_max_var_idx_cache();
-                                            arm_sys.eq_store = std::sync::Arc::new(arm_eq);
+                                            arm_sys.set_eq_store(std::sync::Arc::new(arm_eq));
                                             let mut arm_red = Reduction::new_inheriting(
                                                 self.ctx, arm_sys, post_solve_counter);
                                             arm_red.subst_system();
@@ -5640,7 +6002,7 @@ impl<'ctx> Reduction<'ctx> {
                                                 for arm2 in arms2 {
                                                     let mut s2 = template2.clone();
                                                     s2.invalidate_max_var_idx_cache();
-                                                    s2.eq_store = std::sync::Arc::new(arm2);
+                                                    s2.set_eq_store(std::sync::Arc::new(arm2));
                                                     let mut r3 = Reduction::new_inheriting(
                                                         self.ctx, s2, post_chain_counter);
                                                     r3.subst_system();
@@ -5952,7 +6314,7 @@ impl<'ctx> Reduction<'ctx> {
                             Err(_) | Ok(SolveOutcome::Contradictory) => continue,
                             Ok(SolveOutcome::Cases(arms)) => arms,
                             Ok(SolveOutcome::Linear(_)) =>
-                                vec![(*sub.sys.eq_store).clone()],
+                                vec![(**sub.sys.eq_store).clone()],
                         };
                         let post_sys = sub.sys.clone();
                         // Branch counter for HS FreshT-threading (see the
@@ -5966,7 +6328,7 @@ impl<'ctx> Reduction<'ctx> {
                         for arm_eq in arm_eq_stores {
                             let mut sys = post_sys.clone();
                             sys.invalidate_max_var_idx_cache();
-                            sys.eq_store = std::sync::Arc::new(arm_eq);
+                            sys.set_eq_store(std::sync::Arc::new(arm_eq));
                             for (existing, status) in sys.goals_mut().iter_mut() {
                                 if existing == &g && !status.solved {
                                     status.solved = true;
@@ -7093,8 +7455,7 @@ impl<'ctx> Reduction<'ctx> {
         // One `maybeNonNormalTerms` walk of `self.sys`, shared across every
         // candidate probe below — HS's curried `substCheck` from Goals.hs:381
         // (`gets (substCreatesNonNormalTerms hnd)` captures the system once).
-        // Replaces a former unconditional deep System clone + per-candidate
-        // re-walk.  See `SubstNfChecker`.
+        // See `SubstNfChecker`.
         let nf_checker = has_reducible.then(||
             crate::constraint::solver::contradictions::SubstNfChecker::new(
                 &maude, &self.sys));
@@ -7116,8 +7477,8 @@ impl<'ctx> Reduction<'ctx> {
         } else {
             std::collections::BTreeSet::new()
         };
-        // `nf_checker.is_some()` iff `has_reducible`, so `nf_checker.as_ref()`
-        // reproduces the former `if has_reducible` dispatch exactly.
+        // `nf_checker.is_some()` iff `has_reducible`, so `as_ref()` is
+        // `Some` exactly when the non-normal-terms check must run.
         let simplify_picked = |store: crate::tools::equation_store::EquationStore|
             -> crate::tools::equation_store::EquationStore
         {
@@ -7129,8 +7490,8 @@ impl<'ctx> Reduction<'ctx> {
                     id, self.maude.fresh_counter_peek());
             }
             self.sys.invalidate_max_var_idx_cache();
-            self.sys.eq_store = std::sync::Arc::new(simplify_picked(
-                cases.into_iter().next().unwrap()));
+            self.sys.set_eq_store(std::sync::Arc::new(simplify_picked(
+                cases.into_iter().next().unwrap())));
             self.mark_goal_as_solved(&g);
             // Push the resulting free subst back into the system.
             self.subst_system();
@@ -7172,7 +7533,7 @@ impl<'ctx> Reduction<'ctx> {
                 eprintln!("[rs-fold] SPLITG-CASE id={:?} case={} before={}",
                     id, ci, self.maude.fresh_counter_peek());
             }
-            sys.eq_store = std::sync::Arc::new(simplify_picked(store));
+            sys.set_eq_store(std::sync::Arc::new(simplify_picked(store)));
             let branch_counter = self.maude.fresh_counter_peek();
             if fold_dbg {
                 eprintln!("[rs-fold] SPLITG-CASE-DONE id={:?} case={} after={}",
@@ -7310,7 +7671,7 @@ mod tests {
         // just want to verify the substitution propagates.)
         let tgt = LVar::new("t", LSort::Node, 99);
         r.sys.invalidate_max_var_idx_cache();
-        r.sys.edges.push(crate::constraint::constraints::Edge {
+        r.sys.content_mut().edges.push(crate::constraint::constraints::Edge {
             src: (i.clone(), crate::rule::ConcIdx(0)),
             tgt: (tgt.clone(), crate::rule::PremIdx(0)),
         });
@@ -7342,7 +7703,7 @@ mod tests {
         let j = LVar::new("j", LSort::Node, 3);
         let target = LVar::new("t", LSort::Node, 9);
         r.sys.invalidate_max_var_idx_cache();
-        r.sys.less_atoms.push(crate::constraint::constraints::LessAtom::new(
+        r.sys.content_mut().less_atoms.push(crate::constraint::constraints::LessAtom::new(
             i.clone(), target.clone(),
             crate::constraint::constraints::Reason::Formula));
         let ti = tamarin_term::term::Term::Lit(Lit::Var(i.clone()));

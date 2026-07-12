@@ -11,6 +11,7 @@ use tamarin_theory::constraint::constraints::{
     Edge, Goal, LessAtom, NodeId, Reason,
 };
 use tamarin_theory::constraint::system::System;
+use super::render_system::RenderSystem;
 use tamarin_theory::fact::FactTag;
 use tamarin_theory::rule::{
     is_coerce_rule_info, is_irecv_rule_info, is_isend_rule_info,
@@ -24,7 +25,7 @@ use tamarin_term::lterm::{sort_of_lnterm, LSort, LNTerm};
 
 /// Mirror of Haskell `compressSystem` (Simplification.hs:42-46).
 /// Drops entailed less-atoms, then tries to hide each node in turn.
-pub fn compress_system(mut sys: System) -> System {
+pub fn compress_system(mut sys: RenderSystem) -> RenderSystem {
     sys = drop_entailed_ord_constraints(sys);
     // Haskell: `foldl' (flip tryHideNodeId) se (frees (sLessAtoms, sNodes))`
     // where `frees = sortednub . freesList` — a SINGLE sorted, deduplicated
@@ -51,7 +52,7 @@ pub fn compress_system(mut sys: System) -> System {
 }
 
 /// Drop `LessAtom`s that are implied by the edge relation.
-fn drop_entailed_ord_constraints(mut sys: System) -> System {
+fn drop_entailed_ord_constraints(mut sys: RenderSystem) -> RenderSystem {
     // Build adjacency from `rawEdgeRel` = edges ++ unsolvedChains
     // (Simplification.hs:37 / System.hs:1613-1616).
     let adj = build_raw_edge_adjacency(&sys);
@@ -72,7 +73,7 @@ fn drop_entailed_ord_constraints(mut sys: System) -> System {
             new_atoms.push(la.clone());
         }
     }
-    sys.less_atoms = new_atoms;
+    sys.content_mut().less_atoms = new_atoms;
     sys
 }
 
@@ -127,7 +128,7 @@ fn reachable(
 // tryHideNodeId — `Simplification.hs:85-152`
 // ---------------------------------------------------------------------
 
-fn try_hide_node_id(v: &NodeId, sys: System) -> System {
+fn try_hide_node_id(v: &NodeId, sys: RenderSystem) -> RenderSystem {
     if v.sort != LSort::Node { return sys; }
     // Mirror Haskell guards on `notOccursIn`:
     //   - unsolved chains (any goal Chain mentioning v)
@@ -207,7 +208,7 @@ fn atom_mentions_node(v: &NodeId, at: &tamarin_theory::guarded_types::GAtom) -> 
 // hideAction — `Simplification.hs:99-122`
 // ---------------------------------------------------------------------
 
-fn try_hide_action(v: &NodeId, sys: System) -> Result<System, System> {
+fn try_hide_action(v: &NodeId, sys: RenderSystem) -> Result<RenderSystem, RenderSystem> {
     // Collect KU action atoms at v.
     let ku_actions: Vec<(NodeId, tamarin_theory::fact::LNFact)> = sys.goals.iter()
         .filter_map(|(g, st)| {
@@ -255,11 +256,11 @@ fn try_hide_action(v: &NodeId, sys: System) -> Result<System, System> {
     }
     // Apply.
     let mut new_sys = sys;
-    new_sys.less_atoms.retain(|la| !l_ins.iter().any(|x| x == la)
+    new_sys.content_mut().less_atoms.retain(|la| !l_ins.iter().any(|x| x == la)
         && !l_outs.iter().any(|x| x == la));
     for la in l_news {
         if !new_sys.less_atoms.iter().any(|x| x == &la) {
-            new_sys.less_atoms.push(la);
+            new_sys.content_mut().less_atoms.push(la);
         }
     }
     // Remove KU action goals at v.
@@ -283,7 +284,7 @@ fn eligible_term(t: &LNTerm) -> bool {
 // hideRule — `Simplification.hs:124-152`
 // ---------------------------------------------------------------------
 
-fn try_hide_rule(v: &NodeId, ru: RuleACInst, sys: System) -> Result<System, System> {
+fn try_hide_rule(v: &NodeId, ru: RuleACInst, sys: RenderSystem) -> Result<RenderSystem, RenderSystem> {
     // Eligible-rule check: must be one of irecv/isend/coerce/fresh,
     // OR have zero actions and at most-one premise + at most-one conclusion.
     if !rule_eligible(&ru) { return Err(sys); }
@@ -313,11 +314,11 @@ fn try_hide_rule(v: &NodeId, ru: RuleACInst, sys: System) -> Result<System, Syst
     }) { return Err(sys); }
     // Apply.
     let mut new_sys = sys;
-    new_sys.edges.retain(|e|
+    new_sys.content_mut().edges.retain(|e|
         !e_ins.iter().any(|x| x == e) && !e_outs.iter().any(|x| x == e));
     for e in e_news {
         if !new_sys.edges.iter().any(|x| x == &e) {
-            new_sys.edges.push(e);
+            new_sys.content_mut().edges.push(e);
         }
     }
     // Node removal can LOWER the node-component max, so invalidate the
@@ -370,7 +371,7 @@ pub enum SimplificationLevel {
 ///   SL2 = transitiveReduction sys False
 ///   SL3 = transitiveReduction sys True
 ///   else identity.
-pub fn simplify_system(level: SimplificationLevel, sys: System) -> System {
+pub fn simplify_system(level: SimplificationLevel, sys: RenderSystem) -> RenderSystem {
     match level {
         SimplificationLevel::SL2 => transitive_reduction(sys, false),
         SimplificationLevel::SL3 => transitive_reduction(sys, true),
@@ -383,7 +384,7 @@ pub fn simplify_system(level: SimplificationLevel, sys: System) -> System {
 ///
 /// `total_red = True`  -> retain only `(x,y) ∈ transRed sLess`
 /// `total_red = False` -> retain `(x,y) ∈ transRed sLess` OR reason ∈ {Formula, Adversary}
-pub fn transitive_reduction(sys: System, total_red: bool) -> System {
+pub fn transitive_reduction(sys: RenderSystem, total_red: bool) -> RenderSystem {
     // Haskell: `oldLesses = rawLessRel sys`, used for BOTH `Dag.cyclic`
     // and `Dag.transRed` (Simplification.hs:61-74).  `rawLessRel se =
     // getLessRel sLessAtoms ++ rawEdgeRel se` (System.hs:1621-1622), and
@@ -402,7 +403,7 @@ pub fn transitive_reduction(sys: System, total_red: bool) -> System {
     if has_cycle(&old_lesses, &nodes) { return sys; }
     let kept: BTreeSet<(NodeId, NodeId)> = trans_red(&old_lesses);
     let mut sys = sys;
-    sys.less_atoms.retain(|la| {
+    sys.content_mut().less_atoms.retain(|la| {
         let p = (la.smaller.clone(), la.larger.clone());
         if total_red {
             kept.contains(&p)
@@ -493,11 +494,11 @@ mod tests {
     #[test]
     fn simplify_sl0_is_identity() {
         let mut sys = System::empty();
-        sys.less_atoms.push(LessAtom::new(nid("a", 0), nid("b", 0), Reason::Fresh));
-        sys.less_atoms.push(LessAtom::new(nid("a", 0), nid("c", 0), Reason::Fresh));
-        sys.less_atoms.push(LessAtom::new(nid("b", 0), nid("c", 0), Reason::Fresh));
+        sys.content_mut().less_atoms.push(LessAtom::new(nid("a", 0), nid("b", 0), Reason::Fresh));
+        sys.content_mut().less_atoms.push(LessAtom::new(nid("a", 0), nid("c", 0), Reason::Fresh));
+        sys.content_mut().less_atoms.push(LessAtom::new(nid("b", 0), nid("c", 0), Reason::Fresh));
         let orig = sys.clone();
-        let out = simplify_system(SimplificationLevel::SL0, sys);
+        let out = simplify_system(SimplificationLevel::SL0, RenderSystem::from_prover(sys));
         assert_eq!(orig.less_atoms.len(), out.less_atoms.len());
     }
 
@@ -505,10 +506,10 @@ mod tests {
     fn simplify_sl3_drops_transitive_edge() {
         // a < b < c plus the redundant a < c -- SL3 should drop a < c.
         let mut sys = System::empty();
-        sys.less_atoms.push(LessAtom::new(nid("a", 0), nid("b", 0), Reason::Fresh));
-        sys.less_atoms.push(LessAtom::new(nid("b", 0), nid("c", 0), Reason::Fresh));
-        sys.less_atoms.push(LessAtom::new(nid("a", 0), nid("c", 0), Reason::Fresh));
-        let out = simplify_system(SimplificationLevel::SL3, sys);
+        sys.content_mut().less_atoms.push(LessAtom::new(nid("a", 0), nid("b", 0), Reason::Fresh));
+        sys.content_mut().less_atoms.push(LessAtom::new(nid("b", 0), nid("c", 0), Reason::Fresh));
+        sys.content_mut().less_atoms.push(LessAtom::new(nid("a", 0), nid("c", 0), Reason::Fresh));
+        let out = simplify_system(SimplificationLevel::SL3, RenderSystem::from_prover(sys));
         assert_eq!(out.less_atoms.len(), 2,
             "SL3 should drop the redundant edge: {:?}", out.less_atoms);
         for la in &out.less_atoms {
@@ -521,12 +522,12 @@ mod tests {
         // a < b < c plus the redundant a < c with Reason::Formula:
         // SL2 keeps the formula edge but SL3 drops it.
         let mut sys = System::empty();
-        sys.less_atoms.push(LessAtom::new(nid("a", 0), nid("b", 0), Reason::Fresh));
-        sys.less_atoms.push(LessAtom::new(nid("b", 0), nid("c", 0), Reason::Fresh));
-        sys.less_atoms.push(LessAtom::new(nid("a", 0), nid("c", 0), Reason::Formula));
-        let out2 = simplify_system(SimplificationLevel::SL2, sys.clone());
+        sys.content_mut().less_atoms.push(LessAtom::new(nid("a", 0), nid("b", 0), Reason::Fresh));
+        sys.content_mut().less_atoms.push(LessAtom::new(nid("b", 0), nid("c", 0), Reason::Fresh));
+        sys.content_mut().less_atoms.push(LessAtom::new(nid("a", 0), nid("c", 0), Reason::Formula));
+        let out2 = simplify_system(SimplificationLevel::SL2, RenderSystem::from_prover(sys.clone()));
         assert_eq!(out2.less_atoms.len(), 3, "SL2 retains Formula edges");
-        let out3 = simplify_system(SimplificationLevel::SL3, sys);
+        let out3 = simplify_system(SimplificationLevel::SL3, RenderSystem::from_prover(sys));
         assert_eq!(out3.less_atoms.len(), 2, "SL3 drops Formula edges too");
     }
 
@@ -576,15 +577,15 @@ mod tests {
         sys.add_node(n1.clone(), r1);
         sys.add_node(n2.clone(), r2);
         sys.add_node(n3.clone(), r3);
-        sys.edges.push(Edge {
+        sys.content_mut().edges.push(Edge {
             src: (n1.clone(), ConcIdx(0)),
             tgt: (n2.clone(), PremIdx(0)),
         });
-        sys.edges.push(Edge {
+        sys.content_mut().edges.push(Edge {
             src: (n2.clone(), ConcIdx(0)),
             tgt: (n3.clone(), PremIdx(0)),
         });
-        let out = compress_system(sys);
+        let out = compress_system(RenderSystem::from_prover(sys));
         assert!(out.nodes.iter().all(|(id, _)| id != &n2),
             "Transfer node should have been hidden: {:?}",
             out.nodes.iter().map(|(id, _)| id).collect::<Vec<_>>());
@@ -610,7 +611,7 @@ mod tests {
         );
         let n1 = nid("i", 1);
         sys.add_node(n1.clone(), r1);
-        let out = compress_system(sys);
+        let out = compress_system(RenderSystem::from_prover(sys));
         assert!(out.nodes.iter().any(|(id, _)| id == &n1));
     }
 
@@ -654,15 +655,15 @@ mod tests {
         sys.add_node(n1.clone(), r1);
         sys.add_node(n2.clone(), r2);
         sys.add_node(n3.clone(), r3);
-        sys.edges.push(Edge {
+        sys.content_mut().edges.push(Edge {
             src: (n1.clone(), ConcIdx(0)),
             tgt: (n2.clone(), PremIdx(0)),
         });
-        sys.edges.push(Edge {
+        sys.content_mut().edges.push(Edge {
             src: (n2.clone(), ConcIdx(0)),
             tgt: (n3.clone(), PremIdx(0)),
         });
-        let out = compress_system(sys);
+        let out = compress_system(RenderSystem::from_prover(sys));
         assert!(out.nodes.iter().all(|(id, _)| id != &n2),
             "Coerce node should have been hidden");
     }

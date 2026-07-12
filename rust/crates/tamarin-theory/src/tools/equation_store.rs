@@ -164,6 +164,9 @@ cached_env_flag!(
     /// `set_false`.  Cached so the steady-state cost is an atomic load.
     aes_trace_set_false_full, "TAM_TRACE_SET_FALSE_FULL");
 
+// debug-only keyed registry; never reaches prover output;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn impure_dbg_registry()
     -> &'static std::sync::Mutex<std::collections::HashMap<String, String>>
 {

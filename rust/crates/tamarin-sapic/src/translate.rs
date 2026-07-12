@@ -464,6 +464,9 @@ pub fn translate(
     // The embedded restriction formulas, keyed by rule NAME (compression keeps
     // the first rule's name and never merges `_restrict`-bearing arms — see the
     // `isLetFact`/no-compress guards), so re-pairing by name is faithful.
+    // restriction-by-name re-pair map; keyed lookup only, never iterated;
+    // std kept (byte-inert) — iteration order never reaches output.
+    #[allow(clippy::disallowed_types)]
     let restr_by_name: std::collections::HashMap<String, Vec<tamarin_parser::ast::Formula>> = all
         .iter()
         .filter(|r| !r.restr.is_empty())

@@ -563,10 +563,12 @@ mod tests {
                 propagated: false,
             }],
             contradictory: true,
-            neg_subterms: vec![(v("p", LSort::Msg), v("q", LSort::Msg))],
-            old_neg_subterms: vec![],
+            neg_subterms: crate::tools::subterm_store::SortedPairSet::rebuild_from(
+                vec![(v("p", LSort::Msg), v("q", LSort::Msg))]),
+            old_neg_subterms: crate::tools::subterm_store::SortedPairSet::default(),
         };
-        let sys = System { subterm_store: std::sync::Arc::new(st), ..Default::default() };
+        let mut sys = System::empty();
+        *sys.subterm_store_mut() = st;
         let out = pretty_subterm_store(&sys).render();
         // Contradictory header + all three numbered keyword sections.
         assert!(out.contains("Contradictory: yes"), "got:\n{out}");
@@ -585,7 +587,8 @@ mod tests {
         let mut eq = EquationStore::empty();
         // An empty disjunction makes the store contradictory.
         eq.conj.push(EqDisj { split_id: SplitId(0), substs: vec![] });
-        let sys = System { eq_store: std::sync::Arc::new(eq), ..Default::default() };
+        let mut sys = System::empty();
+        sys.set_eq_store(std::sync::Arc::new(eq));
         let out = pretty_eq_store(&sys).render();
         assert!(out.contains("CONTRADICTORY"), "got:\n{out}");
         assert!(out.contains("subst:"), "got:\n{out}");

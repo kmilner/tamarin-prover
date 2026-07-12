@@ -1682,7 +1682,7 @@ fn atom_decomposition_creates_action_goal_in_simplify() {
         tamarin_theory::guarded::Guarded::Atom(tamarin_theory::guarded::atom_to_gatom_free(&action_atom)),
     ]);
     let mut sys = System::empty();
-    sys.formulas.push(std::sync::Arc::new(g));
+    sys.formulas_mut().push(std::sync::Arc::new(g));
     let mut r = Reduction::new(&ctx, sys);
     simplify_system(&mut r);
     // Action atom should have produced a Goal::Action.
@@ -1804,7 +1804,7 @@ fn simplify_conj_wrapping_disj_produces_goal() {
     let a2 = tamarin_theory::guarded::Guarded::Atom(tamarin_theory::guarded::atom_to_gatom_free(&Atom::Last(mkvar("j"))));
     let disj = tamarin_theory::guarded::Guarded::Disj(vec![a1, a2]);
     let mut sys = System::empty();
-    sys.formulas.push(std::sync::Arc::new(tamarin_theory::guarded::Guarded::Conj(vec![disj])));
+    sys.formulas_mut().push(std::sync::Arc::new(tamarin_theory::guarded::Guarded::Conj(vec![disj])));
     let mut r = Reduction::new(&ctx, sys);
     simplify_system(&mut r);
     assert!(r.sys.goals.iter().any(|(g, _)|
@@ -1879,7 +1879,7 @@ fn proof_search_end_to_end_tiny_theory() {
     // Mark non-initial via a solved formula (Haskell's
     // `isInitialSystem` uses solved_formulas emptiness, not the
     // node/edge count).
-    sys.solved_formulas.push(std::sync::Arc::new(tamarin_theory::guarded::gtrue()));
+    sys.solved_formulas_mut().push(std::sync::Arc::new(tamarin_theory::guarded::gtrue()));
     sys.add_node(
         tamarin_term::lterm::LVar::new(
             "i", tamarin_term::lterm::LSort::Node, 0),

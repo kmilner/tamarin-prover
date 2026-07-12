@@ -1,6 +1,10 @@
 //! Walks `examples/`, parses each `.spthy` and runs elaboration. Reports
 //! how many files we can carry through parser → typed Theory.
 
+// Example/dev tool: reports elaboration results to stdout by design; allow the
+// `disallowed_macros` convention freeze for this example binary.
+#![allow(clippy::disallowed_macros)]
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;

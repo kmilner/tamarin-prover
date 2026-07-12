@@ -66,18 +66,28 @@ pub enum Quant { All, Ex }
 /// HS-faithful structural comparison for Guarded.  Mirrors HS's derived
 /// `Ord (Guarded s c v)` on `Theory.Constraint.System.Guarded.Guarded`.
 pub fn cmp_guarded(a: &Guarded, b: &Guarded) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
     let ta = guarded_tag(a);
     let tb = guarded_tag(b);
     if ta != tb { return ta.cmp(&tb); }
-    match (a, b) {
-        (Guarded::Atom(x), Guarded::Atom(y)) => cmp_atom(x, y),
-        (Guarded::Disj(xs), Guarded::Disj(ys)) => cmp_slice(xs, ys, cmp_guarded),
-        (Guarded::Conj(xs), Guarded::Conj(ys)) => cmp_slice(xs, ys, cmp_guarded),
-        (
-            Guarded::GGuarded { qua: q1, vars: v1, guards: g1, body: b1 },
-            Guarded::GGuarded { qua: q2, vars: v2, guards: g2, body: b2 },
-        ) => {
+    // Tag equality above guarantees same variant, so each `let … else` binding
+    // of `b` is infallible.  Match `a` exhaustively (no wildcard) so a new
+    // `Guarded` variant forces a comparison here.
+    match a {
+        Guarded::Atom(x) => {
+            let Guarded::Atom(y) = b else { unreachable!("guarded tag matched Atom") };
+            cmp_atom(x, y)
+        }
+        Guarded::Disj(xs) => {
+            let Guarded::Disj(ys) = b else { unreachable!("guarded tag matched Disj") };
+            cmp_slice(xs, ys, cmp_guarded)
+        }
+        Guarded::Conj(xs) => {
+            let Guarded::Conj(ys) = b else { unreachable!("guarded tag matched Conj") };
+            cmp_slice(xs, ys, cmp_guarded)
+        }
+        Guarded::GGuarded { qua: q1, vars: v1, guards: g1, body: b1 } => {
+            let Guarded::GGuarded { qua: q2, vars: v2, guards: g2, body: b2 } = b
+                else { unreachable!("guarded tag matched GGuarded") };
             cmp_quant(q1, q2)
                 // HS-faithful: in `LNGuarded = Guarded (String,LSort) Name
                 // LVar` (Guarded.hs:279,389), the `s` parameter — used
@@ -91,7 +101,6 @@ pub fn cmp_guarded(a: &Guarded, b: &Guarded) -> std::cmp::Ordering {
                 .then_with(|| cmp_slice(g1, g2, cmp_atom))
                 .then_with(|| cmp_guarded(b1, b2))
         }
-        _ => Ordering::Equal,
     }
 }
 
@@ -137,24 +146,42 @@ pub fn cmp_atom(a: &GAtom, b: &GAtom) -> std::cmp::Ordering {
     let ta = atom_tag(a);
     let tb = atom_tag(b);
     if ta != tb { return ta.cmp(&tb); }
-    match (a, b) {
+    // Tag equality above guarantees same variant, so each `let … else` binding
+    // of `b` is infallible.  Match `a` exhaustively (no wildcard) so a new
+    // `GAtom` variant forces a comparison here.
+    match a {
         // HS `data ProtoAtom s t = Action t (Fact t) | ...` derives Ord
         // (Atom.hs:78-84), so the derived comparison is the timepoint term
         // `t` FIRST, then the `Fact t`.  Rust's `GAtom::Action(GFact, GTerm)`
         // stores fact-then-term, so we must compare the timepoint first.
-        (GAtom::Action(f1, t1), GAtom::Action(f2, t2)) =>
-            cmp_term(t1, t2).then_with(|| cmp_fact(f1, f2)),
-        (GAtom::Eq(a1, b1), GAtom::Eq(a2, b2)) =>
-            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2)),
-        (GAtom::Subterm(a1, b1), GAtom::Subterm(a2, b2)) =>
-            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2)),
-        (GAtom::Less(a1, b1), GAtom::Less(a2, b2)) =>
-            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2)),
-        (GAtom::Last(t1), GAtom::Last(t2)) => cmp_term(t1, t2),
-        (GAtom::Pred(f1), GAtom::Pred(f2)) => cmp_fact(f1, f2),
-        (GAtom::LessMset(a1, b1), GAtom::LessMset(a2, b2)) =>
-            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2)),
-        _ => std::cmp::Ordering::Equal,
+        GAtom::Action(f1, t1) => {
+            let GAtom::Action(f2, t2) = b else { unreachable!("atom tag matched Action") };
+            cmp_term(t1, t2).then_with(|| cmp_fact(f1, f2))
+        }
+        GAtom::Eq(a1, b1) => {
+            let GAtom::Eq(a2, b2) = b else { unreachable!("atom tag matched Eq") };
+            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2))
+        }
+        GAtom::Subterm(a1, b1) => {
+            let GAtom::Subterm(a2, b2) = b else { unreachable!("atom tag matched Subterm") };
+            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2))
+        }
+        GAtom::Less(a1, b1) => {
+            let GAtom::Less(a2, b2) = b else { unreachable!("atom tag matched Less") };
+            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2))
+        }
+        GAtom::Last(t1) => {
+            let GAtom::Last(t2) = b else { unreachable!("atom tag matched Last") };
+            cmp_term(t1, t2)
+        }
+        GAtom::Pred(f1) => {
+            let GAtom::Pred(f2) = b else { unreachable!("atom tag matched Pred") };
+            cmp_fact(f1, f2)
+        }
+        GAtom::LessMset(a1, b1) => {
+            let GAtom::LessMset(a2, b2) = b else { unreachable!("atom tag matched LessMset") };
+            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2))
+        }
     }
 }
 

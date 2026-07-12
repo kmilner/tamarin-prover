@@ -684,6 +684,9 @@ fn never_contains_fresh_priv(t: &tamarin_term::lterm::LNTerm) -> bool {
 /// shouldn't be deconstructing it (KD chain) afterwards.  Hits an
 /// otherwise-undetected contradiction earlier than the search
 /// would, pruning a search branch.
+// equivalence-class value set; membership/union only, never iterated into output;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn has_forbidden_chain(
     sys: &System,
     ab_adj: &crate::constraint::system::PrebuiltAdj,

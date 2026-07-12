@@ -109,6 +109,10 @@ pub fn apply_abbreviations_fact(
     new_fa.terms = fa.terms.iter()
         .map(|t| apply_abbreviations_term(lookup, t))
         .collect();
+    // The `.terms` assignment changes frees (abbreviation vars replace
+    // subterms); refresh the cached bloom so no stale fingerprint escapes
+    // (display-only path, but keep the invariant honest).
+    new_fa.recompute_bloom();
     new_fa
 }
 

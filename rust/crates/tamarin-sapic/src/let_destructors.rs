@@ -371,7 +371,10 @@ fn subst_comb(
         // its image term.  (Quantifier-bound vars are left untouched, mirroring
         // HS, which only substitutes the process-level `let`-bound variable.)
         ProcessCombinator::Cond(f) => ProcessCombinator::Cond(subst_cond_formula(subst, &f)),
-        other => other,
+        // Parallel/Ndc carry no terms, so substitution is the identity.
+        // Enumerated (no wildcard) so a new term-carrying variant must decide
+        // its substitution here.
+        other @ (ProcessCombinator::Parallel | ProcessCombinator::Ndc) => other,
     }
 }
 

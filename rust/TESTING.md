@@ -149,8 +149,8 @@ scripts/diff_aes_calls.sh <file> <lemma>      # apply_eq_store call counts per s
 See `crates/tamarin-term/src/maude_proc.rs` for the env-gated trace points.
 
 **Diagnostic env flags** (all off by default; solving behavior is never
-env-configurable — these only dump). `TAM_HS_*` work on the instrumented
-Haskell build, the rest on the Rust binary:
+env-configurable — these only dump, count, or verify-and-panic). `TAM_HS_*`
+work on the instrumented Haskell build, the rest on the Rust binary:
 
 | Variable | Effect |
 |---|---|
@@ -161,6 +161,15 @@ Haskell build, the rest on the Rust binary:
 | `TAM_DBG_AES_VARIANTS=1` | apply_eq_store variant before→after counts |
 | `TAM_HS_TRACE_CHAINS=1` | HS-side solveChain enter/extend |
 | `TAM_RS_VERIFY_BOUNDS_CACHE=1` | panic if the bounds_max cache diverges from a full recompute |
+| `TAM_RS_VERIFY_SUBST_SKIP=1` | panic if a marker-skipped `subst_system` pass was not a bit-identical no-op |
+| `TAM_RS_VERIFY_FP=1` | panic if a bloom-skipped fact descent would actually have changed the fact |
+| `TAM_RS_SUBST_SKIP_STATS=1` | `subst_system` call/skip counters to stderr |
+| `TAM_RS_FP_STATS=1` | fact-descent bloom-skip counters to stderr |
+
+The three `TAM_RS_VERIFY_*` hooks certify the solver's internal caches and
+skip optimisations: exporting them during a full corpus-gate run re-executes
+every skipped computation and panics on any divergence, turning the byte
+gate into a self-check of the optimisation machinery as well.
 
 The list is not exhaustive — grep the sources for `TAM_DBG_` / `TAM_RS_` /
 `TAM_HS_` for the full set.

@@ -334,6 +334,9 @@ pub struct ProverSession {
     /// same key (every normal lemma shares the all-sources key), letting
     /// the expensive `saturate_sources_with_simp` pass run once per theory
     /// instead of once per lemma.  `Mutex` keeps the session `&self`.
+    // keyed source cache (Mutex); path->CachedSources
+    // lookup, never iterated; std kept (byte-inert) — order never reaches output.
+    #[allow(clippy::disallowed_types)]
     source_cache: std::sync::Mutex<
         std::collections::HashMap<Vec<String>, CachedSources>,
     >,
@@ -499,6 +502,9 @@ impl ProverSession {
     /// `cli_heuristic.raw` is `Some`, every lemma's goal ranking is the CLI
     /// heuristic (HS `selectHeuristic`: `apDefaultHeuristic <|> pcHeuristic`,
     /// Proof.hs).
+    // keyed source cache constructor; lookup-only map;
+    // std kept (byte-inert) — iteration order never reaches output.
+    #[allow(clippy::disallowed_types)]
     pub fn build_with_in_file_and_heuristic(
         parser_theory: &p::Theory,
         maude: tamarin_term::maude_proc::MaudeHandle,

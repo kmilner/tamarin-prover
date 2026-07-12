@@ -6,6 +6,10 @@
 //! Usage:  cargo run -p tamarin-parser --example wf_false_positives \
 //!           --release [-- <root>]
 
+// Example/dev tool: prints results to stdout by design; allow the
+// `disallowed_macros` convention freeze for this example binary.
+#![allow(clippy::disallowed_macros)]
+
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;

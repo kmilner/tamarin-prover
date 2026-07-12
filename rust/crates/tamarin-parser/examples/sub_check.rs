@@ -1,3 +1,7 @@
+// Example/dev tool: prints results to stdout by design; allow the
+// `disallowed_macros` convention freeze for this example binary.
+#![allow(clippy::disallowed_macros)]
+
 use tamarin_parser::{parse_theory, wf};
 
 fn main() {

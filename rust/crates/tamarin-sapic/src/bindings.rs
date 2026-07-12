@@ -39,7 +39,17 @@ pub fn bindings_act(a: &SapicAction<SapicLVar>) -> Vec<SapicLVar> {
             for f in prems { all.extend(frees_sapic_fact(f)); }
             nub_difference(all, match_vars)
         }
-        _ => Vec::new(),
+        // HS `bindingsAct _ = []` (Bindings.hs:26): every other action binds
+        // nothing.  Enumerated (no wildcard) so a new binding-carrying variant
+        // must decide its bound set here.
+        SapicAction::Rep
+        | SapicAction::ChOut { .. }
+        | SapicAction::Insert(..)
+        | SapicAction::Delete(..)
+        | SapicAction::Lock(..)
+        | SapicAction::Unlock(..)
+        | SapicAction::Event(..)
+        | SapicAction::ProcessCall(..) => Vec::new(),
     }
 }
 
@@ -52,7 +62,13 @@ pub fn bindings_comb(c: &ProcessCombinator<SapicLVar>) -> Vec<SapicLVar> {
         ProcessCombinator::Let { left, match_vars, .. } => {
             nub_difference(frees_sapic_term(left), match_vars)
         }
-        _ => Vec::new(),
+        // HS `bindingsComb _ = []` (Bindings.hs:33): no other combinator binds a
+        // variable.  Enumerated (no wildcard) so a new binding-carrying variant
+        // must decide its bound set here.
+        ProcessCombinator::Parallel
+        | ProcessCombinator::Ndc
+        | ProcessCombinator::Cond(_)
+        | ProcessCombinator::CondEq(..) => Vec::new(),
     }
 }
 

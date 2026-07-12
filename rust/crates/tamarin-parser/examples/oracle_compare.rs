@@ -5,6 +5,10 @@
 //! Usage:  cargo run -p tamarin-parser --example oracle_compare -- [<root>]
 //!         [--limit N] [--filter STR]
 
+// Example/dev tool: prints comparison results to stdout by design; allow the
+// `disallowed_macros` convention freeze for this example binary.
+#![allow(clippy::disallowed_macros)]
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;

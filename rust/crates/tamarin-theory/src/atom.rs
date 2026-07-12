@@ -86,11 +86,7 @@ mod tests {
     #[test]
     fn to_atom_strips_sugar() {
         let s: SyntacticAtom<LNTerm> = ProtoAtom::Syntactic(SyntacticSugar::Pred(
-            Fact {
-                tag: FactTag::Term,
-                annotations: Default::default(),
-                terms: vec![msg_var("x", 0)],
-            },
+            Fact::fresh(FactTag::Term, vec![msg_var("x", 0)]),
         ));
         let a = to_atom(s);
         assert!(matches!(a, ProtoAtom::Syntactic(Unit2)));

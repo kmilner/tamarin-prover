@@ -1104,7 +1104,7 @@ mod tests {
         // Mark non-initial via a solved formula (Haskell's
         // `isInitialSystem` uses solved_formulas emptiness, not the
         // node/edge count).
-        sys.solved_formulas.push(std::sync::Arc::new(crate::guarded::gtrue()));
+        sys.solved_formulas_mut().push(std::sync::Arc::new(crate::guarded::gtrue()));
         sys.add_node(tamarin_term::lterm::LVar::new(
             "i", tamarin_term::lterm::LSort::Node, 0), rule);
         let root = run_proof_search(&ctx, sys, 10);
@@ -1126,7 +1126,7 @@ mod tests {
         // also how Haskell signals contradictoryness — `openGoals`
         // filters `DisjG (Disj [])` and `FormulasFalse` fires from
         // `contradictions`.  We mirror exactly that here.
-        sys.formulas.push(std::sync::Arc::new(crate::guarded::gfalse()));
+        sys.formulas_mut().push(std::sync::Arc::new(crate::guarded::gfalse()));
         sys.add_goal(crate::constraint::constraints::Goal::Disj(
             crate::constraint::constraints::Disj::new(Vec::new()),
         ));
@@ -1174,8 +1174,8 @@ mod tests {
         ));
         // Two duplicate gtrue formulas — `dedupe_formulas_pass` must
         // drop one and `drop_trivially_true_formulas_pass` drops both.
-        sys.formulas.push(std::sync::Arc::new(crate::guarded::gtrue()));
-        sys.formulas.push(std::sync::Arc::new(crate::guarded::gtrue()));
+        sys.formulas_mut().push(std::sync::Arc::new(crate::guarded::gtrue()));
+        sys.formulas_mut().push(std::sync::Arc::new(crate::guarded::gtrue()));
         let root = run_proof_search(&ctx, sys, 5);
         assert_eq!(root.status, NodeStatus::Solved);
     }

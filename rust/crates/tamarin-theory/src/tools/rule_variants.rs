@@ -395,13 +395,11 @@ pub fn abstract_rule_and_variants(
         bindings: &mut std::collections::BTreeMap<LNTerm, LVar>,
         maude: &MaudeHandle,
     ) -> Fact<LNTerm> {
-        Fact {
-            tag: f.tag.clone(),
-            annotations: f.annotations.clone(),
-            terms: f.terms.iter()
-                .map(|t| abstr_term(t, irreducible, bindings, maude))
-                .collect(),
-        }
+        // Abstraction rewrite — frees change; recompute the bloom.
+        let terms: Vec<LNTerm> = f.terms.iter()
+            .map(|t| abstr_term(t, irreducible, bindings, maude))
+            .collect();
+        Fact::fresh_annotated(f.tag.clone(), f.annotations.clone(), terms)
     }
 
     // HS-faithful: import ALL leaf vars FIRST (RuleVariants.hs:95
@@ -829,6 +827,9 @@ pub fn rename_precise_rule_if_changed(rule: &ProtoRuleE) -> Option<ProtoRuleE> {
 /// Walks vars in the SAME order as `rename_precise_rule_with_variants` (the
 /// variant disjunction has no keys for the trivial-disjunction case, so it
 /// reduces to prems, concs, acts, new_vars).
+// var->var precise-rename map; keyed lookup only, never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn rule_renames_under_precise(rule: &ProtoRuleE) -> bool {
     use tamarin_term::lterm::HasFrees;
     use tamarin_utils::fresh::PreciseFreshState;
@@ -878,6 +879,9 @@ fn rule_renames_under_precise(rule: &ProtoRuleE) -> bool {
 /// HS leaves alone, diverging downstream variable idxs and AC-sorted
 /// variant order (symptom on JKL_TS1_2004: `Sessk_reveal_case_3` vs HS
 /// `Sessk_reveal_case_4`).
+// var->var precise-rename map; keyed lookup only, never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn rename_precise_rule_with_variants(
     rule: ProtoRuleE,
     substs: Vec<LNSubstVFresh>,
@@ -933,10 +937,10 @@ fn rename_precise_rule_with_variants(
         t.map_free(&mut |v| map_var(&v))
     };
     let map_facts = |fs: Vec<Fact<LNTerm>>| -> Vec<Fact<LNTerm>> {
-        fs.into_iter().map(|f| Fact {
-            tag: f.tag,
-            annotations: f.annotations,
-            terms: f.terms.into_iter().map(map_term).collect(),
+        fs.into_iter().map(|f| {
+            // Var rename — frees change; recompute the bloom.
+            let terms: Vec<LNTerm> = f.terms.into_iter().map(map_term).collect();
+            Fact::fresh_annotated(f.tag, f.annotations, terms)
         }).collect()
     };
 

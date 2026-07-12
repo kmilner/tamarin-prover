@@ -314,7 +314,7 @@ fn fan_out_on_pending_eq_arms(
     for arm_eq in pending {
         let mut arm_sys = arm0_sys.clone();
         arm_sys.invalidate_max_var_idx_cache();
-        arm_sys.eq_store = std::sync::Arc::new(arm_eq);
+        arm_sys.set_eq_store(std::sync::Arc::new(arm_eq));
         all_arm_systems.push(arm_sys);
     }
     let mut out: Vec<crate::constraint::system::System> = Vec::new();
@@ -349,7 +349,7 @@ fn install_pass_cases_arms(
     let mut it = arms.into_iter();
     if let Some(first) = it.next() {
         red.sys.invalidate_max_var_idx_cache();
-        red.sys.eq_store = std::sync::Arc::new(first);
+        red.sys.set_eq_store(std::sync::Arc::new(first));
     }
     for rest in it {
         red.pending_eq_arms.push(rest);
@@ -655,10 +655,10 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         // vacuous Simplify step downstream where Haskell goes straight to
         // Solve (injectivity_check class).
         red.sys.invalidate_max_var_idx_cache();
-        red.sys.formulas.retain(|f| **f != fm);
+        red.sys.formulas_mut().retain(|f| **f != fm);
         if !crate::guarded::stores_contains(&red.sys.solved_formulas, &fm) {
             red.sys.invalidate_max_var_idx_cache();
-            red.sys.solved_formulas.push(std::sync::Arc::new(fm));
+            red.sys.solved_formulas_mut().push(std::sync::Arc::new(fm));
         }
         // HS-faithful: `evalFormulaAtoms` (Simplify.hs) ALWAYS
         // calls `insertFormula fm'` regardless of whether `fm'` is gtrue,
@@ -1140,13 +1140,13 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     sys_actions.extend(node_actions);
     if sys_actions.is_empty() { return ChangeIndicator::Unchanged; }
 
-    // Group `sys_actions` indices by fact name, once per pass.  The Action-
-    // guard arm of `try_match_all_guards::rec` previously scanned EVERY
-    // sys_action per recursion step, paying a `fact_name` String allocation
-    // plus a compare for each — O(paths · |sys_actions|) allocations.  A
-    // name-keyed index narrows each arm to exactly the actions the old scan
-    // would have accepted, in the SAME order (indices ascend within a group,
-    // preserving the original scan order restricted to name-equal entries),
+    // Group `sys_actions` indices by fact name, once per pass.  Without the
+    // index, the Action-guard arm of `try_match_all_guards::rec` would scan
+    // EVERY sys_action per recursion step, paying a `fact_name` String
+    // allocation plus a compare for each — O(paths · |sys_actions|)
+    // allocations.  The name-keyed index narrows each arm to exactly the
+    // actions such a scan's name filter accepts, in the SAME order (indices
+    // ascend within a group, preserving scan order among name-equal entries),
     // so the sequence of match attempts — and hence every downstream match/
     // candidate — is unchanged.  The map is lookup-only (never iterated), so
     // its hash order is unobservable; it dies with the pass.
@@ -1388,10 +1388,10 @@ fn try_match_all_guards(
     use tamarin_parser::ast::Atom as AAtom;
 
     // The `(name, idx)` set of the universal's bound vars, hoisted out of the
-    // per-(guard, action) matching calls: `match_atom_via_maude` and the Eq
-    // arm previously rebuilt this same `BTreeSet` (String clones included) on
-    // every invocation, though it depends only on `vars` — invariant across
-    // the whole recursion.
+    // per-(guard, action) matching calls: it depends only on `vars` —
+    // invariant across the whole recursion — so `match_atom_via_maude` and
+    // the Eq arm take it as a parameter instead of each rebuilding it
+    // (String clones included) per invocation.
     let pattern_vars: std::collections::BTreeSet<(String, u64)> = vars.iter()
         .map(|v| (v.name.clone(), v.idx))
         .collect();
@@ -1521,17 +1521,15 @@ fn try_match_all_guards(
             // (hash inequality proves value inequality, so the accept/
             // reject decision is untouched).
             //
-            // The former raw structural disjunct (`f == &implied ||`) is
-            // dropped as subsumed: `implied_apply_canon_cow` is a pure
-            // function of the formula value, and every table entry is the
-            // canon of its source formula, so `f == implied` forces
-            // `canon(f) == canon(implied)` — the canon comparison already
-            // answers `true` for every structurally-equal pair, and the OR
-            // of both checks equals the canon check alone.
+            // No separate raw structural check (`f == &implied`) is needed:
+            // `implied_apply_canon_cow` is a pure function of the formula
+            // value, and every table entry is the canon of its source
+            // formula, so `f == implied` forces `canon(f) == canon(implied)`
+            // — the canon comparison already answers `true` for every
+            // structurally-equal pair.
             //
-            // Short-circuiting `||` (vs the former three eager `any` scans)
-            // is equally unobservable: the probes are pure and the combined
-            // boolean is identical.
+            // Short-circuiting `||` is unobservable: the probes are pure,
+            // so evaluation order cannot change the combined boolean.
             let canon_hash = tamarin_utils::fx_hash_one(canon.as_ref());
             let already = dedup_tables.formulas_canon().iter()
                     .any(|(fc, fh)| *fh == canon_hash && fc.as_ref() == canon.as_ref())
@@ -1564,9 +1562,9 @@ fn try_match_all_guards(
                 // `actions_by_name` index (substitution never rewrites a
                 // fact NAME, so the group key is exact).  The group holds
                 // ascending `sys_actions` indices — the identical sequence
-                // the old full scan visited after its name filter — so
-                // match attempts, and therefore candidates, are unchanged.
-                // A missing key means the old scan skipped every action.
+                // an unindexed scan's name filter would visit — so match
+                // attempts, and therefore candidates, are unchanged.  A
+                // missing key means no sys_action carries this name.
                 let name_group = actions_by_name.get(&g_fact_subst.name)
                     .map(|v| v.as_slice()).unwrap_or(&[]);
                 for &ai in name_group {
@@ -1657,8 +1655,8 @@ fn try_match_all_guards(
                 };
                 // Convert parser-AST terms to LNTerm and run structural
                 // match, with the recursion-invariant `pattern_vars` set
-                // hoisted to `try_match_all_guards` (same content as the
-                // former per-invocation build).
+                // hoisted to `try_match_all_guards` (it depends only on
+                // `vars`).
                 let Some(pat_lnt) = crate::elaborate::term_to_lnterm(&pat_term)
                     else { return };
                 let Some(subj_lnt) = crate::elaborate::term_to_lnterm(&subj_term)
@@ -2175,10 +2173,15 @@ fn normalise_less_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     // Skip the clone and the per-atom normalize loop; the dedup below still
     // runs unconditionally to stay byte-faithful.
     if !red.sys.eq_store.subst.is_empty() {
-        // `eq_store` and `less_atoms` are disjoint `System` fields, so a
+        // `eq_store` and `less_atoms` are disjoint `SystemContent` fields, so a
         // shared borrow of the subst coexists with the `less_atoms.iter_mut()`
-        // below — no per-pass BTreeMap+Term deep clone of the subst.
-        let subst = &red.sys.eq_store.subst;
+        // below — no per-pass BTreeMap+Term deep clone of the subst.  Bind ONE
+        // untracked content ref and read the subst THROUGH it (design Finding
+        // 1): a bare Deref read of the subst beside a `content_mut_untracked`
+        // borrow of `less_atoms` would collapse field-disjointness into a
+        // whole-System borrow and fail to compile.
+        let c = red.sys.content_mut_untracked();
+        let subst = &c.eq_store.subst;
         let normalize = |id: &crate::constraint::constraints::NodeId| -> crate::constraint::constraints::NodeId {
             let t = tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(id.clone()));
@@ -2189,7 +2192,7 @@ fn normalise_less_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
                 id.clone()
             }
         };
-        for la in red.sys.less_atoms.iter_mut() {
+        for la in c.less_atoms.iter_mut() {
             let new_smaller = normalize(&la.smaller);
             let new_larger = normalize(&la.larger);
             if new_smaller != la.smaller || new_larger != la.larger {
@@ -2199,6 +2202,14 @@ fn normalise_less_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
             }
         }
     }
+    // CONTENT-axis gap: the in-place less-atom endpoint rewrite above changes
+    // values without touching a cache-maintenance helper (the author proved
+    // the max-var idx cannot rise), so bump `content_stamp` here to break a
+    // stale skip marker.  (The dedup below invalidates the cache on a length
+    // change, which bumps too — this covers the value-only rewrite.)
+    if matches!(changed, ChangeIndicator::Changed) {
+        red.sys.bump_content_stamp();
+    }
     // HS-faithful dedup post-normalise: HS's `sLessAtoms` is a `Set`;
     // post-subst image collapsing two distinct atoms is auto-deduped.
     // See `subst_system_once` (reduction.rs:664+) for full rationale.
@@ -2207,15 +2218,15 @@ fn normalise_less_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         = Vec::with_capacity(pre_len);
     // First-occurrence-wins dedup: `LessAtom` Eq ignores the reason
     // (constraints.rs:88-92), so the identity key is the `(smaller,larger)`
-    // pair.  A `FastSet` membership probe reproduces the former
-    // `new_less.iter().any(|x| x == &la)` scan exactly — the atom is pushed
-    // iff its pair was unseen — turning the O(n²) dedup into O(n).  The set
+    // pair.  A `FastSet` membership probe: the atom is pushed iff its pair
+    // is unseen — the same relation a linear `any(|x| x == &la)` scan tests
+    // — turning the O(n²) dedup into O(n).  The set
     // never escapes (only membership is read), so its hash order is
     // irrelevant; only `new_less`'s Vec order is output-bearing.
     let mut seen: tamarin_utils::FastSet<
         (tamarin_term::lterm::LVar, tamarin_term::lterm::LVar)>
         = tamarin_utils::FastSet::default();
-    for la in std::mem::take(&mut red.sys.less_atoms) {
+    for la in std::mem::take(&mut red.sys.content_mut_untracked().less_atoms) {
         if seen.insert((la.smaller.clone(), la.larger.clone())) {
             new_less.push(la);
         }
@@ -2224,7 +2235,7 @@ fn normalise_less_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         changed = ChangeIndicator::Changed;
         red.sys.invalidate_max_var_idx_cache();
     }
-    red.sys.less_atoms = new_less;
+    red.sys.content_mut_untracked().less_atoms = new_less;
     if changed == ChangeIndicator::Changed { red.changed = ChangeIndicator::Changed; }
     changed
 }
@@ -3141,9 +3152,9 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
             if other_id == sup_id { continue; }
             // Loop-inversion membership test (see the `node_fresh_vars`
             // precompute above): true iff `fresh_var` occurs in one of this
-            // node's `rPrems ++ rActs` terms not below a reducible head — the
-            // exact any-term result of the former inner
-            // `elem_not_below_reducible` walk, now an O(1) hash lookup.
+            // node's `rPrems ++ rActs` terms not below a reducible head —
+            // the any-term result of `elem_not_below_reducible` over this
+            // node, precomputed so the probe here is an O(1) hash lookup.
             if !node_fresh_vars[idx].contains(fresh_var) { continue; }
             match crate::rule::unifiable_rule_ac_insts(&maude, sup_rule, other_rule) {
                 Ok(true) => continue,
@@ -3491,7 +3502,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
             .map(|c| (c.small.clone(), c.big.clone()))
             .collect();
     let neg_subterms: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> =
-        red.sys.subterm_store.neg_subterms.clone();
+        red.sys.subterm_store.neg_subterms.to_vec();
     // Mirror of HS `isTrueFalse reducible (Just sst) (small, big)`
     // (SubtermStore.hs:334-371) — the cheap structural classification
     // used by `triviallySmaller` / `triviallyNotSmaller` inside
@@ -3779,7 +3790,7 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     if to_decompose.is_empty() { return ChangeIndicator::Unchanged; }
     // Remove them, then re-insert via the decomposition logic.
     red.sys.invalidate_max_var_idx_cache();
-    red.sys.formulas.retain(|f| !reducible_formula(f));
+    red.sys.formulas_mut().retain(|f| !reducible_formula(f));
     for f in to_decompose {
         red.insert_formula(f);
     }
@@ -3812,10 +3823,10 @@ fn drop_trivially_true_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     let gt = crate::guarded::gtrue();
     let had_gtrue = crate::guarded::stores_contains(&red.sys.formulas, &gt);
     red.sys.invalidate_max_var_idx_cache();
-    red.sys.formulas.retain(|f| **f != gt);
+    red.sys.formulas_mut().retain(|f| **f != gt);
     if had_gtrue && !crate::guarded::stores_contains(&red.sys.solved_formulas, &gt) {
         red.sys.invalidate_max_var_idx_cache();
-        red.sys.solved_formulas.push(std::sync::Arc::new(gt));
+        red.sys.solved_formulas_mut().push(std::sync::Arc::new(gt));
     }
     if red.sys.formulas.len() != before {
         red.changed = ChangeIndicator::Changed;
@@ -3840,15 +3851,21 @@ fn dedupe_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     let before = red.sys.formulas.len();
     let mut seen: Vec<std::sync::Arc<Guarded>> = Vec::new();
     let mut seen_canon: Vec<Guarded> = Vec::new();
-    for f in red.sys.formulas.drain(..) {
-        let canon = normalize_sort_hints(&f);
+    // Read via `iter()` (Deref, no mut borrow) so the common no-op path (no
+    // duplicates) takes ZERO mutable borrow and ZERO stamp bump — this pass
+    // runs every simplify fixpoint iteration, including the final no-op one
+    // that follows the `subst_system` marker-set, and an unconditional bump
+    // here would staleify that marker and collapse the skip (design Finding 2).
+    for f in red.sys.formulas.iter() {
+        let canon = normalize_sort_hints(f);
         if !seen_canon.contains(&canon) {
             seen_canon.push(canon);
-            seen.push(f);
+            seen.push(f.clone());
         }
     }
-    red.sys.formulas = seen;
-    if red.sys.formulas.len() != before {
+    if seen.len() != before {
+        // A real drop: `formulas_mut()` bumps `content_stamp` on handout.
+        *red.sys.formulas_mut() = seen;
         red.changed = ChangeIndicator::Changed;
         ChangeIndicator::Changed
     } else {
@@ -4198,7 +4215,10 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     // -------------------------------------------------------------
     {
         type Pair = (tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm);
-        let original_negs: Vec<Pair> = red.sys.subterm_store.neg_subterms.clone();
+        // A sorted clone of the current negSubterms set (HS `oldNegSubterms :=
+        // original negSubterms`); feeds both the changed-set filter below and
+        // the writeback at the end.
+        let original_negs = red.sys.subterm_store.neg_subterms.clone();
         let changed_negs: Vec<Pair> = original_negs.iter()
             .filter(|p| red.sys.subterm_store.old_neg_subterms.binary_search(p).is_err())
             .cloned().collect();
@@ -4282,7 +4302,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         for p in &already_false {
             if let Ok(pos) = red.sys.subterm_store.neg_subterms.binary_search(p) {
                 red.sys.invalidate_max_var_idx_cache();
-                red.sys.subterm_store_mut().neg_subterms.remove(pos);
+                red.sys.subterm_store_mut().neg_subterms.remove_at(pos);
                 changed = ChangeIndicator::Changed;
             }
         }
@@ -4398,7 +4418,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     // -------------------------------------------------------------
     {
         let negs: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> =
-            red.sys.subterm_store.neg_subterms.clone();
+            red.sys.subterm_store.neg_subterms.to_vec();
         let pos: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> =
             red.sys.subterm_store.subterms.iter()
                 .chain(red.sys.subterm_store.solved_subterms.iter())
@@ -4532,7 +4552,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         let f = crate::guarded::normalise_stored_formula_owned(f);
         if !crate::guarded::stores_contains(&red.sys.formulas, &f) && !crate::guarded::stores_contains(&red.sys.solved_formulas, &f) {
             red.sys.invalidate_max_var_idx_cache();
-            red.sys.formulas.push(std::sync::Arc::new(f));
+            red.sys.formulas_mut().push(std::sync::Arc::new(f));
             red.changed = ChangeIndicator::Changed;
             changed = ChangeIndicator::Changed;
         }
@@ -5060,7 +5080,7 @@ mod tests {
             mkvar_idx("j", 0),
         )));
         sys.invalidate_max_var_idx_cache();
-        sys.formulas.push(std::sync::Arc::new(crate::guarded::Guarded::Conj(vec![a1.clone(), a2.clone()])));
+        sys.formulas_mut().push(std::sync::Arc::new(crate::guarded::Guarded::Conj(vec![a1.clone(), a2.clone()])));
         let mut r = Reduction::new(&ctx, sys);
         simplify_system(&mut r);
         // The Conj should have been removed from the open formula set.
@@ -5102,7 +5122,7 @@ mod tests {
         // the Disj inside.
         let disj = crate::guarded::Guarded::Disj(vec![a1, a2]);
         sys.invalidate_max_var_idx_cache();
-        sys.formulas.push(std::sync::Arc::new(crate::guarded::Guarded::Conj(vec![disj])));
+        sys.formulas_mut().push(std::sync::Arc::new(crate::guarded::Guarded::Conj(vec![disj])));
         let mut r = Reduction::new(&ctx, sys);
         simplify_system(&mut r);
         // After decomposition, a Goal::Disj should exist.
@@ -5151,7 +5171,7 @@ mod tests {
         let n = mkvar_l("n", 0);
         let m = mkvar_l("m", 0);
         sys.invalidate_max_var_idx_cache();
-        sys.less_atoms.push(crate::constraint::constraints::LessAtom::new(
+        sys.content_mut().less_atoms.push(crate::constraint::constraints::LessAtom::new(
             n.clone(), m,
             crate::constraint::constraints::Reason::Formula,
         ));

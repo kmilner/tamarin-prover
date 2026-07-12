@@ -1350,7 +1350,7 @@ mod tests {
         let ctx = ProofContext::new(h, Vec::new());
         let mut sys = System::empty();
         // Force out of initial state so is_finished can run.
-        sys.solved_formulas.push(std::sync::Arc::new(crate::guarded::gtrue()));
+        sys.solved_formulas_mut().push(std::sync::Arc::new(crate::guarded::gtrue()));
         let skel = ParsedProofTree {
             method: ParsedMethod::Contradiction,
             cases: Vec::new(),

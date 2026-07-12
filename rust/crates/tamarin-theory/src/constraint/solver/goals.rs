@@ -298,7 +298,6 @@ pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
 /// (e.g. `solveUniqueActions`, `solveAllSafeGoals`) silently picks
 /// goals in a different order and the proof shape diverges.
 pub(crate) fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
     let tag = |g: &Goal| -> u8 {
         match g {
             Goal::Action(_, _)  => 0,
@@ -312,16 +311,31 @@ pub(crate) fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
     let ta = tag(a);
     let tb = tag(b);
     if ta != tb { return ta.cmp(&tb); }
-    match (a, b) {
-        (Goal::Action(la, fa), Goal::Action(lb, fb)) =>
-            la.cmp(lb).then_with(|| fa.cmp(fb)),
-        (Goal::Chain(ca, pa), Goal::Chain(cb, pb)) =>
+    // Tag equality above guarantees `a` and `b` are the same variant, so each
+    // `let … else` binding of `b` is infallible.  Match `a` exhaustively (no
+    // wildcard) so a new `Goal` variant fails to compile here until its payload
+    // comparison is written.
+    match a {
+        Goal::Action(la, fa) => {
+            let Goal::Action(lb, fb) = b else { unreachable!("goal tag matched Action") };
+            la.cmp(lb).then_with(|| fa.cmp(fb))
+        }
+        Goal::Chain(ca, pa) => {
+            let Goal::Chain(cb, pb) = b else { unreachable!("goal tag matched Chain") };
             (&ca.0, ca.1.0).cmp(&(&cb.0, cb.1.0))
-                .then_with(|| (&pa.0, pa.1.0).cmp(&(&pb.0, pb.1.0))),
-        (Goal::Premise(pa, fa), Goal::Premise(pb, fb)) =>
+                .then_with(|| (&pa.0, pa.1.0).cmp(&(&pb.0, pb.1.0)))
+        }
+        Goal::Premise(pa, fa) => {
+            let Goal::Premise(pb, fb) = b else { unreachable!("goal tag matched Premise") };
             (&pa.0, pa.1.0).cmp(&(&pb.0, pb.1.0))
-                .then_with(|| fa.cmp(fb)),
-        (Goal::Disj(da), Goal::Disj(db)) => {
+                .then_with(|| fa.cmp(fb))
+        }
+        Goal::Split(sa) => {
+            let Goal::Split(sb) = b else { unreachable!("goal tag matched Split") };
+            sa.cmp(sb)
+        }
+        Goal::Disj(da) => {
+            let Goal::Disj(db) = b else { unreachable!("goal tag matched Disj") };
             // HS `Disj a = Disj [a]` derives `Ord` as the newtype over the
             // list, i.e. plain list Ord (element-by-element, shorter < longer),
             // bottoming out at the structural `Ord LNGuarded`.  Use the
@@ -333,10 +347,10 @@ pub(crate) fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
             // decimal idx width, and Action timepoint-vs-fact order.
             crate::guarded::cmp_slice(&da.0, &db.0, crate::guarded::cmp_guarded)
         }
-        (Goal::Subterm((sa, ta_)), Goal::Subterm((sb, tb_))) =>
-            sa.cmp(sb).then_with(|| ta_.cmp(tb_)),
-        (Goal::Split(sa), Goal::Split(sb)) => sa.cmp(sb),
-        _ => Ordering::Equal,
+        Goal::Subterm((sa, ta_)) => {
+            let Goal::Subterm((sb, tb_)) = b else { unreachable!("goal tag matched Subterm") };
+            sa.cmp(sb).then_with(|| ta_.cmp(tb_))
+        }
     }
 }
 
@@ -1053,6 +1067,9 @@ fn pcre_to_fancy(pattern: &str) -> std::borrow::Cow<'_, str> {
 
 /// Compile + cache a PCRE pattern (`fancy-regex`).  Shared by the
 /// boolean-match and all-matches helpers.
+// static compiled-regex memo cache; keyed lookup only, never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn compile_regex(pattern: &str) -> Option<std::sync::Arc<fancy_regex::Regex>> {
     use std::collections::HashMap;
     use std::sync::Mutex;

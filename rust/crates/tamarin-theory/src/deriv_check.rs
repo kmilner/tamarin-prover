@@ -339,6 +339,9 @@ fn nat_to_fresh_var(v: &p::VarSpec) -> p::VarSpec {
 /// (name, sort, idx)) becomes its `dvar<k>` probe var; any other var is
 /// retyped nat→fresh (HS `natToFreshVars`).  Keeps `Out(...)` referencing the
 /// same probe vars as the `Fr(...)` premises.
+// (name,sort,idx)->probe-var rename map; keyed lookup only;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn rename_term_to_probe(
     t: &p::Term,
     map: &std::collections::HashMap<(String, u8, u64), p::VarSpec>,
@@ -402,6 +405,9 @@ fn collect_term_vars(t: &p::Term, out: &mut Vec<p::VarSpec>) {
 /// ...one per free var...  (two distinct timepoints; the knowledge
 /// predicate is `KU`, not `K` — consistent with the module header
 /// and the inline comment in the body.)
+// (name,sort,idx)->probe-var rename map; keyed lookup only;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn synthesise_probe_theory(
     src: &p::Theory,
     rule: &p::Rule,

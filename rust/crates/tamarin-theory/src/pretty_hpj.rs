@@ -107,6 +107,7 @@ fn html_entity_col_width(s: &str) -> usize {
 /// RAII guard enabling HTML-entity fill-width accounting on the current thread
 /// until dropped (see [`HTML_ENTITY_WIDTH`]).  Restores the previous value on
 /// drop, so nested/re-entrant use is safe.
+#[must_use = "dropping this guard immediately ends the scope it protects"]
 pub struct HtmlEntityWidthGuard(bool);
 
 impl HtmlEntityWidthGuard {
@@ -147,6 +148,7 @@ thread_local! {
 
 /// RAII guard enabling the full HtmlDoc render mode on the current thread until
 /// dropped (see [`HTML_MODE`]).  Restores the previous value on drop.
+#[must_use = "dropping this guard immediately ends the scope it protects"]
 pub struct HtmlDocGuard(bool);
 
 impl HtmlDocGuard {

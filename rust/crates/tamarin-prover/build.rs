@@ -4,6 +4,11 @@
 //! `$(gitHash)`/`$(gitDirty)`/`$(gitBranch)` splices from `Development.GitRev`
 //! plus `runIO Data.Time.getCurrentTime`.
 
+// Build script: `println!` is the sanctioned Cargo build-directive channel
+// (`cargo:rustc-env=…`, `cargo:rerun-if-changed=…`) — it never touches the
+// prover's runtime stdout.  Allow the `disallowed_macros` freeze here.
+#![allow(clippy::disallowed_macros)]
+
 use std::process::Command;
 
 fn main() {

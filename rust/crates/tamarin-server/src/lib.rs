@@ -42,6 +42,13 @@
 //!   - diff theories (`/thy/equiv/...`)
 //!   - lemma editing (`edit`)
 
+// Sanctioned stdout path: the interactive server prints its "server ready at
+// …" / "shutting down…" startup+lifecycle messages to stdout by design
+// (mirroring HS's `Interactive.hs` ready message).  These are not the batch
+// `--prove` byte-parity surface, so `println!` is the intended mechanism and
+// the `disallowed_macros` freeze is allowed for this file.
+#![allow(clippy::disallowed_macros)]
+
 pub mod graph;
 pub mod handlers;
 pub mod routes;

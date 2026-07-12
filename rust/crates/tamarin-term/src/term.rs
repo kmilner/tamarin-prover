@@ -59,12 +59,20 @@ pub enum Term<A> {
 impl<A: PartialEq> PartialEq for Term<A> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Term::Lit(a), Term::Lit(b)) => a == b,
-            (Term::App(s1, a1), Term::App(s2, a2)) => {
-                s1 == s2 && (Arc::ptr_eq(a1, a2) || a1[..] == a2[..])
+        // Match `self` exhaustively (no wildcard) so a new `Term` variant forces
+        // an equality decision here; the inner `if let … else false` makes a
+        // `Lit`/`App` cross pair unequal.
+        match self {
+            Term::Lit(a) => {
+                if let Term::Lit(b) = other { a == b } else { false }
             }
-            _ => false,
+            Term::App(s1, a1) => {
+                if let Term::App(s2, a2) = other {
+                    s1 == s2 && (Arc::ptr_eq(a1, a2) || a1[..] == a2[..])
+                } else {
+                    false
+                }
+            }
         }
     }
 }

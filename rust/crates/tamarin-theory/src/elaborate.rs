@@ -603,6 +603,7 @@ fn user_fun_constructability(name: &str) -> Constructability {
 
 /// Bundles RAII guards for all the user-declared function thread-locals,
 /// scoped to the lifetime of an outer call (typically `prove_lemma`).
+#[must_use = "dropping this guard immediately ends the scope it protects"]
 pub struct UserFunsForTheoryGuard {
     _unary: UserUnaryFunsGuard,
     _nullary: UserNullaryFunsGuard,
@@ -1530,6 +1531,9 @@ pub fn canonicalize_ac_in_formula(f: &p::Formula) -> p::Formula {
 /// Names of arity-1 NoEq function symbols in the (closed-theory) signature.
 /// Mirrors HS `lookupArity` reading the parser-state signature for
 /// `naryOpApp`'s `k == 1` tuple-folding (Theory/Text/Parser/Term.hs:58-93).
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 pub fn arity1_noeq_names(sig: &tamarin_term::maude_sig::MaudeSig)
     -> std::collections::HashSet<String>
 {
@@ -1558,6 +1562,9 @@ pub fn arity1_noeq_names(sig: &tamarin_term::maude_sig::MaudeSig)
 /// `h(<a,b>)` formula-rendering divergence AND the spurious "reducible
 /// function symbols are disallowed" wf warning (a unary `h` applied with
 /// surplus args looks to the wf check like an unknown reducible `h/n`).
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 pub fn rewrite_arity1_term(
     t: &p::Term,
     arity1: &std::collections::HashSet<String>,
@@ -1595,6 +1602,9 @@ pub fn rewrite_arity1_term(
 }
 
 /// Apply [`rewrite_arity1_term`] to every term in a parser-AST fact.
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 pub fn rewrite_arity1_fact(
     fa: &p::Fact,
     arity1: &std::collections::HashSet<String>,
@@ -1603,6 +1613,9 @@ pub fn rewrite_arity1_fact(
 }
 
 /// Apply [`rewrite_arity1_term`] to every term in a parser-AST atom.
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 pub fn rewrite_arity1_atom(
     a: &p::Atom,
     arity1: &std::collections::HashSet<String>,
@@ -1612,6 +1625,9 @@ pub fn rewrite_arity1_atom(
 
 /// Apply [`rewrite_arity1_term`] to every term in a parser-AST formula.
 /// See [`rewrite_arity1_term`] for the HS-faithfulness rationale.
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 pub fn rewrite_arity1_formula(
     f: &p::Formula,
     arity1: &std::collections::HashSet<String>,

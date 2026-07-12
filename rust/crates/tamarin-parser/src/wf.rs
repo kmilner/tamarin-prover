@@ -563,17 +563,38 @@ fn cmp_wf_term(a: &Term, b: &Term) -> std::cmp::Ordering {
     if ca != cb { return ca.cmp(&cb); }
     if sa != sb { return sa.cmp(&sb); }
     use Term::*;
-    match (a, b) {
-        (Var(v1), Var(v2)) => {
+    // `class` maps every variant to a unique `(class, subclass)`, so the two
+    // early returns above guarantee `a` and `b` are the same variant and each
+    // `let … else` binding of `b` is infallible.  Match `a` exhaustively (no
+    // wildcard) so a new `Term` variant forces an ordering decision here.  The
+    // nullary FAPP builtins carry no payload, so same-variant pairs are `Equal`.
+    match a {
+        Var(v1) => {
+            let Var(v2) = b else { unreachable!("term class matched Var") };
             // HS Ord LVar = (idx, sort, name) (LTerm.hs:521-523).
             v1.idx.cmp(&v2.idx)
                 .then_with(|| sort_tag(&v1.sort).cmp(&sort_tag(&v2.sort)))
                 .then_with(|| v1.name.cmp(&v2.name))
         }
-        (PubLit(s1), PubLit(s2)) => s1.cmp(s2),
-        (FreshLit(s1), FreshLit(s2)) => s1.cmp(s2),
-        (NatLit(s1), NatLit(s2)) => s1.cmp(s2),
-        (Number(n1), Number(n2)) => n1.cmp(n2),
+        PubLit(s1) => {
+            let PubLit(s2) = b else { unreachable!("term class matched PubLit") };
+            s1.cmp(s2)
+        }
+        FreshLit(s1) => {
+            let FreshLit(s2) = b else { unreachable!("term class matched FreshLit") };
+            s1.cmp(s2)
+        }
+        NatLit(s1) => {
+            let NatLit(s2) = b else { unreachable!("term class matched NatLit") };
+            s1.cmp(s2)
+        }
+        Number(n1) => {
+            let Number(n2) = b else { unreachable!("term class matched Number") };
+            n1.cmp(n2)
+        }
+        NumberOne => std::cmp::Ordering::Equal,
+        NatOne => std::cmp::Ordering::Equal,
+        DhNeutral => std::cmp::Ordering::Equal,
         // HS derived `Ord (Term a)` for two FAPP terms compares the FunSym
         // first (for NoEq this is the function-name ByteString,
         // FunctionSymbols.hs:106,113-117) and then the operand list
@@ -582,21 +603,34 @@ fn cmp_wf_term(a: &Term, b: &Term) -> std::cmp::Ordering {
         // separated by `class`) compare their operands element-wise.  This
         // gives a total order on the AC operand lists that arise, rather than
         // tying distinct complex operands as Equal.
-        (App(n1, a1), App(n2, a2)) =>
-            n1.cmp(n2).then_with(|| cmp_term_slices(a1, a2)),
-        (AlgApp(n1, l1, r1), AlgApp(n2, l2, r2)) =>
+        App(n1, a1) => {
+            let App(n2, a2) = b else { unreachable!("term class matched App") };
+            n1.cmp(n2).then_with(|| cmp_term_slices(a1, a2))
+        }
+        AlgApp(n1, l1, r1) => {
+            let AlgApp(n2, l2, r2) = b else { unreachable!("term class matched AlgApp") };
             n1.cmp(n2)
                 .then_with(|| cmp_wf_term(l1, l2))
-                .then_with(|| cmp_wf_term(r1, r2)),
-        (Pair(a1), Pair(a2)) => cmp_term_slices(a1, a2),
-        (Diff(l1, r1), Diff(l2, r2)) =>
-            cmp_wf_term(l1, l2).then_with(|| cmp_wf_term(r1, r2)),
-        (BinOp(o1, l1, r1), BinOp(o2, l2, r2)) =>
+                .then_with(|| cmp_wf_term(r1, r2))
+        }
+        Pair(a1) => {
+            let Pair(a2) = b else { unreachable!("term class matched Pair") };
+            cmp_term_slices(a1, a2)
+        }
+        Diff(l1, r1) => {
+            let Diff(l2, r2) = b else { unreachable!("term class matched Diff") };
+            cmp_wf_term(l1, l2).then_with(|| cmp_wf_term(r1, r2))
+        }
+        BinOp(o1, l1, r1) => {
+            let BinOp(o2, l2, r2) = b else { unreachable!("term class matched BinOp") };
             (*o1 as u8).cmp(&(*o2 as u8))
                 .then_with(|| cmp_wf_term(l1, l2))
-                .then_with(|| cmp_wf_term(r1, r2)),
-        (PatMatch(i1), PatMatch(i2)) => cmp_wf_term(i1, i2),
-        _ => std::cmp::Ordering::Equal,
+                .then_with(|| cmp_wf_term(r1, r2))
+        }
+        PatMatch(i1) => {
+            let PatMatch(i2) = b else { unreachable!("term class matched PatMatch") };
+            cmp_wf_term(i1, i2)
+        }
     }
 }
 

@@ -1,5 +1,12 @@
 //! Port of `GraphOptions` from `Graph.hs`.
 
+// this module's `HashMap<String, String>` values are
+// query-parameter maps (from the request query string / axum's `Query`
+// extractor), consumed by keyed lookup (`.get`) only — never iterated into
+// output.  They are also off the batch `--prove` byte-parity surface (server
+// UI only).  std kept: axum's `Query<HashMap<..>>` requires the std type.
+#![allow(clippy::disallowed_types)]
+
 use std::collections::HashMap;
 
 use super::simplify::SimplificationLevel;

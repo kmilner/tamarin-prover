@@ -119,8 +119,8 @@ fn grafted_edge_eqs(
 /// rewinds past the step's transient draws).  Callers pass the forking
 /// Reduction's `maude.fresh_counter_peek()`.  `new_inheriting` maxes
 /// with `avoid_fresh_state` and the REFINE_FLOOR, so a floored refine
-/// caller keeps its `avoid th` seed and `inherit_next = 0` degrades to
-/// the old detached behaviour.
+/// caller keeps its `avoid th` seed, and `inherit_next = 0` means no
+/// inheritance — the fork starts detached from the caller's counter.
 fn fork_arm_reduction<'c>(
     ctx: &'c crate::constraint::solver::context::ProofContext,
     template: &System,
@@ -130,7 +130,7 @@ fn fork_arm_reduction<'c>(
     use crate::constraint::solver::reduction::Reduction;
     let mut arm_sys = template.clone();
     arm_sys.invalidate_max_var_idx_cache();
-    arm_sys.eq_store = std::sync::Arc::new(arm_eq);
+    arm_sys.set_eq_store(std::sync::Arc::new(arm_eq));
     Reduction::new_inheriting(ctx, arm_sys, inherit_next)
 }
 
@@ -160,16 +160,42 @@ pub fn in_precompute_mode() -> bool {
     IN_PRECOMPUTE.with(|c| c.get())
 }
 
-fn set_precompute_mode(v: bool) {
-    IN_PRECOMPUTE.with(|c| c.set(v));
-}
-
 pub fn in_initial_source_cases() -> bool {
     IN_INITIAL_SOURCE_CASES.with(|c| c.get())
 }
 
-fn set_initial_source_cases(v: bool) {
-    IN_INITIAL_SOURCE_CASES.with(|c| c.set(v));
+/// RAII guard: saves `IN_PRECOMPUTE` on entry, sets it true, and restores the
+/// saved value on drop — early `return`s, `?`, and unwind alike.  `IN_PRECOMPUTE`
+/// has no free setter, so flipping it requires holding this guard; a caught
+/// panic above (`catch_unwind` in the oracle/deriv-check solvers) therefore
+/// cannot leave the flag stuck true on a reused rayon worker.
+#[must_use = "dropping this guard immediately ends the scope it protects"]
+struct PrecomputeModeGuard(bool);
+impl PrecomputeModeGuard {
+    fn enter() -> Self {
+        PrecomputeModeGuard(IN_PRECOMPUTE.with(|c| c.replace(true)))
+    }
+}
+impl Drop for PrecomputeModeGuard {
+    fn drop(&mut self) {
+        IN_PRECOMPUTE.with(|c| c.set(self.0));
+    }
+}
+
+/// RAII guard for `IN_INITIAL_SOURCE_CASES`, mirroring [`PrecomputeModeGuard`]:
+/// saves the flag on entry, sets it true, and restores the saved value on drop.
+/// The flag has no free setter, so it can only be flipped through this guard.
+#[must_use = "dropping this guard immediately ends the scope it protects"]
+struct InitialSourceCasesGuard(bool);
+impl InitialSourceCasesGuard {
+    fn enter() -> Self {
+        InitialSourceCasesGuard(IN_INITIAL_SOURCE_CASES.with(|c| c.replace(true)))
+    }
+}
+impl Drop for InitialSourceCasesGuard {
+    fn drop(&mut self) {
+        IN_INITIAL_SOURCE_CASES.with(|c| c.set(self.0));
+    }
 }
 
 /// Solver-tuning parameters mirroring Haskell's `IntegerParameters`.
@@ -268,10 +294,14 @@ impl Clone for Source {
 
 impl PartialEq for Source {
     fn eq(&self, other: &Self) -> bool {
-        let a = self.cases_cell.lock().unwrap().clone();
-        let b = other.cases_cell.lock().unwrap().clone();
-        self.goal == other.goal
-            && self.incomplete == other.incomplete
+        // Destructure without `..` so a new `Source` field forces an equality
+        // decision here; all three fields participate.
+        let Source { goal, cases_cell, incomplete } = self;
+        let Source { goal: other_goal, cases_cell: other_cases_cell, incomplete: other_incomplete } = other;
+        let a = cases_cell.lock().unwrap().clone();
+        let b = other_cases_cell.lock().unwrap().clone();
+        goal == other_goal
+            && incomplete == other_incomplete
             && a == b
     }
 }
@@ -430,13 +460,11 @@ fn initial_source_cases(
 ) -> Vec<(String, System)> {
     // HS-faithful: `initialSource` calls `solveGoal` from Goals.hs
     // directly (NOT via `solveWithSource`), so initial case computation
-    // never short-circuits through source-case dispatch.  Set the flag
-    // so `solve_premise_goal`'s dispatch skips during this call.
-    let prev_initial = in_initial_source_cases();
-    set_initial_source_cases(true);
-    let result = initial_source_cases_impl(goal, ctx);
-    set_initial_source_cases(prev_initial);
-    result
+    // never short-circuits through source-case dispatch.  The guard sets the
+    // flag so `solve_premise_goal`'s dispatch skips during this call, and
+    // restores the saved value when it drops at return.
+    let _initial_guard = InitialSourceCasesGuard::enter();
+    initial_source_cases_impl(goal, ctx)
 }
 
 fn initial_source_cases_impl(
@@ -644,7 +672,10 @@ pub fn precompute_full_sources(
     // concern: it iterates `cases` and would defeat the laziness if
     // run here.  This precompute function does not run it; `context.rs`
     // invokes `saturate_sources_with_simp_public` separately.
-    set_precompute_mode(true);
+    //
+    // The guard drops at function return, restoring the saved `IN_PRECOMPUTE`
+    // value; nothing between the final `out` build and the return reads the flag.
+    let _precompute_guard = PrecomputeModeGuard::enter();
     let mut out: Vec<Source> = Vec::new();
     // -----------------------------------------------------------------
     // protoGoals — PremiseG for each proto-fact tag seen in the rules.
@@ -793,7 +824,6 @@ pub fn precompute_full_sources(
         out.push(Source::lazy(goal));
     }
 
-    set_precompute_mode(false);
     out
 }
 
@@ -1000,6 +1030,7 @@ fn source_bounds(
 /// fs`); [`RefineFsScope::floor`] pushes a raw floor and is used by the
 /// disj-loop in `run_solve_all_safe_goals_disj_with_progress` (floor
 /// `source_avoid`).
+#[must_use = "dropping this guard immediately ends the scope it protects"]
 struct RefineFsScope(u64);
 impl RefineFsScope {
     /// Push a raw refine-floor, saving the previous one for restore.
@@ -1145,7 +1176,7 @@ pub fn refine_with_source_asms(
         for (name, mut sys) in src.cases_take() {
             for a in assumptions {
                 if !crate::guarded::stores_contains(&sys.formulas, a) && !crate::guarded::stores_contains(&sys.solved_formulas, a) {
-                    sys.formulas.push(std::sync::Arc::new(a.clone()));
+                    sys.formulas_mut().push(std::sync::Arc::new(a.clone()));
                 }
             }
             // Mirror Haskell `set sSourceKind RefinedSource`.
@@ -1184,8 +1215,8 @@ pub fn refine_with_source_asms(
     for src in saturated {
         let mut new_cases: Vec<(String, System)> = Vec::new();
         for (name, mut sys) in src.cases_take().into_iter() {
-            sys.formulas.clear();
-            sys.solved_formulas.clear();
+            sys.formulas_mut().clear();
+            sys.solved_formulas_mut().clear();
             sys.invalidate_max_var_idx_cache();
             sys.goals_mut().retain(|(g, _)|
                 !matches!(g, crate::constraint::constraints::Goal::Disj(_)));
@@ -1234,8 +1265,8 @@ pub fn saturate_sources_with_simp_public(
 /// `next`, `changed`, or `current` from the outer loop.  Reads `ctx`
 /// (shared, immutable), `ths_snapshot` (shared, immutable), and other
 /// scalar params.  Maude IPC inside is serialised via the handle's
-/// Mutex; `set_precompute_mode` is `thread_local!` so the per-worker
-/// flag toggle is independent.
+/// Mutex; `PrecomputeModeGuard` toggles the `thread_local!` `IN_PRECOMPUTE`
+/// cell, so the per-worker flag toggle is independent.
 fn refine_one_source(
     ctx: &crate::constraint::solver::context::ProofContext,
     src: Source,
@@ -1272,33 +1303,38 @@ fn refine_one_source(
         .max().unwrap_or(0);
     for (name_list, sys) in all_cases {
         // === Multi-branch refineSource (Haskell-faithful) ===
-        set_precompute_mode(true);
-        // HS-faithful: NO per-branch step cap.  HS `solveAllSafeGoals`
-        // (Sources.hs:201-211) recurses until no safe goal and no
-        // source-pick remains; the ONLY exploration bounds are the
-        // open-chains limit (`chainsLeft`, paramOpenChainsLimit,
-        // Sources.hs:151-153/383) and the outer saturation limit
-        // (paramSaturationLimit, Sources.hs:362/368).  A finite default
-        // here PARKED branches mid-flight as emitted cases — states
-        // with open chain/KD goals HS would have solved or
-        // contradicted — ballooning Chen_Kudla's KU(exp) source from
-        // HS's 29 cases to 276 and flipping the no_WPFS verdict.  HS has
-        // no such cap (only chainsLeft + paramSaturationLimit), so this
-        // is unconditionally unbounded.
-        let outer_cap: i64 = i64::MAX;
-        let (branches, branch_took_step) = run_solve_all_safe_goals_disj_with_progress(
-            ctx, sys, ths_snapshot, /*chains_limit*/ 10,
-            outer_cap, branch_cap, name_list, source_avoid);
-        if branch_took_step {
-            // HS-faithful `not (null names)` change signal —
-            // solveAllSafeGoals took at least one step (safe-goal
-            // solve or source-pick) on this case.  Drives outer
-            // saturate re-iteration even when case count doesn't
-            // grow, so multi-iter convergence patterns like
-            // chaum's KU(~x:Fresh)→1-case work.
-            changed = true;
-        }
-        set_precompute_mode(false);
+        // Precompute mode is scoped to the branch solve only; the block's guard
+        // drops at the block's end — restoring the saved value before the
+        // restrict/dedup below runs, and on unwind as well.
+        let branches = {
+            let _precompute_guard = PrecomputeModeGuard::enter();
+            // HS-faithful: NO per-branch step cap.  HS `solveAllSafeGoals`
+            // (Sources.hs:201-211) recurses until no safe goal and no
+            // source-pick remains; the ONLY exploration bounds are the
+            // open-chains limit (`chainsLeft`, paramOpenChainsLimit,
+            // Sources.hs:151-153/383) and the outer saturation limit
+            // (paramSaturationLimit, Sources.hs:362/368).  A finite default
+            // here PARKED branches mid-flight as emitted cases — states
+            // with open chain/KD goals HS would have solved or
+            // contradicted — ballooning Chen_Kudla's KU(exp) source from
+            // HS's 29 cases to 276 and flipping the no_WPFS verdict.  HS has
+            // no such cap (only chainsLeft + paramSaturationLimit), so this
+            // is unconditionally unbounded.
+            let outer_cap: i64 = i64::MAX;
+            let (branches, branch_took_step) = run_solve_all_safe_goals_disj_with_progress(
+                ctx, sys, ths_snapshot, /*chains_limit*/ 10,
+                outer_cap, branch_cap, name_list, source_avoid);
+            if branch_took_step {
+                // HS-faithful `not (null names)` change signal —
+                // solveAllSafeGoals took at least one step (safe-goal
+                // solve or source-pick) on this case.  Drives outer
+                // saturate re-iteration even when case count doesn't
+                // grow, so multi-iter convergence patterns like
+                // chaum's KU(~x:Fresh)→1-case work.
+                changed = true;
+            }
+            branches
+        };
         // HS-faithful `refineSource` (Sources.hs:123):
         //   map (second (modify sSubst (restrict stableVars)))
         // restricts each branch's eq-store subst to the STABLE vars
@@ -1433,8 +1469,9 @@ fn saturate_sources_with_simp_opt(
         // same source ordering as the sequential version.
         //
         // Determinism: the per-source body has no shared mutable state.
-        // `set_precompute_mode` is `thread_local!`, so each worker's
-        // flag is independent.  `ctx`, `ths_snapshot`, `branch_cap`,
+        // `PrecomputeModeGuard` toggles the `thread_local!` `IN_PRECOMPUTE`
+        // cell, so each worker's flag is independent.  `ctx`, `ths_snapshot`,
+        // `branch_cap`,
         // `aggressive_drop` are read-only.
         // `run_solve_all_safe_goals_disj_with_progress` builds its own
         // Reduction over an owned System, no aliasing.  Maude IPC
@@ -1575,12 +1612,18 @@ fn k_conc_term_for_chain(
 /// `eqModuloFreshnessNoAC` (LTerm.hs:632).  Two terms are equal iff
 /// they're structurally identical after renaming every free var to a
 /// fresh canonical name preserving ONLY sort.
+// alpha-eq var->index maps (outer scope); probed by key only, never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn eq_modulo_freshness_no_ac(
     a: &tamarin_term::lterm::LNTerm,
     b: &tamarin_term::lterm::LNTerm,
 ) -> bool {
     use tamarin_term::lterm::LVar;
     use std::collections::HashMap;
+    // alpha-eq var->index maps (go helper); probed by key only, never iterated;
+    // std kept (byte-inert) — iteration order never reaches output.
+    #[allow(clippy::disallowed_types)]
     fn go(
         a: &tamarin_term::lterm::LNTerm,
         b: &tamarin_term::lterm::LNTerm,
@@ -2479,7 +2522,7 @@ fn freshen_system(
     // bump preserves AC arg order (`unsafefApp`), so use `map_free_monotone`
     // throughout this freshening.
     let mut out = sys.clone();
-    out.nodes = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.nodes).into_iter()
+    out.content_mut_untracked().nodes = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(std::mem::take(&mut out.content_mut_untracked().nodes)).into_iter()
         .map(|(id, ru)| {
             (shift_lvar(&id),
              ru.map_free_monotone(&mut |v| shift_lvar(&v))) })
@@ -2501,19 +2544,19 @@ fn freshen_system(
     // Invalidate: a stale-LOW full max would let `avoid_fresh_state` on
     // the freshened clone seed minted vars into the just-shifted range.
     out.invalidate_max_var_idx_cache();
-    out.edges = out.edges.into_iter()
+    out.content_mut_untracked().edges = std::mem::take(&mut out.content_mut_untracked().edges).into_iter()
         .map(|e| crate::constraint::constraints::Edge {
             src: (shift_lvar(&e.src.0), e.src.1),
             tgt: (shift_lvar(&e.tgt.0), e.tgt.1),
         })
         .collect();
-    out.less_atoms = out.less_atoms.into_iter()
+    out.content_mut_untracked().less_atoms = std::mem::take(&mut out.content_mut_untracked().less_atoms).into_iter()
         .map(|l| crate::constraint::constraints::LessAtom::new(
             shift_lvar(&l.smaller),
             shift_lvar(&l.larger),
             l.reason))
         .collect();
-    out.goals = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.goals).into_iter()
+    out.content_mut_untracked().goals = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(std::mem::take(&mut out.content_mut_untracked().goals)).into_iter()
         .map(|(g, st)| {
             let g2 = match g {
                 crate::constraint::constraints::Goal::Action(n, fa) =>
@@ -2533,8 +2576,8 @@ fn freshen_system(
             (g2, st)
         })
         .collect());
-    if let Some(la) = out.last_atom.take() {
-        out.last_atom = Some(shift_lvar(&la));
+    if let Some(la) = out.content_mut_untracked().last_atom.take() {
+        out.content_mut_untracked().last_atom = Some(shift_lvar(&la));
     }
     // Formulas / solved-formulas / lemmas: shift parser-AST vars too.
     // These can reference rule vars (after `subst_guarded` propagation)
@@ -2552,9 +2595,9 @@ fn freshen_system(
     let shift_g = |g: &crate::guarded::Guarded| {
         crate::guarded::map_lvars_in_guarded(g, shift_parser_var)
     };
-    out.formulas = out.formulas.iter().map(|g| std::sync::Arc::new(shift_g(g))).collect();
-    out.solved_formulas = out.solved_formulas.iter().map(|g| std::sync::Arc::new(shift_g(g))).collect();
-    out.lemmas = out.lemmas.iter().map(|g| std::sync::Arc::new(shift_g(g))).collect();
+    out.content_mut_untracked().formulas = out.formulas.iter().map(|g| std::sync::Arc::new(shift_g(g))).collect();
+    out.content_mut_untracked().solved_formulas = out.solved_formulas.iter().map(|g| std::sync::Arc::new(shift_g(g))).collect();
+    out.content_mut_untracked().lemmas = out.lemmas.iter().map(|g| std::sync::Arc::new(shift_g(g))).collect();
     // Eq-store: shift both domain LVars and range terms.  This whole
     // freshening is HS `rename` (Monotone), so range-term shifts preserve
     // AC arg order — `map_free_monotone`.
@@ -2596,6 +2639,10 @@ fn freshen_system(
         out.subterm_store_mut().solved_subterms = out.subterm_store.solved_subterms.iter()
             .map(shift_st).collect();
     }
+    // Whole-system freshen: `out` is a var-shifted rewrite of a clone, so no
+    // inherited verified-no-op verdict can survive.  Mint fresh stamps + clear
+    // the marker.
+    out.mint_fresh_stamps();
     out
 }
 
@@ -3074,23 +3121,23 @@ fn freshen_system_keep_with_shift(
     // would mis-seed `avoid_fresh_state` on the freshened clone).
     out.invalidate_node_max_cache();
     out.invalidate_max_var_idx_cache();
-    out.nodes = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.nodes).into_iter()
+    out.content_mut_untracked().nodes = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(std::mem::take(&mut out.content_mut_untracked().nodes)).into_iter()
         .map(|(id, ru)| (shift_lvar(&id), ru.map_free(&mut |v| shift_lvar(&v))))
         .collect());
-    out.edges = out.edges.into_iter()
+    out.content_mut_untracked().edges = std::mem::take(&mut out.content_mut_untracked().edges).into_iter()
         .map(|e| crate::constraint::constraints::Edge {
             src: (shift_lvar(&e.src.0), e.src.1),
             tgt: (shift_lvar(&e.tgt.0), e.tgt.1),
         })
         .collect();
-    out.less_atoms = out.less_atoms.into_iter()
+    out.content_mut_untracked().less_atoms = std::mem::take(&mut out.content_mut_untracked().less_atoms).into_iter()
         .map(|l| crate::constraint::constraints::LessAtom::new(
             shift_lvar(&l.smaller),
             shift_lvar(&l.larger),
             l.reason,
         ))
         .collect();
-    out.goals = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.goals).into_iter()
+    out.content_mut_untracked().goals = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(std::mem::take(&mut out.content_mut_untracked().goals)).into_iter()
         .map(|(g, st)| {
             let g2 = match g {
                 crate::constraint::constraints::Goal::Action(n, fa) =>
@@ -3125,21 +3172,21 @@ fn freshen_system_keep_with_shift(
             (g2, st)
         })
         .collect());
-    if let Some(la) = out.last_atom.take() {
-        out.last_atom = Some(shift_lvar(&la));
+    if let Some(la) = out.content_mut_untracked().last_atom.take() {
+        out.content_mut_untracked().last_atom = Some(shift_lvar(&la));
     }
     // Haskell-faithful: shift free LVars in `formulas`, `solved_formulas`,
     // and `lemmas`.  Haskell's `mapFrees` on System (System.hs:1863-1876)
     // traverses ALL 13 fields — without this, post-freshen formulas/
     // lemmas reference pre-freshen var idxs and collide with live
     // post-shift node/edge idxs.
-    out.formulas = out.formulas.into_iter()
+    out.content_mut_untracked().formulas = std::mem::take(&mut out.content_mut_untracked().formulas).into_iter()
         .map(|g| std::sync::Arc::new(crate::guarded::map_lvars_in_guarded(&g, &shift_vs)))
         .collect();
-    out.solved_formulas = out.solved_formulas.into_iter()
+    out.content_mut_untracked().solved_formulas = std::mem::take(&mut out.content_mut_untracked().solved_formulas).into_iter()
         .map(|g| std::sync::Arc::new(crate::guarded::map_lvars_in_guarded(&g, &shift_vs)))
         .collect();
-    out.lemmas = out.lemmas.into_iter()
+    out.content_mut_untracked().lemmas = std::mem::take(&mut out.content_mut_untracked().lemmas).into_iter()
         .map(|g| std::sync::Arc::new(crate::guarded::map_lvars_in_guarded(&g, &shift_vs)))
         .collect();
     // Shift LNTerm vars inside subterm_store constraints.
@@ -3184,6 +3231,7 @@ fn freshen_system_keep_with_shift(
             *s = tamarin_term::subst_vfresh::SubstVFresh::from_list(pairs);
         }
     }
+    out.mint_fresh_stamps();
     out
 }
 
@@ -3439,23 +3487,23 @@ fn freshen_system_some_inst(
     // `avoid_fresh_state` on the freshened clone).
     out.invalidate_node_max_cache();
     out.invalidate_max_var_idx_cache();
-    out.nodes = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.nodes).into_iter()
+    out.content_mut_untracked().nodes = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(std::mem::take(&mut out.content_mut_untracked().nodes)).into_iter()
         .map(|(id, ru)| (lookup(&id), ru.map_free(&mut |v| lookup(&v))))
         .collect());
-    out.edges = out.edges.into_iter()
+    out.content_mut_untracked().edges = std::mem::take(&mut out.content_mut_untracked().edges).into_iter()
         .map(|e| crate::constraint::constraints::Edge {
             src: (lookup(&e.src.0), e.src.1),
             tgt: (lookup(&e.tgt.0), e.tgt.1),
         })
         .collect();
-    out.less_atoms = out.less_atoms.into_iter()
+    out.content_mut_untracked().less_atoms = std::mem::take(&mut out.content_mut_untracked().less_atoms).into_iter()
         .map(|l| crate::constraint::constraints::LessAtom::new(
             lookup(&l.smaller),
             lookup(&l.larger),
             l.reason,
         ))
         .collect();
-    out.goals = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.goals).into_iter()
+    out.content_mut_untracked().goals = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(std::mem::take(&mut out.content_mut_untracked().goals)).into_iter()
         .map(|(g, st)| {
             let g2 = match g {
                 crate::constraint::constraints::Goal::Action(n, fa) =>
@@ -3486,16 +3534,16 @@ fn freshen_system_some_inst(
             (g2, st)
         })
         .collect());
-    if let Some(la) = out.last_atom.take() {
-        out.last_atom = Some(lookup(&la));
+    if let Some(la) = out.content_mut_untracked().last_atom.take() {
+        out.content_mut_untracked().last_atom = Some(lookup(&la));
     }
-    out.formulas = out.formulas.into_iter()
+    out.content_mut_untracked().formulas = std::mem::take(&mut out.content_mut_untracked().formulas).into_iter()
         .map(|g| std::sync::Arc::new(crate::guarded::map_lvars_in_guarded(&g, &lookup_vs)))
         .collect();
-    out.solved_formulas = out.solved_formulas.into_iter()
+    out.content_mut_untracked().solved_formulas = std::mem::take(&mut out.content_mut_untracked().solved_formulas).into_iter()
         .map(|g| std::sync::Arc::new(crate::guarded::map_lvars_in_guarded(&g, &lookup_vs)))
         .collect();
-    out.lemmas = out.lemmas.into_iter()
+    out.content_mut_untracked().lemmas = std::mem::take(&mut out.content_mut_untracked().lemmas).into_iter()
         .map(|g| std::sync::Arc::new(crate::guarded::map_lvars_in_guarded(&g, &lookup_vs)))
         .collect();
     for c in &mut out.subterm_store_mut().subterms {
@@ -3522,6 +3570,7 @@ fn freshen_system_some_inst(
             *s = tamarin_term::subst_vfresh::SubstVFresh::from_list(pairs);
         }
     }
+    out.mint_fresh_stamps();
     out
 }
 
@@ -3757,8 +3806,7 @@ fn refine_source_case_action(
     // conj: DIFF family.  Witnesses are VFresh-bound (batch-invisible;
     // never in printed rule/goal terms).
     //
-    // BP-cluster safety (the reason the old additive shift existed —
-    // commit e65f0a3f: case vars colliding with live `vr.0`/`i1.0`
+    // BP-cluster safety (case vars colliding with live `vr.0`/`i1.0`
     // nodes at conjoinSystem→setNodes): conjoin only ever sees the
     // post-`freshen_system_some_inst` case (step D), which renames
     // every non-keep var from the LIVE Reduction's counter (≥ live
@@ -3927,7 +3975,7 @@ fn refine_source_case_action(
     let arm_eq_stores: Vec<crate::tools::equation_store::EquationStore> =
         if term_eqs.is_empty() {
             // No refineSubst; keep current eq_store as the sole arm.
-            vec![(*refined.sys.eq_store).clone()]
+            vec![(**refined.sys.eq_store).clone()]
         } else {
             let outcome = refined.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs);
             match outcome {
@@ -3939,7 +3987,7 @@ fn refine_source_case_action(
                     // into refined.sys.eq_store.  Mirror as a single-arm
                     // Vec so the post-continuation runs once with that
                     // store.
-                    vec![(*refined.sys.eq_store).clone()]
+                    vec![(**refined.sys.eq_store).clone()]
                 }
                 Ok(SolveOutcome::Cases(arms)) => {
                     arms
@@ -4424,9 +4472,9 @@ fn apply_source_case_premise(
     // renamed source's min idx lands exactly at `avoid goalTerm`
     // (rebase-down at runtime).  See the block comment in
     // `refine_source_case_action`'s A.1 for the full derivation, the
-    // witness-idx (web conj: DIFF) rationale, and why the BP-cluster
-    // setNodes collisions (commit e65f0a3f, the old additive
-    // `goal_max.max(live_max)+1` shift) can't recur: conjoin only sees
+    // witness-idx (web conj: DIFF) rationale, and why BP-cluster
+    // setNodes collisions (case vars vs live nodes) cannot occur:
+    // conjoin only sees
     // the post-`freshen_system_some_inst` case (step D), renamed from
     // the live Reduction's counter.
     let mut goal_max: u64 = 0;
@@ -4528,7 +4576,11 @@ fn apply_source_case_premise(
         (renamed_abstract_node.clone(), abstract_prem_idx_orig);
     let new_prem: (tamarin_term::lterm::LVar, crate::rule::PremIdx) =
         (renamed_abstract_node.clone(), live_prem_idx);
-    for e in renamed_case.edges.iter_mut() {
+    // In-place edge-endpoint rewrite through `content_mut()` — the
+    // conservative door bumps `content_stamp` (and, harmlessly, invalidates
+    // the caches: `renamed_case` was freshened, marker already cleared, and it
+    // is about to be wrapped in a `Reduction` and refined).
+    for e in renamed_case.content_mut().edges.iter_mut() {
         if e.tgt == pat_prem {
             e.tgt = new_prem.clone();
         }
@@ -4567,7 +4619,7 @@ fn apply_source_case_premise(
     // silently dropped).
     let arm_eq_stores: Vec<crate::tools::equation_store::EquationStore> =
         if term_eqs.is_empty() {
-            vec![(*refined.sys.eq_store).clone()]
+            vec![(**refined.sys.eq_store).clone()]
         } else {
             let outcome = refined.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs);
             match outcome {
@@ -4575,7 +4627,7 @@ fn apply_source_case_premise(
                     return Vec::new();
                 }
                 Ok(SolveOutcome::Linear(_)) => {
-                    vec![(*refined.sys.eq_store).clone()]
+                    vec![(**refined.sys.eq_store).clone()]
                 }
                 Ok(SolveOutcome::Cases(arms)) => {
                     arms
@@ -4934,6 +4986,9 @@ fn close_trivial_chains_in_graft(
 /// the case's `abstract_node` (which produces the KU action) to the
 /// live goal's `live_node`.  Unlike a premise-source graft, no premise
 /// edge needs bridging — the action node *is* the consumer.
+// dedup membership set over subst vars; .contains only, never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn graft_case_into_action(
     live_sys: &System,
     case_sys: &System,
@@ -5790,17 +5845,18 @@ fn write_rule_to_key_excl_new_vars(
 /// formula once, renaming free LVar leaves in place and writing a compact
 /// structural fingerprint, with NO clone and NO `Debug` dispatch.
 ///
-/// The produced key BYTES differ from the old `Debug` rendering, but the
-/// induced equivalence partition is IDENTICAL: `compute_compare_systems_key`
-/// keys are purely internal (never reach `--prove` output), and they are
+/// The key BYTES are an arbitrary internal fingerprint:
+/// `compute_compare_systems_key` keys never reach `--prove` output and are
 /// only ever compared for equality/ordering against other keys from the
-/// SAME `removeRedundantCases` call.  The `rename` map is a var→var alpha
+/// SAME `removeRedundantCases` call, so ANY injective encoding induces the
+/// same equivalence partition.  The `rename` map is a var→var alpha
 /// renaming (`compute_rename_map`), so substituting it never produces a
 /// `Pair` and `mk_gpair`'s tuple-flattening (the one non-rename effect of
-/// `subst_guarded`) can never fire here — i.e. the old `subst_guarded`
-/// step did *nothing but rename free vars* for this input class.  This
+/// `subst_guarded`) can never fire for this input class — a full
+/// `subst_guarded` here would do *nothing but rename free vars*.  This
 /// serializer renames the same free vars and is injective over the formula
-/// structure, so two formulas collide here iff they collided before.
+/// structure, so it partitions formulas exactly as a substitute-then-
+/// compare route would.
 fn write_guarded_to_key(
     g: &crate::guarded::Guarded,
     rename: &RenameMap,
@@ -6014,6 +6070,27 @@ fn compute_compare_systems_key(
 ) -> String {
     use std::fmt::Write as _;
     let rename = compute_rename_map(sys, stable_vars);
+    // Exhaustive destructure of the system's content (no `..`): adding a
+    // `SystemContent` field becomes a compile error here until its role in the
+    // comparison key is decided (serialise it, or bind it to `_name` with a
+    // reason).  Every content field currently participates in the key, so all
+    // bindings are used below.  System-level fields not in `SystemContent`
+    // (`source_kind`, `side`, `next_goal_nr`) are read via `sys.` and their
+    // additions are caught by the exhaustive destructures in
+    // `impl Clone`/`impl PartialEq for System`.  `&**sys` derefs `&System` →
+    // `&SystemContent`.
+    let crate::constraint::system::SystemContent {
+        nodes,
+        edges,
+        less_atoms,
+        formulas,
+        solved_formulas,
+        lemmas,
+        last_atom,
+        eq_store,
+        subterm_store,
+        goals,
+    } = &**sys;
     // `cap_hint` pre-sizes the key buffer to a sibling case's key length
     // (keys within one `removeRedundantCases` call have similar sizes),
     // avoiding the ~10 doubling reallocs of a growing key.  Reserve is
@@ -6022,7 +6099,7 @@ fn compute_compare_systems_key(
     // NODES (with renamed ids, excluding rule.new_vars).
     out.push_str("NODES:[");
     let mut nodes_sorted: Vec<&(tamarin_term::lterm::LVar, crate::rule::RuleACInst)> =
-        sys.nodes.iter().collect();
+        nodes.iter().collect();
     // `sort_by_cached_key` is stable like `sort_by_key` (same order) but
     // pays ONE `rn` lookup + LVar clone per node instead of one per
     // comparison.
@@ -6044,7 +6121,7 @@ fn compute_compare_systems_key(
     out.push_str(";EDGES:[");
     let mut edges_renamed: Vec<(tamarin_term::lterm::LVar, crate::rule::ConcIdx,
                                 tamarin_term::lterm::LVar, crate::rule::PremIdx)>
-        = sys.edges.iter()
+        = edges.iter()
             .map(|e| (rn(&rename, &e.src.0), e.src.1, rn(&rename, &e.tgt.0), e.tgt.1))
             .collect();
     edges_renamed.sort();
@@ -6066,7 +6143,7 @@ fn compute_compare_systems_key(
     // LESS.
     out.push_str(";LESS:[");
     let mut less_renamed: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LVar,
-                               crate::constraint::constraints::Reason)> = sys.less_atoms.iter()
+                               crate::constraint::constraints::Reason)> = less_atoms.iter()
         .map(|la| (rn(&rename, &la.smaller), rn(&rename, &la.larger), la.reason))
         .collect();
     less_renamed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
@@ -6079,20 +6156,20 @@ fn compute_compare_systems_key(
     out.push(']');
     // LAST.
     out.push_str(";LAST:");
-    if let Some(j) = &sys.last_atom {
+    if let Some(j) = last_atom {
         let r = rn(&rename, j);
         push_u64(&mut out, r.idx);
     }
     // SUBTERM STORE.
     out.push_str(";STORE:[");
-    for st in &sys.subterm_store.subterms {
+    for st in &subterm_store.subterms {
         write_term_to_key(&st.small, &rename, &mut out);
         out.push_str("<<");
         write_term_to_key(&st.big, &rename, &mut out);
         out.push(';');
     }
     out.push_str("]/SOLVED:[");
-    for st in &sys.subterm_store.solved_subterms {
+    for st in &subterm_store.solved_subterms {
         write_term_to_key(&st.small, &rename, &mut out);
         out.push_str("<<");
         write_term_to_key(&st.big, &rename, &mut out);
@@ -6102,7 +6179,7 @@ fn compute_compare_systems_key(
     // EQSTORE.subst (free subst).
     out.push_str(";SUBST:[");
     let mut subst_pairs: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> =
-        sys.eq_store.subst.to_list();
+        eq_store.subst.to_list();
     // Re-key by renamed var, then sort.
     let mut subst_keyed: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> =
         subst_pairs.drain(..).map(|(v, t)| (rn(&rename, &v), t)).collect();
@@ -6125,7 +6202,7 @@ fn compute_compare_systems_key(
     // buffer and range Vec are reused across all sorted sections below.
     let mut scratch = String::new();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for disj in &sys.eq_store.conj {
+    for disj in &eq_store.conj {
         out.push_str("id=SplitId(");
         push_i64(&mut out, disj.split_id.0);
         out.push_str(");");
@@ -6175,7 +6252,7 @@ fn compute_compare_systems_key(
     out.push_str(";FORMS:[");
     scratch.clear();
     ranges.clear();
-    for g in &sys.formulas {
+    for g in formulas {
         let start = scratch.len();
         write_guarded_to_key(g, &rename, &mut scratch);
         ranges.push((start, scratch.len() - start));
@@ -6186,7 +6263,7 @@ fn compute_compare_systems_key(
     out.push_str(";SOLV_FORMS:[");
     scratch.clear();
     ranges.clear();
-    for g in &sys.solved_formulas {
+    for g in solved_formulas {
         let start = scratch.len();
         write_guarded_to_key(g, &rename, &mut scratch);
         ranges.push((start, scratch.len() - start));
@@ -6197,7 +6274,7 @@ fn compute_compare_systems_key(
     out.push_str(";LEMMAS:[");
     scratch.clear();
     ranges.clear();
-    for g in &sys.lemmas {
+    for g in lemmas {
         let start = scratch.len();
         write_guarded_to_key(g, &rename, &mut scratch);
         ranges.push((start, scratch.len() - start));
@@ -6214,7 +6291,7 @@ fn compute_compare_systems_key(
     out.push_str(";GOALS:[");
     scratch.clear();
     ranges.clear();
-    for (g, st) in sys.goals.iter() {
+    for (g, st) in goals.iter() {
         let start = scratch.len();
         write_goal_to_key(g, &rename, &mut scratch);
         scratch.push_str(":st=");

@@ -71,6 +71,59 @@ pub enum SourceKind { RawSources, RefinedSources }
 pub enum Side { LHS, RHS }
 
 // =============================================================================
+// Write-sealed equation-store field
+// =============================================================================
+
+/// Write-sealed newtype around the system's equation-store `Arc`.
+///
+/// The `eq_store` field of [`SystemContent`] stays `pub` so every READ site
+/// keeps compiling unchanged — `sys.eq_store.subst` (double-deref
+/// `SealedEqStore` → `Arc<EquationStore>` → `EquationStore`),
+/// `Arc::ptr_eq(&a.eq_store, …)` (deref-coercion `&SealedEqStore` →
+/// `&Arc<EquationStore>`), etc. — via the `Deref<Target = Arc<EquationStore>>`
+/// below.
+///
+/// But it cannot be WRITTEN outside this module: the tuple field is private
+/// and the wrapper implements **no** `Default`, `Clone`, `DerefMut`, or public
+/// constructor, so a `SealedEqStore` VALUE cannot be produced anywhere except
+/// `system.rs`.  That closes the residual subst-stamp hole at COMPILE time:
+/// the escape-hatch `content_mut_untracked()` hands out `&mut SystemContent`
+/// with the `pub eq_store` field visible, but `c.eq_store = …` now has no
+/// expressible right-hand side (no value to assign, no `mem::take`/`replace`
+/// target, no struct-literal field), so the only reachable write path is
+/// `System::set_eq_store` / `take_eq_store` / `eq_store_mut`, each of which
+/// bumps `subst_stamp`.
+///
+/// `Debug`/`PartialEq` are implemented manually, delegating to the inner
+/// `Arc`, so `SystemContent`'s derived `Debug`/`PartialEq` are byte-identical
+/// to the pre-seal `Arc<EquationStore>` field.
+pub struct SealedEqStore(Arc<EquationStore>);
+
+impl std::ops::Deref for SealedEqStore {
+    type Target = Arc<EquationStore>;
+    #[inline]
+    fn deref(&self) -> &Arc<EquationStore> { &self.0 }
+}
+
+// Delegate to the inner `Arc` so `{:?}` output (and any Debug-derived
+// serialisation) is identical to the pre-seal `Arc<EquationStore>` field.
+impl std::fmt::Debug for SealedEqStore {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+// Content comparison (forwards to `Arc`'s `PartialEq`, i.e. the inner
+// `EquationStore` value), preserving goal/case dedup equality semantics.
+impl PartialEq for SealedEqStore {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+// =============================================================================
 // System
 // =============================================================================
 
@@ -84,10 +137,27 @@ pub enum Side { LHS, RHS }
 /// copy-on-write sharing (see field docs). Lookup is currently
 /// linear; once the remaining derives land we can swap to ordered
 /// containers without changing the public surface.
-#[derive(Debug, Default)]
-pub struct System {
-    pub source_kind: Option<SourceKind>,
-    pub side: Option<Side>,
+/// The value-carrying core of a [`System`]: the ten fields
+/// `subst_system_once` reads/writes.  Split out of `System` so that
+/// (a) `System: Deref<Target = SystemContent>` makes every field READ
+/// compile unchanged (field reads auto-deref through `.`), and (b) the
+/// deliberate ABSENCE of `DerefMut` turns every raw field WRITE into a
+/// compile error, forcing each through one of a small, closed set of
+/// stamp/cache-maintaining accessors on `System` (`content_mut`,
+/// `formulas_mut`, `nodes_mut`, … / the `content_mut_untracked` escape
+/// hatch).  A raw write that forgets the stamp/cache bookkeeping no
+/// longer type-checks — that is the enforcement pivot for the
+/// verified-identity `subst_system` skip.
+// `Default` and `Clone` are IMPL'D MANUALLY (below), not derived: the
+// `eq_store` field is a `SealedEqStore`, which deliberately implements neither
+// `Default` nor `Clone` (that is what makes an out-of-module `SealedEqStore`
+// value unproducible → the write-seal).  The manual impls rebuild the field
+// through the module-private tuple constructor, so their behaviour is
+// byte-identical to the derived versions (an `Arc` refcount bump / a fresh
+// default `Arc`).  `Debug`/`PartialEq` are still derived (the wrapper provides
+// both, delegating to the inner `Arc`).
+#[derive(Debug, PartialEq)]
+pub struct SystemContent {
     /// Node id → rule instance providing its conclusion.
     ///
     /// Wrapped in `Arc` for copy-on-write structural sharing: cloning a
@@ -129,7 +199,12 @@ pub struct System {
     ///
     /// `Arc`-wrapped for copy-on-write structural sharing (see `nodes`).
     /// Cloned at every proof fork; mutated through `eq_store_mut`.
-    pub eq_store: Arc<EquationStore>,
+    ///
+    /// Write-sealed via [`SealedEqStore`]: reads deref through unchanged; the
+    /// only write path is `set_eq_store`/`take_eq_store`/`eq_store_mut` (each
+    /// bumps `subst_stamp`) because no `SealedEqStore` value is constructible
+    /// outside this module.
+    pub eq_store: SealedEqStore,
     /// Subterm store.
     ///
     /// `Arc`-wrapped for copy-on-write structural sharing (see `nodes`).
@@ -140,6 +215,66 @@ pub struct System {
     /// `Arc`-wrapped for copy-on-write structural sharing (see `nodes`).
     /// Cloned at every proof fork; mutated through `goals_mut`.
     pub goals: Arc<Vec<(Goal, GoalStatus)>>,
+}
+
+// Manual `Default` — the derived one is unavailable because `SealedEqStore`
+// has no `Default` (part of the write-seal).  Rebuilds `eq_store` through the
+// module-private constructor with a default `Arc<EquationStore>`; every other
+// field takes its own `Default`, so the result is byte-identical to a derive.
+impl Default for SystemContent {
+    fn default() -> Self {
+        Self {
+            nodes: Arc::default(),
+            edges: Vec::default(),
+            less_atoms: Vec::default(),
+            formulas: Vec::default(),
+            solved_formulas: Vec::default(),
+            lemmas: Vec::default(),
+            last_atom: None,
+            eq_store: SealedEqStore(Arc::default()),
+            subterm_store: Arc::default(),
+            goals: Arc::default(),
+        }
+    }
+}
+
+// Manual `Clone` — the derived one is unavailable because `SealedEqStore` has
+// no `Clone` (part of the write-seal; `.clone()` on the field falls through
+// `Deref` to `Arc::clone`, yielding `Arc<EquationStore>`, not another sealed
+// value — so a clone can never be assigned back into an `eq_store` slot).
+// Every field clones exactly as the derive would (`Arc` refcount bumps for the
+// shared collections, `eq_store` rebuilt through the private constructor from
+// an `Arc::clone`).  Byte-identical to a derived `Clone`.
+impl Clone for SystemContent {
+    fn clone(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            less_atoms: self.less_atoms.clone(),
+            formulas: self.formulas.clone(),
+            solved_formulas: self.solved_formulas.clone(),
+            lemmas: self.lemmas.clone(),
+            last_atom: self.last_atom.clone(),
+            eq_store: SealedEqStore(self.eq_store.0.clone()),
+            subterm_store: self.subterm_store.clone(),
+            goals: self.goals.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct System {
+    /// The value-carrying content fields (see [`SystemContent`]).
+    ///
+    /// PRIVATE — this is the enforcement pivot.  Reads reach the fields
+    /// via `System: Deref<Target = SystemContent>` (so `sys.nodes` etc.
+    /// still work everywhere).  Writes cannot: no code outside this
+    /// module can name `system.content`, and there is no `DerefMut`, so
+    /// the only reachable mutation path is a stamp/cache-maintaining
+    /// accessor on `System`.
+    content: SystemContent,
+    pub source_kind: Option<SourceKind>,
+    pub side: Option<Side>,
     /// Monotonic goal-number counter (`_sNextGoalNr`,
     /// System.hs:394).  Advanced on every goal insertion (even when
     /// the goal already exists — HS's `insertGoalStatus`
@@ -193,6 +328,31 @@ pub struct System {
     /// push / uniform shift).  Excluded from `PartialEq`/`Clone`
     /// semantics exactly like `max_var_idx_cache`.
     pub node_max_cache: Cell<Option<u64>>,
+    /// Value-version of the nine content fields `subst_system_once` reads
+    /// (`nodes, edges, last_atom, less_atoms, goals, formulas,
+    /// solved_formulas, lemmas, subterm_store`).  A fresh `next_stamp()` on
+    /// every VALUE (or order/count) change to any of them, minted by the same
+    /// cache-maintenance chokepoints the max-var-idx cache already funnels
+    /// every content mutation through (see `bump_content_stamp`).  Powers the
+    /// verified-identity `subst_system` skip (reduction.rs).  Excluded from
+    /// `PartialEq` / serialized keys / `compute_compare_systems_key` exactly
+    /// like the cache Cells.  `Cell` so read-path bump helpers need no `&mut`.
+    /// Private: all access goes through the stamp/marker methods below.
+    content_stamp: Cell<u64>,
+    /// Value-version of `eq_store.subst`.  Fresh `next_stamp()` on every subst
+    /// mutation (bumped inside `eq_store_mut`/`set_eq_store`).  Lives on
+    /// `System` (not `EquationStore`) so `EquationStore`'s derived
+    /// `PartialEq`/`Eq` — relied on by goal/case dedup — stays untouched.
+    subst_stamp: Cell<u64>,
+    /// `(content_stamp, subst_stamp)` snapshot at the end of the last
+    /// zero-signal `subst_system` invocation; `None` = no verified no-op yet.
+    /// While the marker still equals the live stamps, `subst_system` is a
+    /// proven total no-op and the whole loop is skipped.  Cloned verbatim (a
+    /// clone inherits the parent's verdict until it is itself mutated, which
+    /// bumps a stamp and breaks the match).  Excluded from `PartialEq` like
+    /// the cache Cells.  Private: readable/writable only through
+    /// `subst_marker_matches` / `record_subst_marker` / `clear_subst_marker`.
+    subst_applied_marker: Cell<Option<(u64, u64)>>,
 }
 
 // Manual `Clone` — copies the cache value (NOT invalidates).  System
@@ -200,24 +360,40 @@ pub struct System {
 // invalidated the cache would defeat the optimisation.
 impl Clone for System {
     fn clone(&self) -> Self {
+        // Exhaustive destructure of `self` (no `..`): adding a `System` field
+        // becomes a compile error here until its clone role is decided,
+        // instead of being silently dropped from the clone.
+        let System {
+            content,
+            source_kind,
+            side,
+            next_goal_nr,
+            used_sources,
+            sources_lemma_universals,
+            max_var_idx_cache,
+            node_max_cache,
+            content_stamp,
+            subst_stamp,
+            subst_applied_marker,
+        } = self;
         Self {
-            source_kind: self.source_kind,
-            side: self.side,
-            nodes: self.nodes.clone(),
-            edges: self.edges.clone(),
-            less_atoms: self.less_atoms.clone(),
-            formulas: self.formulas.clone(),
-            solved_formulas: self.solved_formulas.clone(),
-            lemmas: self.lemmas.clone(),
-            last_atom: self.last_atom.clone(),
-            eq_store: self.eq_store.clone(),
-            subterm_store: self.subterm_store.clone(),
-            goals: self.goals.clone(),
-            next_goal_nr: self.next_goal_nr,
-            used_sources: self.used_sources.clone(),
-            sources_lemma_universals: self.sources_lemma_universals.clone(),
-            max_var_idx_cache: Cell::new(self.max_var_idx_cache.get()),
-            node_max_cache: Cell::new(self.node_max_cache.get()),
+            content: content.clone(),
+            source_kind: *source_kind,
+            side: *side,
+            next_goal_nr: *next_goal_nr,
+            used_sources: used_sources.clone(),
+            sources_lemma_universals: sources_lemma_universals.clone(),
+            // The cache/stamp Cells are COPIED verbatim (NOT invalidated): a
+            // clone is content-identical to its parent, so it inherits both
+            // stamps AND the marker — if the parent had a verified no-op
+            // verdict, the clone legitimately skips too, until the clone is
+            // itself mutated (which bumps its own stamp and breaks the match).
+            // Globally-unique stamps make cross-lineage aliasing impossible.
+            max_var_idx_cache: Cell::new(max_var_idx_cache.get()),
+            node_max_cache: Cell::new(node_max_cache.get()),
+            content_stamp: Cell::new(content_stamp.get()),
+            subst_stamp: Cell::new(subst_stamp.get()),
+            subst_applied_marker: Cell::new(subst_applied_marker.get()),
         }
     }
 }
@@ -229,22 +405,49 @@ impl Clone for System {
 // cleanup(sys); ... if cleaned[0] == cleaned_input { return None; }`).
 impl PartialEq for System {
     fn eq(&self, other: &Self) -> bool {
-        self.source_kind == other.source_kind
-            && self.side == other.side
-            && self.nodes == other.nodes
-            && self.edges == other.edges
-            && self.less_atoms == other.less_atoms
-            && self.formulas == other.formulas
-            && self.solved_formulas == other.solved_formulas
-            && self.lemmas == other.lemmas
-            && self.last_atom == other.last_atom
-            && self.eq_store == other.eq_store
-            && self.subterm_store == other.subterm_store
-            && self.goals == other.goals
-            && self.next_goal_nr == other.next_goal_nr
-            && self.used_sources == other.used_sources
-            && self.sources_lemma_universals == other.sources_lemma_universals
+        // Exhaustive destructure of `self` (no `..`): adding a `System` field
+        // becomes a compile error here until its equality role is decided —
+        // either compare it below or bind it to `_` with a reason.
+        let System {
+            content,
+            source_kind,
+            side,
+            next_goal_nr,
+            used_sources,
+            sources_lemma_universals,
+            // DELIBERATELY excluded from equality: two systems with identical
+            // content but different cache/stamp state (e.g. one freshly cloned,
+            // one after `bounds_max` populated its cache) must compare equal —
+            // see `proof_method.rs`'s cleanup-equality check.
+            max_var_idx_cache: _,
+            node_max_cache: _,
+            content_stamp: _,
+            subst_stamp: _,
+            subst_applied_marker: _,
+        } = self;
+        *source_kind == other.source_kind
+            && *side == other.side
+            && *content == other.content
+            && *next_goal_nr == other.next_goal_nr
+            && *used_sources == other.used_sources
+            && *sources_lemma_universals == other.sources_lemma_universals
     }
+}
+
+/// Read access to the [`SystemContent`] fields.  Field reads auto-deref
+/// through the `.` operator, so `sys.nodes`, `sys.eq_store.subst`, … keep
+/// compiling unchanged both cross-module and inside `impl System`.
+///
+/// There is DELIBERATELY no `DerefMut`: this is a "smart field container",
+/// not a pointer.  Every write must go through a stamp/cache-maintaining
+/// accessor on `System` (`content_mut`, `formulas_mut`, `nodes_mut`, … or
+/// the `content_mut_untracked` escape hatch) so that forgetting the
+/// stamp/cache bookkeeping is a compile error, not a silent skip
+/// divergence.  See [`System::content_mut`] for the write path.
+impl std::ops::Deref for System {
+    type Target = SystemContent;
+    #[inline]
+    fn deref(&self) -> &SystemContent { &self.content }
 }
 
 /// Canonicalize a Goal for dedup-comparison in `add_goal_with_loop_flag`.
@@ -315,7 +518,191 @@ fn trace_goal_insert() -> bool {
 }
 
 impl System {
-    pub fn empty() -> Self { Self::default() }
+    pub fn empty() -> Self {
+        let s = Self::default();
+        // A freshly-built System has never had a verified no-op pass: mint
+        // fresh, globally-unique stamps (off the reserved-0 sentinel) and
+        // start with no marker, so its first `subst_system` runs a full pass.
+        s.mint_fresh_stamps();
+        s
+    }
+
+    // ====== verified-identity subst_system skip: stamp maintenance ======
+
+    /// Mint a fresh `content_stamp`.  Called by every content-mutation
+    /// chokepoint (the max-var-idx cache maintenance helpers below, plus
+    /// `nodes_mut`/`subterm_store_mut` and the handful of raw-write gap sites
+    /// the cache discipline does not cover).  A fresh unique stamp on any
+    /// change breaks a stale `subst_applied_marker`, forcing the next
+    /// `subst_system` to run rather than skip.  Over-bumping only loses skips;
+    /// under-bumping is a soundness bug, so every ambiguous site bumps.
+    #[inline]
+    pub fn bump_content_stamp(&self) {
+        self.content_stamp.set(tamarin_utils::next_stamp());
+    }
+
+    /// Mint a fresh `subst_stamp` (called on every `eq_store.subst` mutation
+    /// via `eq_store_mut`/`set_eq_store`).
+    #[inline]
+    pub fn bump_subst_stamp(&self) {
+        self.subst_stamp.set(tamarin_utils::next_stamp());
+    }
+
+    /// True iff the verified-identity marker is set and BOTH stamps still
+    /// equal the values it recorded — neither the content nor the eq-store
+    /// substitution has been touched since a zero-signal `subst_system`
+    /// pass observed this exact state, so re-running the pass is a proven
+    /// total no-op.
+    #[inline]
+    pub fn subst_marker_matches(&self) -> bool {
+        self.subst_applied_marker.get()
+            == Some((self.content_stamp.get(), self.subst_stamp.get()))
+    }
+
+    /// Record the verified-identity marker at the current stamp pair.
+    /// Callable only after a `subst_system` pass that raised zero change
+    /// signals: the marker asserts that pass was a total no-op at exactly
+    /// this `(content_stamp, subst_stamp)` state.  Any later content/subst
+    /// mutation mints a fresh stamp, so the stored pair stops matching —
+    /// no explicit invalidation is needed.
+    #[inline]
+    pub fn record_subst_marker(&self) {
+        self.subst_applied_marker.set(Some((
+            self.content_stamp.get(),
+            self.subst_stamp.get(),
+        )));
+    }
+
+    /// Drop the verified-identity marker.  For whole-system rewriters
+    /// (precise rename) whose eq-store bump alone already breaks the match:
+    /// clearing keeps the marker's meaning exact rather than relying on the
+    /// stamp mismatch.
+    #[inline]
+    pub fn clear_subst_marker(&self) {
+        self.subst_applied_marker.set(None);
+    }
+
+    /// Mint fresh values for BOTH stamps and clear the marker.  Used at
+    /// whole-object constructors / whole-system transforms (freshen / precise
+    /// rename) where a cloned marker must not survive a wholesale rewrite.
+    #[inline]
+    pub fn mint_fresh_stamps(&self) {
+        self.content_stamp.set(tamarin_utils::next_stamp());
+        self.subst_stamp.set(tamarin_utils::next_stamp());
+        self.subst_applied_marker.set(None);
+    }
+
+    /// Install a new equation store, bumping `subst_stamp`.  The ONLY
+    /// sanctioned path for `self.eq_store = Arc::new(..)` reassignment — the
+    /// `eq_store_direct_assignment_is_routed` guard test fails the build on any
+    /// raw `.eq_store =` write in the solver that bypasses this.
+    #[inline]
+    pub fn set_eq_store(&mut self, es: Arc<EquationStore>) {
+        // Module-private `SealedEqStore` constructor: the only place (with
+        // `take_eq_store`/`eq_store_mut`) a sealed value is produced.
+        self.content.eq_store = SealedEqStore(es);
+        self.bump_subst_stamp();
+    }
+
+    /// Take the `eq_store` `Arc` out (leaving a `Default` in its place),
+    /// bumping `subst_stamp`.  Sole sanctioned `mem::take(&mut …eq_store)`
+    /// door for the "unwrap → rebuild → `set_eq_store`" pattern; the
+    /// `eq_store_installs_route_through_set_eq_store` guard test forbids a raw
+    /// `mem::take(&mut sys.eq_store)` elsewhere (the take is a subst mutation).
+    #[inline]
+    pub fn take_eq_store(&mut self) -> Arc<EquationStore> {
+        self.bump_subst_stamp();
+        // `SealedEqStore` has no `Default`, so `mem::take` is unavailable (by
+        // design — that unavailability is what seals the field).  Swap in a
+        // freshly-constructed default sealed store and unwrap the taken value.
+        std::mem::replace(&mut self.content.eq_store, SealedEqStore(Arc::default())).0
+    }
+
+    // ====== content-write choke doors (the enforcement surface) ======
+
+    /// The one CONSERVATIVE content-write door.  Bumps BOTH stamps and
+    /// invalidates BOTH max caches, then hands out `&mut SystemContent` for
+    /// field-level split borrows.  Over-invalidation loses skips / cache hits,
+    /// never correctness.  Prefer a precise accessor on a hot path; use this
+    /// everywhere else (notably the interactive graph-render pipeline, which
+    /// never runs `subst_system` afterwards so the double bump is free).
+    ///
+    /// `subst_system_once` and the other whole-system rewriters never use this
+    /// (they use `content_mut_untracked`), so its `subst_stamp` bump never
+    /// fires mid-skip-window on the hot path.
+    #[inline]
+    pub fn content_mut(&mut self) -> &mut SystemContent {
+        self.bump_content_stamp();
+        self.bump_subst_stamp();
+        self.max_var_idx_cache.set(None);
+        self.node_max_cache.set(None);
+        &mut self.content
+    }
+
+    /// Raw `&mut SystemContent` with NO stamp bump and NO cache invalidation.
+    ///
+    /// ONLY for whole-system rewriters that manage the stamps AND both max
+    /// caches themselves and whose perf depends on not over-invalidating (they
+    /// reassign whole `Arc`s, mint fresh stamps, or track change precisely).
+    /// Every other mutation MUST use `content_mut` or a precise accessor.
+    ///
+    /// The closed set of callers is pinned by the
+    /// `content_untracked_callers_are_enumerated` guard test.  A new call site
+    /// fails the build until its stamp reasoning is established.  The
+    /// subst axis is sealed independently of this list: the `eq_store` field
+    /// this door exposes is a `SealedEqStore`, so a raw assignment has no
+    /// expressible right-hand side and every write path bumps `subst_stamp`.
+    ///
+    /// VISIBILITY: `pub(crate)`, not `pub` — unnameable from `tamarin-server`
+    /// and any other downstream crate (only the tracked `content_mut` door is
+    /// `pub`).  The conceptually-tighter `pub(in crate::constraint::solver)` is
+    /// illegal here: this inherent method is declared in `impl System` inside
+    /// module `crate::constraint::system`, which is a *sibling* (not an
+    /// ancestor) of `solver`, and `pub(in …)` may only name an ancestor module.
+    /// The guard test's whole-`src` file scan makes the enforced scope equal to
+    /// the visibility scope.
+    #[inline]
+    pub(crate) fn content_mut_untracked(&mut self) -> &mut SystemContent {
+        &mut self.content
+    }
+
+    /// Bump `content_stamp` and hand out `&mut Vec<Arc<Guarded>>` for the
+    /// `formulas` store.  Bumps content_stamp only (NOT the max cache): the
+    /// caller keeps its adjacent `bump_cache_guarded` / `invalidate_*` so the
+    /// additive max-cache discipline is unchanged for these hot formula sites
+    /// (routing through `content_mut` would newly INVALIDATE the max cache on
+    /// every formula insert — a `bounds_max` regression).
+    #[inline]
+    pub fn formulas_mut(&mut self) -> &mut Vec<Arc<Guarded>> {
+        self.bump_content_stamp();
+        &mut self.content.formulas
+    }
+
+    /// Bump `content_stamp` and hand out `&mut` to `solved_formulas`
+    /// (see [`formulas_mut`](Self::formulas_mut)).
+    #[inline]
+    pub fn solved_formulas_mut(&mut self) -> &mut Vec<Arc<Guarded>> {
+        self.bump_content_stamp();
+        &mut self.content.solved_formulas
+    }
+
+    /// Bump `content_stamp` and hand out `&mut` to `lemmas`
+    /// (see [`formulas_mut`](Self::formulas_mut)).
+    #[inline]
+    pub fn lemmas_mut(&mut self) -> &mut Vec<Arc<Guarded>> {
+        self.bump_content_stamp();
+        &mut self.content.lemmas
+    }
+
+    /// Set `last_atom`, bumping `content_stamp`.  The sanctioned door for the
+    /// scattered `last_atom = ..` writes (except the whole-system rewriters,
+    /// which use `content_mut_untracked`).  Callers keep any adjacent max-cache
+    /// maintenance (`bump_cache_lvar` / `invalidate_*`).
+    #[inline]
+    pub fn set_last_atom(&mut self, la: Option<NodeId>) {
+        self.bump_content_stamp();
+        self.content.last_atom = la;
+    }
 
     /// The rule instance at node `v`, if present. Port of HS `nodeRuleSafe`
     /// (System.hs:917): `M.lookup v sNodes`.
@@ -374,25 +761,46 @@ impl System {
     /// for any in-place mutation of the node list.
     #[inline]
     pub fn nodes_mut(&mut self) -> &mut Vec<(NodeId, RuleACInst)> {
-        Arc::make_mut(&mut self.nodes)
+        // Structural content-mutation choke: any `&mut` node access bumps
+        // `content_stamp` (unconditional — `subst_system_once` reassigns
+        // `self.sys.nodes` directly, never via `nodes_mut`, so this never
+        // over-bumps the pass's own node write; a skip stays valid).
+        self.bump_content_stamp();
+        Arc::make_mut(&mut self.content.nodes)
     }
 
     /// Copy-on-write mutable access to `goals` (see `nodes_mut`).
     #[inline]
     pub fn goals_mut(&mut self) -> &mut Vec<(Goal, GoalStatus)> {
-        Arc::make_mut(&mut self.goals)
+        Arc::make_mut(&mut self.content.goals)
     }
 
     /// Copy-on-write mutable access to `eq_store` (see `nodes_mut`).
     #[inline]
     pub fn eq_store_mut(&mut self) -> &mut EquationStore {
-        Arc::make_mut(&mut self.eq_store)
+        // Coarse SUBST-axis choke: bump `subst_stamp` on ANY `&mut` eq-store
+        // access.  Over-reports on conj-only mutations (safe — lost skips
+        // only).  `subst_system_once` never calls this on its read path (it
+        // clones `eq_store.subst` once), so a fired skip is never invalidated
+        // by the pass's own bookkeeping.
+        self.bump_subst_stamp();
+        // Reach through the sealed wrapper's private field to the inner `Arc`
+        // (in-module access) for copy-on-write mutation.
+        Arc::make_mut(&mut self.content.eq_store.0)
     }
 
     /// Copy-on-write mutable access to `subterm_store` (see `nodes_mut`).
     #[inline]
     pub fn subterm_store_mut(&mut self) -> &mut SubtermStore {
-        Arc::make_mut(&mut self.subterm_store)
+        // Structural content-mutation choke for the subterm store: EVERY
+        // subterm mutation (external adds, the conjoin graft, AND
+        // `subst_system_once`'s own subterm rewrite) routes through here, so
+        // one unconditional bump subsumes the whole subterm enumeration.  It
+        // over-bumps `subst_system_once`'s own subterm use — a free over-bump:
+        // the bump lands DURING the pass, the marker captures the post-pass
+        // stamp, and the next skip still fires if no EXTERNAL write intervened.
+        self.bump_content_stamp();
+        Arc::make_mut(&mut self.content.subterm_store)
     }
 
     // ====== max_var_idx_cache maintenance ======
@@ -402,6 +810,12 @@ impl System {
     /// eq-store simp, node removal, ...).  Cheap (single `Cell::set`).
     #[inline]
     pub fn invalidate_max_var_idx_cache(&self) {
+        // CONTENT-axis choke (shared with the max-var-idx cache): every
+        // value-lowering mutation of the nine fields `subst_system_once` reads
+        // already funnels through this call, so bumping `content_stamp` here
+        // — plus in the additive `bump_cache_*` helpers below — inherits the
+        // max-var cache's proven-complete enumeration of content mutations.
+        self.bump_content_stamp();
         self.max_var_idx_cache.set(None);
     }
 
@@ -414,6 +828,7 @@ impl System {
     /// the full cache and MUST leave this one intact.
     #[inline]
     pub fn invalidate_node_max_cache(&self) {
+        self.bump_content_stamp();
         self.node_max_cache.set(None);
     }
 
@@ -456,6 +871,11 @@ impl System {
     /// Bump the cache for a newly-added LVar.  No-op if invalidated.
     #[inline]
     pub fn bump_cache_lvar(&self, v: &tamarin_term::lterm::LVar) {
+        // CONTENT-axis choke (additive): called on every content-growing write
+        // (add_node/edge/less/goal, insert_last, ...).  Bump UNCONDITIONALLY —
+        // even when the new var's idx is <= the cached max (numeric no-op), the
+        // field still grew, so the marker must invalidate.
+        self.bump_content_stamp();
         if let Some(cur) = self.max_var_idx_cache.get() {
             if v.idx > cur {
                 self.max_var_idx_cache.set(Some(v.idx));
@@ -466,6 +886,7 @@ impl System {
     /// Bump the cache by walking a term.
     #[inline]
     pub fn bump_cache_term(&self, t: &tamarin_term::lterm::LNTerm) {
+        self.bump_content_stamp();
         if let Some(cur) = self.max_var_idx_cache.get() {
             let mut m = cur;
             crate::constraint::solver::reduction::bm_term_pub(t, &mut m);
@@ -476,6 +897,7 @@ impl System {
     /// Bump the cache by walking a fact's terms.
     #[inline]
     pub fn bump_cache_fact(&self, fa: &crate::fact::LNFact) {
+        self.bump_content_stamp();
         if let Some(cur) = self.max_var_idx_cache.get() {
             let mut m = cur;
             crate::constraint::solver::reduction::bm_fact_pub(fa, &mut m);
@@ -486,6 +908,7 @@ impl System {
     /// Bump the cache by walking a rule's free vars.
     #[inline]
     pub fn bump_cache_rule(&self, r: &crate::rule::RuleACInst) {
+        self.bump_content_stamp();
         if let Some(cur) = self.max_var_idx_cache.get() {
             let mut m = cur;
             crate::constraint::solver::reduction::bm_rule_pub(r, &mut m);
@@ -496,6 +919,7 @@ impl System {
     /// Bump the cache by walking a guarded formula.
     #[inline]
     pub fn bump_cache_guarded(&self, f: &Guarded) {
+        self.bump_content_stamp();
         if let Some(cur) = self.max_var_idx_cache.get() {
             let n = crate::guarded::max_var_idx(f);
             if n > cur { self.max_var_idx_cache.set(Some(n)); }
@@ -505,6 +929,9 @@ impl System {
     /// Bump the cache by walking a goal.
     #[inline]
     pub fn bump_cache_goal(&self, g: &Goal) {
+        // Bump BEFORE the cache-None early return so a goal add still moves
+        // `content_stamp` when the max-var cache is currently invalidated.
+        self.bump_content_stamp();
         if self.max_var_idx_cache.get().is_none() { return; }
         match g {
             Goal::Action(i, fa) => {
@@ -664,7 +1091,7 @@ impl System {
         if !self.edges.contains(&e) {
             self.bump_cache_lvar(&e.src.0);
             self.bump_cache_lvar(&e.tgt.0);
-            self.edges.push(e);
+            self.content.edges.push(e);
         }
     }
 
@@ -687,12 +1114,12 @@ impl System {
         // `InjectiveFacts`, driving the less-edge's graph colour. The reason
         // is metadata for rendering only (read solely by `Dot.hs`/graph
         // simplification); replace in place to preserve iteration order.
-        if let Some(existing) = self.less_atoms.iter_mut().find(|x| **x == l) {
+        if let Some(existing) = self.content.less_atoms.iter_mut().find(|x| **x == l) {
             *existing = l;
         } else {
             self.bump_cache_lvar(&l.smaller);
             self.bump_cache_lvar(&l.larger);
-            self.less_atoms.push(l);
+            self.content.less_atoms.push(l);
         }
     }
 
@@ -729,13 +1156,13 @@ impl System {
     pub fn add_less_indexed(&mut self, l: LessAtom, idx: &mut LessIndex) -> bool {
         let key = (l.smaller.clone(), l.larger.clone());
         if let Some(&pos) = idx.get(&key) {
-            self.less_atoms[pos] = l;
+            self.content.less_atoms[pos] = l;
             false
         } else {
             self.bump_cache_lvar(&l.smaller);
             self.bump_cache_lvar(&l.larger);
             let pos = self.less_atoms.len();
-            self.less_atoms.push(l);
+            self.content.less_atoms.push(l);
             idx.insert(key, pos);
             true
         }
@@ -824,7 +1251,7 @@ impl System {
             other => {
                 if !crate::guarded::stores_contains(&self.lemmas, &other) {
                     self.bump_cache_guarded(&other);
-                    self.lemmas.push(Arc::new(other));
+                    self.content.lemmas.push(Arc::new(other));
                 }
             }
         }
@@ -893,7 +1320,7 @@ pub fn formula_to_system(
     let mut conj_items = vec![gf1];
     conj_items.extend(other_restrictions);
     let gf2 = gconj(conj_items);
-    sys.formulas.push(Arc::new(gf2));
+    sys.formulas_mut().push(Arc::new(gf2));
     // Safety restrictions are added as known-true lemmas.
     sys.insert_lemmas(safety);
     sys
@@ -911,6 +1338,218 @@ mod tests {
         assert!(s.nodes.is_empty());
         assert!(s.edges.is_empty());
         assert!(s.goals.is_empty());
+    }
+
+    // ===== verified-identity subst_system skip: stamp lifecycle =====
+
+    #[test]
+    fn next_stamp_strictly_increases() {
+        let a = tamarin_utils::next_stamp();
+        let b = tamarin_utils::next_stamp();
+        let c = tamarin_utils::next_stamp();
+        assert!(a < b && b < c);
+        assert_ne!(a, 0, "0 is the reserved sentinel");
+    }
+
+    #[test]
+    fn empty_mints_fresh_stamps_and_no_marker() {
+        let s = System::empty();
+        assert_ne!(s.content_stamp.get(), 0);
+        assert_ne!(s.subst_stamp.get(), 0);
+        assert_eq!(s.subst_applied_marker.get(), None);
+    }
+
+    #[test]
+    fn clone_copies_stamps_and_marker_verbatim() {
+        let s = System::empty();
+        s.subst_applied_marker.set(Some((7, 9)));
+        let c = s.clone();
+        assert_eq!(c.content_stamp.get(), s.content_stamp.get());
+        assert_eq!(c.subst_stamp.get(), s.subst_stamp.get());
+        assert_eq!(c.subst_applied_marker.get(), Some((7, 9)));
+    }
+
+    #[test]
+    fn content_mutation_bumps_content_stamp_leaving_parent_untouched() {
+        let parent = System::empty();
+        let c0 = parent.content_stamp.get();
+        let mut child = parent.clone();
+        assert_eq!(child.content_stamp.get(), c0, "clone inherits verbatim");
+        let v = LVar::new("k", LSort::Msg, 0);
+        let f = LNFact::new(crate::fact::FactTag::Out, vec![]);
+        child.add_goal(Goal::Action(v, f));
+        assert_ne!(child.content_stamp.get(), c0, "add_goal bumps the child");
+        assert_eq!(parent.content_stamp.get(), c0, "parent untouched");
+    }
+
+    #[test]
+    fn set_eq_store_bumps_subst_stamp() {
+        let mut s = System::empty();
+        let b0 = s.subst_stamp.get();
+        s.set_eq_store(std::sync::Arc::new(
+            crate::tools::equation_store::EquationStore::default()));
+        assert_ne!(s.subst_stamp.get(), b0);
+    }
+
+    #[test]
+    fn eq_store_mut_bumps_subst_stamp() {
+        let mut s = System::empty();
+        let b0 = s.subst_stamp.get();
+        let _ = s.eq_store_mut();
+        assert_ne!(s.subst_stamp.get(), b0);
+    }
+
+    #[test]
+    fn stamps_and_marker_excluded_from_partial_eq() {
+        let a = System::empty();
+        let b = a.clone();
+        // Diverge every stamp/marker cell but keep content identical.
+        b.content_stamp.set(a.content_stamp.get().wrapping_add(1));
+        b.subst_stamp.set(a.subst_stamp.get().wrapping_add(1));
+        b.subst_applied_marker.set(Some((123, 456)));
+        assert_eq!(a, b, "PartialEq must ignore the stamp/marker cells");
+    }
+
+    /// The `content_mut_untracked()` escape hatch (no stamp
+    /// bump, no cache invalidation) may be called ONLY from the closed set of
+    /// whole-system rewriters that manage the stamps/caches themselves.  A new
+    /// caller fails the build until its stamp reasoning is established (the
+    /// subst axis is sealed separately: `SealedEqStore` makes a raw `eq_store`
+    /// assignment inexpressible).
+    ///
+    /// Scans the WHOLE crate `src/` (the method is `pub(crate)`, so its
+    /// visibility scope is the whole crate — the scan scope must match).  For
+    /// each `.content_mut_untracked()` CALL it records the nearest preceding
+    /// `fn <name>` and asserts the caller-name set is within the whitelist.
+    #[test]
+    fn content_untracked_callers_are_enumerated() {
+        const ALLOWED: &[&str] = &[
+            "subst_system_once",
+            "set_nodes",
+            "freshen_system",
+            "freshen_system_keep_with_shift",
+            "freshen_system_some_inst",
+            "rename_precise_system",
+            "normalise_less_atoms_pass",
+        ];
+        let src_root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        // Build the call needle by concatenation so THIS test's own source
+        // (and the accessor's doc comment) never contains the literal verbatim
+        // and cannot self-flag.  A CALL is `.<method>()`; the definition
+        // `fn <method>` has no leading dot and is excluded.
+        let needle = [".", "content_mut_untracked", "()"].concat();
+        let mut offenders: Vec<String> = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(src_root)];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() { stack.push(path); continue; }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") { continue; }
+                let src = std::fs::read_to_string(&path).expect("read source");
+                let mut cur_fn = String::from("<file-scope>");
+                for line in src.lines() {
+                    let trimmed = line.trim_start();
+                    // Stop at the file's `#[cfg(test)]` / `mod tests` boundary:
+                    // unit tests legitimately exercise the accessor and must not
+                    // count as production callers (test modules sit at file end).
+                    if trimmed.starts_with("#[cfg(test)]")
+                        || trimmed.starts_with("mod tests")
+                    {
+                        break;
+                    }
+                    if let Some(rest) = trimmed.strip_prefix("fn ")
+                        .or_else(|| trimmed.strip_prefix("pub fn "))
+                        .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+                    {
+                        let name: String = rest.chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
+                        if !name.is_empty() { cur_fn = name; }
+                    }
+                    if trimmed.starts_with("//") { continue; }
+                    if line.contains(&needle)
+                        && !ALLOWED.contains(&cur_fn.as_str())
+                    {
+                        offenders.push(format!("{} in fn {}", path.display(), cur_fn));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "content_mut_untracked() called from non-whitelisted fn(s) \
+             (verify its stamp discipline, then add to ALLOWED): {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn content_mut_bumps_both_stamps_and_invalidates_caches() {
+        let mut s = System::empty();
+        s.max_var_idx_cache.set(Some(5));
+        s.node_max_cache.set(Some(5));
+        let c0 = s.content_stamp.get();
+        let b0 = s.subst_stamp.get();
+        let _ = s.content_mut();
+        assert_ne!(s.content_stamp.get(), c0, "content_mut bumps content_stamp");
+        assert_ne!(s.subst_stamp.get(), b0, "content_mut bumps subst_stamp");
+        assert_eq!(s.max_var_idx_cache.get(), None, "content_mut clears max cache");
+        assert_eq!(s.node_max_cache.get(), None, "content_mut clears node cache");
+    }
+
+    #[test]
+    fn content_mut_untracked_bumps_nothing() {
+        let mut s = System::empty();
+        s.max_var_idx_cache.set(Some(5));
+        let c0 = s.content_stamp.get();
+        let b0 = s.subst_stamp.get();
+        let _ = s.content_mut_untracked();
+        assert_eq!(s.content_stamp.get(), c0, "untracked door does not bump content");
+        assert_eq!(s.subst_stamp.get(), b0, "untracked door does not bump subst");
+        assert_eq!(s.max_var_idx_cache.get(), Some(5), "untracked door leaves caches");
+    }
+
+    #[test]
+    fn deref_reads_reach_content_fields() {
+        // Compile-level coverage that reads auto-deref through `SystemContent`.
+        let s = System::empty();
+        assert_eq!(s.nodes.len(), 0);
+        assert_eq!(s.edges.len(), 0);
+        assert_eq!(s.less_atoms.len(), 0);
+        assert_eq!(s.formulas.len(), 0);
+        assert_eq!(s.goals.len(), 0);
+        assert!(s.last_atom.is_none());
+        assert!(s.eq_store.subst.is_empty());
+    }
+
+    #[test]
+    fn formula_accessors_bump_content_stamp() {
+        let mut s = System::empty();
+        for pick in 0..3 {
+            let c0 = s.content_stamp.get();
+            match pick {
+                0 => { let _ = s.formulas_mut(); }
+                1 => { let _ = s.solved_formulas_mut(); }
+                _ => { let _ = s.lemmas_mut(); }
+            }
+            assert_ne!(s.content_stamp.get(), c0, "formula accessor bumps content_stamp");
+        }
+    }
+
+    #[test]
+    fn set_last_atom_bumps_content_stamp() {
+        let mut s = System::empty();
+        let c0 = s.content_stamp.get();
+        s.set_last_atom(None);
+        assert_ne!(s.content_stamp.get(), c0);
+    }
+
+    #[test]
+    fn take_eq_store_bumps_subst_stamp_and_takes() {
+        let mut s = System::empty();
+        let b0 = s.subst_stamp.get();
+        let taken = s.take_eq_store();
+        assert_ne!(s.subst_stamp.get(), b0, "take_eq_store bumps subst_stamp");
+        assert!(taken.subst.is_empty());
     }
 
     #[test]

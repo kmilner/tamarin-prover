@@ -1010,7 +1010,7 @@ pub const LINE_LENGTH: usize = 110;
 /// (that conflates a msg-position `k` with a sibling `#k` timepoint binder);
 /// instead we look up the binder whose sort matches this occurrence's
 /// resolved sort, exactly as HS's `lookup`/`show` does after by-position
-/// sorting.  Falls back to the old innermost-name behaviour only when no
+/// sorting.  Falls back to innermost-name selection only when no
 /// sort-matching binder exists, preserving the single-binder cases.
 fn resolved_sort_pos(v: &p::VarSpec, scope: &[Bind], temporal: bool) -> p::SortHint {
     if temporal {

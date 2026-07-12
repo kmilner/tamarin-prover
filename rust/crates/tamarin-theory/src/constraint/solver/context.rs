@@ -1004,13 +1004,11 @@ pub fn annotate_loop_breakers(
             fa.for_each_free(&mut |v| { if v.idx + 1 > avoid_max { avoid_max = v.idx + 1; } });
             let mut next = avoid_max;
             let free = s.fresh_to_free(|_| { let i = next; next += 1; i });
-            crate::fact::LNFact {
-                tag: fa.tag.clone(),
-                annotations: fa.annotations.clone(),
-                terms: fa.terms.iter()
-                    .map(|t| tamarin_term::subst::apply_vterm(&free, t.clone()))
-                    .collect(),
-            }
+            // freshToFree rename + apply — frees change; recompute the bloom.
+            let terms: Vec<tamarin_term::lterm::LNTerm> = fa.terms.iter()
+                .map(|t| tamarin_term::subst::apply_vterm(&free, t.clone()))
+                .collect();
+            crate::fact::LNFact::fresh_annotated(fa.tag.clone(), fa.annotations.clone(), terms)
         }).collect()
     };
 

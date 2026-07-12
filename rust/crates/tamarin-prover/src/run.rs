@@ -11,6 +11,14 @@
 //! `--parse-only` is the one path that re-emits the source verbatim
 //! (no analysis); all other modes go through the pretty-printer.
 
+// Sanctioned stdout path: this is the batch-mode CLI output module — it emits
+// the analyzed-theory document and progress lines to stdout by design (the
+// byte-parity surface itself).  `println!`/`print!` are the intended output
+// mechanism here, so the `disallowed_macros` convention freeze is allowed for
+// this file.  (Library crates stay guarded; only the binary's output paths and
+// examples carry this allow.)
+#![allow(clippy::disallowed_macros)]
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -524,9 +532,9 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
     // `using parList`/`parTraversable`/`parMap` sites HS uses (see
     // `lib/theory/src/Prover.hs:102,195`, `Theory/Constraint/Solver/Sources.hs`,
     // `lib/theory/src/TheoryObject.hs:744,752`).  Default: full machine
-    // parallelism (`available_parallelism()`, uncapped — `MaudePool`
-    // removed the Maude IPC mutex contention that previously made larger
-    // pools unproductive; memory is budgeted via `--maude-processes`).
+    // parallelism (`available_parallelism()`, uncapped — Maude IPC runs
+    // through the contention-free `MaudePool`, so larger pools scale;
+    // memory is budgeted via `--maude-processes`).
     // `--processors=1` falls back to a 1-thread pool, guaranteeing
     // byte-identical output to the pre-parallel sequential path.
     init_rayon_pool(args);

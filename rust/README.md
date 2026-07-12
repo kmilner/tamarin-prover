@@ -1,16 +1,16 @@
 # tamarin-prover (Rust port)
 
 A Rust port of the [Tamarin Prover](https://tamarin-prover.github.io/) that
-reproduces the Haskell prover's output byte-for-byte — and is 2–37× faster
-on several-fold less memory.
+reproduces the Haskell prover's output byte-for-byte — and is typically
+4–15× faster (up to 38×) on several-fold less memory.
 
 - **Parity:** byte-identical `--prove` output with the Haskell prover on a
   402-file corpus — every theory under `examples/` that uses only ported
   features. Stored proofs replay and validate across provers in both
   directions, and the interactive web UI agrees page-for-page with the
   Haskell server across ≈380 theories / ≈120,000 crawled pages.
-- **Performance:** 2–37× faster across 1–16 cores with several-fold less
-  peak memory (≈4–26× at one core) — see [Performance](#performance).
+- **Performance:** 1.6–38× faster across 1–16 cores (median ≈7×), with
+  peak memory 2–21× lower at one core — see [Performance](#performance).
 - **Not yet ported:** observational equivalence (`--diff`) and the
   accountability frontend — see [Not yet ported](#not-yet-ported).
 - **Verification:** [TESTING.md](TESTING.md) documents the parity-gate
@@ -101,44 +101,46 @@ TIMEOUT, DERIV, HS_PATH, RS_PATH env vars (see the scripts/bench.sh header).
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 2.3 s | 0.5 s (-78%) | 62 MB | 17 MB (-73%) |
-| `Joux` | 18.2 s | 4.6 s (-75%) | 239 MB | 43 MB (-82%) |
-| `stateverif_left_right` | 29.0 s | 4.2 s (-86%) | 792 MB | 35 MB (-96%) |
-| `Yubikey` | 37.9 s | 5.5 s (-85%) | 283 MB | 44 MB (-84%) |
-| `gcm` | 95.2 s | 15.4 s (-84%) | 1275 MB | 86 MB (-93%) |
-| `wireguard` | 98.1 s | 8.4 s (-91%) | 1236 MB | 47 MB (-96%) |
-| `CCITT_X509_3` | 372.2 s | 34.6 s (-91%) | 2505 MB | 297 MB (-88%) |
+| `NSPK3` | 2.4 s | 0.5 s (-79%) | 63 MB | 26 MB (-59%) |
+| `Joux` | 18.5 s | 4.6 s (-75%) | 248 MB | 66 MB (-73%) |
+| `stateverif_left_right` | 29.2 s | 4.2 s (-86%) | 855 MB | 51 MB (-94%) |
+| `Yubikey` | 38.2 s | 5.4 s (-86%) | 281 MB | 67 MB (-76%) |
+| `gcm` | 96.1 s | 15.0 s (-84%) | 1275 MB | 100 MB (-92%) |
+| `wireguard` | 99.9 s | 7.7 s (-92%) | 1233 MB | 60 MB (-95%) |
+| `CCITT_X509_3` | 372.4 s | 32.2 s (-91%) | 2419 MB | 317 MB (-87%) |
 
 **4 cores**
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 1.2 s | 0.4 s (-67%) | 82 MB | 25 MB (-70%) |
-| `Joux` | 15.7 s | 6.4 s (-59%) | 285 MB | 48 MB (-83%) |
-| `stateverif_left_right` | 17.7 s | 2.8 s (-84%) | 774 MB | 58 MB (-93%) |
-| `Yubikey` | 24.2 s | 4.1 s (-83%) | 303 MB | 72 MB (-76%) |
-| `gcm` | 69.3 s | 7.6 s (-89%) | 1279 MB | 154 MB (-88%) |
-| `wireguard` | 61.7 s | 4.8 s (-92%) | 1247 MB | 79 MB (-94%) |
-| `CCITT_X509_3` | 157.4 s | 9.6 s (-94%) | 4336 MB | 531 MB (-88%) |
+| `NSPK3` | 1.2 s | 0.4 s (-67%) | 85 MB | 56 MB (-34%) |
+| `Joux` | 15.9 s | 6.3 s (-60%) | 271 MB | 75 MB (-72%) |
+| `stateverif_left_right` | 18.1 s | 2.6 s (-86%) | 849 MB | 76 MB (-91%) |
+| `Yubikey` | 25.2 s | 4.2 s (-83%) | 294 MB | 102 MB (-65%) |
+| `gcm` | 71.9 s | 7.3 s (-90%) | 1253 MB | 186 MB (-85%) |
+| `wireguard` | 62.5 s | 4.3 s (-93%) | 1236 MB | 99 MB (-92%) |
+| `CCITT_X509_3` | 159.9 s | 9.0 s (-94%) | 4180 MB | 591 MB (-86%) |
 
 **16 cores**
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 1.2 s | 0.7 s (-42%) | 133 MB | 35 MB (-74%) |
-| `Joux` | 15.9 s | 6.6 s (-58%) | 312 MB | 55 MB (-82%) |
-| `stateverif_left_right` | 17.7 s | 2.7 s (-85%) | 829 MB | 81 MB (-90%) |
-| `Yubikey` | 24.9 s | 3.9 s (-84%) | 351 MB | 151 MB (-57%) |
-| `gcm` | 65.7 s | 5.7 s (-91%) | 1346 MB | 276 MB (-79%) |
-| `wireguard` | 49.1 s | 4.7 s (-90%) | 1323 MB | 130 MB (-90%) |
-| `CCITT_X509_3` | 142.2 s | 3.8 s (-97%) | 6002 MB | 686 MB (-89%) |
+| `NSPK3` | 1.3 s | 0.8 s (-38%) | 133 MB | 106 MB (-20%) |
+| `Joux` | 16.4 s | 6.6 s (-60%) | 325 MB | 103 MB (-68%) |
+| `stateverif_left_right` | 17.6 s | 2.8 s (-84%) | 859 MB | 148 MB (-83%) |
+| `Yubikey` | 24.4 s | 3.9 s (-84%) | 368 MB | 215 MB (-42%) |
+| `gcm` | 59.1 s | 5.7 s (-90%) | 1322 MB | 322 MB (-76%) |
+| `wireguard` | 48.4 s | 4.3 s (-91%) | 1335 MB | 184 MB (-86%) |
+| `CCITT_X509_3` | 142.4 s | 3.7 s (-97%) | 5791 MB | 780 MB (-87%) |
 
 <!-- BENCH:END -->
 
 Memory is the maximum resident set of the prover process; Maude runs as a
 separate subprocess on both sides and is excluded. Across all theories and
-core counts the Rust port is 2–37× faster and uses several-fold less memory
-— ≈4–26× at one core, ≈2–10× at sixteen.
+core counts the Rust port is 1.6–38× faster (median ≈7×); peak memory is
+2–21× lower at one core and 1.2–7× lower at sixteen. The worst cells are
+the sub-second `NSPK3` runs, where startup and timer granularity dominate
+both provers.
 
 The port parallelises at two levels, both via rayon: independent lemmas are
 proved concurrently, and within a lemma the proof-search fan-out and source

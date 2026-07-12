@@ -1354,8 +1354,8 @@ fn sort_tag(s: crate::lterm::LSort) -> &'static str {
 
 /// Build a conjunction-equation Maude command: `<prefix>lhs =? rhs /\ ... .\n`.
 /// Shared by `unify` (with the AC residual eqs) and `variant_unify_eqs`; each
-/// side is converted via `lterm_to_mterm_global` threading the shared `ctx`, so
-/// the emitted wire command is byte-identical to the former inline loops.
+/// side is converted via `lterm_to_mterm_global` threading the shared `ctx`,
+/// so both call sites emit one identical wire encoding.
 fn build_conj_eqs_cmd(
     prefix: &[u8],
     eqs: &[Equal<LNTerm>],
@@ -1721,6 +1721,7 @@ impl MaudePool {
 
 /// A borrowed Maude handle from a `MaudePool`.  `Deref`s to
 /// `MaudeHandle`; releases back to the pool on `Drop`.
+#[must_use = "dropping this guard immediately ends the scope it protects"]
 pub struct PooledMaude<'a> {
     pool: &'a MaudePool,
     inner: Option<MaudeHandle>,

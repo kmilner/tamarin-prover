@@ -179,6 +179,9 @@ pub fn is_applicable_for_display(
 ///     [ (\(x,y) -> (... x ++ "_case_" ++ pad (show i), y)) | i <- [1..] ]
 ///     where l = length (show n); pad cs = replicate (l - length cs) '0' ++ cs
 /// so total<10 → width 1 (no padding); total>=10 → width 2 ("01"..); etc.
+// case-name counters; output order follows the ordered cases Vec, maps keyed only;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn distinguish_case_names(cases: Vec<(String, System)>) -> Vec<(String, System)> {
     use std::collections::HashMap;
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -642,8 +645,8 @@ pub fn exec_proof_method(
                 // rationale above).
                 let mut case_sys = sys.clone();
                 case_sys.invalidate_max_var_idx_cache();
-                case_sys.formulas.clear();
-                case_sys.formulas.push(std::sync::Arc::new(fm_case));
+                case_sys.formulas_mut().clear();
+                case_sys.formulas_mut().push(std::sync::Arc::new(fm_case));
                 let sub_systems: Vec<System> =
                     crate::constraint::solver::simplify::simplify_system_with_fanout(
                         ctx, case_sys);
@@ -758,7 +761,7 @@ mod tests {
         // solved formula (Haskell `isInitialSystem` checks
         // `solved_formulas.is_empty() && no_gfalse`; setting one to
         // gtrue makes the system non-initial).
-        s.solved_formulas.push(std::sync::Arc::new(crate::guarded::gtrue()));
+        s.solved_formulas_mut().push(std::sync::Arc::new(crate::guarded::gtrue()));
         // Add a placeholder node too so the structure is non-trivial.
         let nid = tamarin_term::lterm::LVar::new("i", tamarin_term::lterm::LSort::Node, 0);
         use crate::rule::{
@@ -794,7 +797,7 @@ mod tests {
         let mut s = System::empty();
         // gfalse in formulas makes the system non-initial AND yields a
         // `FormulasFalse` contradiction.
-        s.formulas.push(std::sync::Arc::new(crate::guarded::gfalse()));
+        s.formulas_mut().push(std::sync::Arc::new(crate::guarded::gfalse()));
         match is_finished(&ctx, &s) {
             Some(Result::Contradictory(Some(Contradiction::FormulasFalse))) => {}
             r => panic!("expected Contradictory(FormulasFalse), got {:?}", r),
@@ -850,7 +853,7 @@ mod tests {
             body,
         );
         let mut s = System::empty();
-        s.formulas.push(std::sync::Arc::new(fm));
+        s.formulas_mut().push(std::sync::Arc::new(fm));
         let r = exec_proof_method(&ctx, &ProofMethod::Induction, &s).expect("induction");
         // Two case names: empty_trace and non_empty_trace.
         assert_eq!(r.len(), 2);

@@ -2,14 +2,17 @@
 //!
 //! Usage: `cargo run --example dump_proof -- <theory.spthy> <lemma>`
 
+// Example/dev tool: dumps the proof tree to stdout by design; allow the
+// `disallowed_macros` convention freeze for this example binary.
+#![allow(clippy::disallowed_macros)]
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use tamarin_parser::parse_theory;
-use tamarin_theory::elaborate::elaborate;
 use tamarin_theory::prove::prove_lemma;
 use tamarin_theory::proof_skeleton::render;
-use tamarin_term::maude_proc::MaudeHandle;
+
+mod common;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -20,17 +23,7 @@ fn main() {
     let theory_path = &args[1];
     let lemma = &args[2];
 
-    let source = std::fs::read_to_string(theory_path).expect("read theory");
-    let parsed = parse_theory(&source, &[]).expect("parse theory");
-    // Need the elaborated theory to extract the full MaudeSig
-    // (includes aenc/pk/etc.).  Using default sig means Maude won't
-    // know the user-declared symbols, producing a wrong proof tree.
-    let elaborated = elaborate(&parsed).expect("elaborate");
-
-    // Resolve maude from $MAUDE_PATH, else `maude` on PATH.
-    let maude_path = std::env::var("MAUDE_PATH").unwrap_or_else(|_| "maude".to_string());
-    let maude_sig = elaborated.signature.maude_sig.clone();
-    let maude = MaudeHandle::start(&maude_path, maude_sig).expect("start maude");
+    let (parsed, _elaborated, maude) = common::load_theory_with_maude(theory_path);
 
     let root = prove_lemma(&parsed, lemma, maude, 500).expect("prove");
     let steps = count_steps(&root);

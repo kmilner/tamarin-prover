@@ -9,8 +9,11 @@
 
 pub mod abbreviation;
 pub mod options;
+pub mod render_system;
 pub mod repr;
 pub mod simplify;
+
+pub use render_system::RenderSystem;
 
 pub use options::{GraphOptions, graph_options_from_query, graph_options_from_params};
 pub use repr::{

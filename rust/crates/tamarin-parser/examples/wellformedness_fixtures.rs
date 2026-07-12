@@ -13,6 +13,10 @@
 //! Pass `--no-tamarin` to skip the Tamarin oracle pass (e.g. on systems
 //! without the binary installed).
 
+// Example/dev tool: prints fixture results to stdout by design; allow the
+// `disallowed_macros` convention freeze for this example binary.
+#![allow(clippy::disallowed_macros)]
+
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;

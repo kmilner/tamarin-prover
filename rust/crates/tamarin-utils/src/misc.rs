@@ -6,6 +6,9 @@
 //! Intentionally retained: faithful `Utils.Misc` mirror. Only `two_partitions`
 //! has a live caller; the rest are kept for completeness of the port.
 
+// generic map-utility import; invert_map returns a new map, never rendered;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::hash::Hash;
@@ -77,6 +80,9 @@ where
 // -- Map helpers --------------------------------------------------------------
 
 /// `invertMap`: swap keys and values of a bijective map.
+// generic map inverter; returns a map by key, never iterated into output;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 pub fn invert_map<K, V>(m: HashMap<K, V>) -> HashMap<V, K>
 where
     V: Eq + Hash,
@@ -286,6 +292,9 @@ mod tests {
     }
 
     #[test]
+    // unit test over a deterministic literal map;
+    // std kept (byte-inert) — iteration order never reaches output.
+    #[allow(clippy::disallowed_types)]
     fn invert_map_bijective() {
         let m: HashMap<i32, &str> =
             HashMap::from([(1, "a"), (2, "b"), (3, "c")]);

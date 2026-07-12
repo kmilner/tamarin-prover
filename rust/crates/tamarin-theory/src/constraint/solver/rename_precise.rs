@@ -18,8 +18,6 @@
 //! so we walk each field by hand. The walk-order mirrors
 //! `Reduction::subst_system_once` so any future cross-checks stay aligned.
 
-use tamarin_utils::FastMap;
-
 use tamarin_term::lterm::{HasFrees, LVar, LNTerm};
 use tamarin_term::subst::Subst;
 use tamarin_term::term::Term;
@@ -222,11 +220,16 @@ pub fn rename_precise_system(sys: &mut System) {
     if map.is_empty() { return; }
     if any_remap {
         sys.invalidate_max_var_idx_cache();
+        // Whole-system alpha-rename: no inherited verified-no-op verdict
+        // survives a domain/range rename.  The Phase-2
+        // eq-store rewrite (via `eq_store_mut`) already bumps `subst_stamp`;
+        // clear the marker explicitly too.
+        sys.clear_subst_marker();
     }
 
     let term_subst: Subst<tamarin_term::lterm::Name, LVar> = Subst::from_list(
         map.iter().map(|(old, new)| {
-            (old.clone(), Term::Lit(Lit::Var(new.clone())))
+            (old.0.clone(), Term::Lit(Lit::Var(new.clone())))
         }),
     );
     // Hashed leaf-lookup view over the pass-invariant rename subst
@@ -239,8 +242,8 @@ pub fn rename_precise_system(sys: &mut System) {
     let formula_subst: VarSubst = map.iter().map(|(old, new)| {
         let sort = lvar_sort_to_sort_hint(new.sort);
         (
-            // `old.name` is an interned `&'static str` — zero-alloc key.
-            (old.name, old.idx),
+            // `old.0.name` is an interned `&'static str` — zero-alloc key.
+            (old.0.name, old.0.idx),
             tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
                 name: new.name.to_string(),
                 idx: new.idx,
@@ -285,16 +288,16 @@ pub fn rename_precise_system(sys: &mut System) {
             // Identity rename ⇒ the (id, rule) multiset is unchanged; only the
             // HS `M.fromList` ascending-NodeId storage order needs restoring.
             // Node-component max is unchanged, so its cache stays valid.
-            let mut nodes = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.nodes));
+            let mut nodes = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.content_mut_untracked().nodes));
             nodes.sort_by(|a, b| a.0.cmp(&b.0));
-            sys.nodes = std::sync::Arc::new(nodes);
+            sys.content_mut_untracked().nodes = std::sync::Arc::new(nodes);
         }
     } else {
         // Real rename: node var idxs are remapped (almost always lower), so
         // the node-component max can drop — invalidate its cache here (the
         // one site that actually rewrites nodes).
         sys.invalidate_node_max_cache();
-        let nodes = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.nodes));
+        let nodes = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.content_mut_untracked().nodes));
         let mut renamed: Vec<(crate::constraint::constraints::NodeId, crate::rule::RuleACInst)>
             = nodes.into_iter().map(|(id, rule)| {
                 let new_id = map_var(id);
@@ -302,23 +305,23 @@ pub fn rename_precise_system(sys: &mut System) {
                 (new_id, new_rule)
             }).collect();
         renamed.sort_by(|a, b| a.0.cmp(&b.0));
-        sys.nodes = std::sync::Arc::new(renamed);
+        sys.content_mut_untracked().nodes = std::sync::Arc::new(renamed);
     }
 
     // 2. Edges.
-    for e in sys.edges.iter_mut() {
+    for e in sys.content_mut_untracked().edges.iter_mut() {
         e.src.0 = map_var(e.src.0.clone());
         e.tgt.0 = map_var(e.tgt.0.clone());
     }
     // Dedup after rename — sort + dedup (matches subst_system).
-    let mut tmp: Vec<_> = std::mem::take(&mut sys.edges);
+    let mut tmp: Vec<_> = std::mem::take(&mut sys.content_mut_untracked().edges);
     tmp.sort();
     tmp.dedup();
-    sys.edges = tmp;
+    sys.content_mut_untracked().edges = tmp;
 
     // 3. Last atom.
-    if let Some(la) = sys.last_atom.take() {
-        sys.last_atom = Some(map_var(la));
+    if let Some(la) = sys.content_mut_untracked().last_atom.take() {
+        sys.content_mut_untracked().last_atom = Some(map_var(la));
     }
 
     // 4. Less atoms.
@@ -332,7 +335,7 @@ pub fn rename_precise_system(sys: &mut System) {
     // (Term/LTerm.hs:827 `fmap S.fromList . mapFrees f . S.toList`).
     let mut new_less: Vec<crate::constraint::constraints::LessAtom>
         = Vec::with_capacity(sys.less_atoms.len());
-    for la in std::mem::take(&mut sys.less_atoms) {
+    for la in std::mem::take(&mut sys.content_mut_untracked().less_atoms) {
         let mut la = la;
         la.smaller = map_var(la.smaller.clone());
         la.larger  = map_var(la.larger.clone());
@@ -342,19 +345,20 @@ pub fn rename_precise_system(sys: &mut System) {
     // set rather than an O(n^2) membership scan.
     new_less.sort();
     new_less.dedup();
-    sys.less_atoms = new_less;
+    sys.content_mut_untracked().less_atoms = new_less;
 
     // 5. Goals — per-variant rewrite.
-    let goals = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.goals));
+    let goals = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.content_mut_untracked().goals));
     let apply_term = |t: LNTerm| -> LNTerm {
         term_view.apply(t)
     };
     let apply_fact = |fa: crate::fact::LNFact| -> crate::fact::LNFact {
-        crate::fact::Fact {
-            tag: fa.tag,
-            annotations: fa.annotations,
-            terms: fa.terms.into_iter().map(&apply_term).collect(),
-        }
+        // Var→var rename is a frees-changing rebuild:
+        // recompute the bloom from the renamed terms — NEVER copy `fa`'s.
+        let terms: Vec<LNTerm> = fa.terms.into_iter().map(&apply_term).collect();
+        // Computing constructor — recomputes the bloom from the renamed terms
+        // internally (never copies `fa`'s stale bloom).
+        crate::fact::Fact::fresh_annotated(fa.tag, fa.annotations, terms)
     };
     let mut new_goals: Vec<(Goal, crate::constraint::system::GoalStatus)> =
         Vec::with_capacity(goals.len());
@@ -386,13 +390,13 @@ pub fn rename_precise_system(sys: &mut System) {
     // entries land in ascending NEW Goal order.
     //
     // Sort + dedup (O(n log n)) instead of an O(n^2) membership scan. We
-    // dedup on structural `Goal` equality (the old `any(eg == &g2)`
-    // relation) — NOT on `goal_cmp == Equal`, because `goal_cmp` orders
+    // dedup on structural `Goal` equality (plain `==`) — NOT on
+    // `goal_cmp == Equal`, because `goal_cmp` orders
     // Disj goals by len + canonical string and would over-collapse.
     new_goals.sort_by(|a, b|
         crate::constraint::solver::goals::goal_cmp(&a.0, &b.0));
     new_goals.dedup_by(|a, b| a.0 == b.0);
-    sys.goals = std::sync::Arc::new(new_goals);
+    sys.content_mut_untracked().goals = std::sync::Arc::new(new_goals);
 
     // 6. Formulas / solved / lemmas — via parser-level VarSubst.
     //
@@ -417,9 +421,9 @@ pub fn rename_precise_system(sys: &mut System) {
             v.dedup_by(|a, b| crate::guarded::cmp_guarded(a, b)
                 == std::cmp::Ordering::Equal);
         };
-        sort_dedup_guarded(&mut sys.formulas, &formula_subst);
-        sort_dedup_guarded(&mut sys.solved_formulas, &formula_subst);
-        sort_dedup_guarded(&mut sys.lemmas, &formula_subst);
+        sort_dedup_guarded(&mut sys.content_mut_untracked().formulas, &formula_subst);
+        sort_dedup_guarded(&mut sys.content_mut_untracked().solved_formulas, &formula_subst);
+        sort_dedup_guarded(&mut sys.content_mut_untracked().lemmas, &formula_subst);
     }
 
     // 7. eq_store — rewrite the subst (dom + range) and the conj.
@@ -491,27 +495,80 @@ pub fn rename_precise_system(sys: &mut System) {
     sys.subterm_store_mut().solved_subterms.dedup_by(|a, b|
         (&a.small, &a.big) == (&b.small, &b.big));
     // negSubterms are mapped too; oldNegSubterms are NOT (HS mapFrees
-    // keeps `oldNegSt` with `pure` — SubtermStore.hs:550-555).
-    for p in sys.subterm_store_mut().neg_subterms.iter_mut() {
-        p.0 = apply_term(p.0.clone());
-        p.1 = apply_term(p.1.clone());
-    }
-    sys.subterm_store_mut().neg_subterms.sort();
-    sys.subterm_store_mut().neg_subterms.dedup();
+    // keeps `oldNegSt` with `pure` — SubtermStore.hs:550-555).  Take the set
+    // out, map each pair, then `rebuild_from` re-establishes the sorted-unique
+    // set invariant on the rewritten pairs.
+    let mapped: Vec<(LNTerm, LNTerm)> =
+        std::mem::take(&mut sys.subterm_store_mut().neg_subterms)
+            .into_iter()
+            .map(|(s, t)| (apply_term(s), apply_term(t)))
+            .collect();
+    sys.subterm_store_mut().neg_subterms =
+        crate::tools::subterm_store::SortedPairSet::rebuild_from(mapped);
 }
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
+/// Rename-map key wrapping the original `LVar`.
+///
+/// `Hash` delegates to `LVar`'s content-based derive, so two vars with equal
+/// *content* always hash to the same bucket even when their interned name
+/// pointers differ (a rare non-canonical literal name vs the pooled copy) —
+/// this is what keeps the dedup correct and the `--prove` output byte-identical.
+/// Only `Eq` is optimised: `lvar_fast_eq` short-circuits on the interned name
+/// POINTER, skipping the byte-wise `str` compare that dominated `import`'s
+/// confirming-eq self time, and falls back to the exact content compare when
+/// the pointers differ — so the equality RELATION is exactly `LVar`'s.
+#[derive(Clone)]
+struct VarKey(LVar);
+
+impl PartialEq for VarKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool { lvar_fast_eq(&self.0, &other.0) }
+}
+impl Eq for VarKey {}
+impl std::hash::Hash for VarKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) { self.0.hash(state) }
+}
+// Lets `contains_key`/`get` probe by `&LVar` (no clone) yet run the fast eq.
+// The probe hashes via `LVar`'s derive (identical to `VarKey::hash`), so the
+// probe lands in the same bucket the owned key was stored in.
+impl hashbrown::Equivalent<VarKey> for LVar {
+    #[inline]
+    fn equivalent(&self, key: &VarKey) -> bool { lvar_fast_eq(self, &key.0) }
+}
+
+/// Exactly `LVar`'s content equality, faster: interned names share one
+/// canonical pointer (intern guarantees content-equal ⇒ pointer-equal), so a
+/// pointer+len match confirms the name without the byte compare; anything else
+/// falls back to the full content compare, so the relation is unchanged.
+#[inline]
+fn lvar_fast_eq(a: &LVar, b: &LVar) -> bool {
+    // Destructure without `..` so a new `LVar` field forces an equality decision
+    // here, keeping this fast path in step with `LVar`'s derived Eq.
+    let LVar { name: a_name, sort: a_sort, idx: a_idx } = a;
+    let LVar { name: b_name, sort: b_sort, idx: b_idx } = b;
+    // idx (u64) first — most discriminating, cheapest — then sort, so a
+    // hash-collision mismatch is rejected before the name is touched.
+    if a_idx != b_idx || a_sort != b_sort {
+        return false;
+    }
+    (std::ptr::eq(a_name.as_ptr(), b_name.as_ptr()) && a_name.len() == b_name.len())
+        || a_name == b_name
+}
+
+/// The rename map: keyed by `VarKey` (content hash, fast pointer eq), hashed
+/// with the same `FxBuildHasher` as `FastMap`.  Iteration order is never
+/// observed — `into_map` feeds only `Subst::from_list` (a re-sorted `BTreeMap`)
+/// and a distinct-key `VarSubst` applied by lookup.
+type RenameMap = hashbrown::HashMap<VarKey, LVar, rustc_hash::FxBuildHasher>;
+
 struct RenameState {
     fresh: PreciseFreshState,
-    // Lookup-only: keyed by the original `LVar`, queried via
-    // `contains_key`/`insert`, and the eventual `into_map` is consumed
-    // only by `Subst::from_list` (a `BTreeMap`, re-sorted) and a
-    // distinct-key `VarSubst` applied by lookup — so iteration order is
-    // never observed.
-    map: FastMap<LVar, LVar>,
+    map: RenameMap,
     /// Set the first time a var is bound to a DIFFERENT idx than its
     /// original.  `import` always preserves name+sort, so a fresh binding
     /// is the identity exactly when its allocated idx equals the original;
@@ -524,22 +581,29 @@ impl RenameState {
     fn new() -> Self {
         RenameState {
             fresh: PreciseFreshState::nothing_used(),
-            map: FastMap::default(),
+            map: RenameMap::default(),
             changed: false,
         }
     }
     /// `importBinding`: idempotent — first call for `v` allocates a fresh
     /// LVar keyed by `v.name`; later calls return the same binding.
     fn import(&mut self, v: &LVar) {
+        // Probe by `&LVar` (no clone) via `VarKey`'s `Equivalent` impl, whose
+        // `eq` short-circuits on the interned name POINTER — skipping the
+        // byte-wise `str` compare that dominated `import`'s confirming-eq self
+        // time (`equal_same_length` in the profile) — with a content fallback
+        // that keeps the equality RELATION exactly `LVar`'s.  The hash is still
+        // content-based (see `VarKey`), so equal-content vars — even with
+        // different name pointers — dedup into one slot: output is identical.
         if self.map.contains_key(v) { return; }
         let idx = self.fresh.fresh_ident(v.name);
         // Record whether this first binding remaps the idx (name+sort are
         // always preserved), so an all-identity prefix leaves `changed` false.
         if idx != v.idx { self.changed = true; }
-        let new_v = LVar { name: v.name, sort: v.sort, idx };
-        self.map.insert(v.clone(), new_v);
+        // First occurrence only (rare): materialise the owned key.
+        self.map.insert(VarKey(v.clone()), LVar { name: v.name, sort: v.sort, idx });
     }
-    fn into_map(self) -> FastMap<LVar, LVar> { self.map }
+    fn into_map(self) -> RenameMap { self.map }
 }
 
 fn lvar_sort_to_sort_hint(s: tamarin_term::lterm::LSort) -> tamarin_parser::ast::SortHint {
@@ -678,7 +742,7 @@ mod tests {
 
         let mk_sys = |i_a: u64, i_b: u64| -> System {
             let mut sys = System::empty();
-            sys.less_atoms.push(LessAtom::new(
+            sys.content_mut().less_atoms.push(LessAtom::new(
                 node("i", i_a), node("i", i_b), Reason::Fresh,
             ));
             sys

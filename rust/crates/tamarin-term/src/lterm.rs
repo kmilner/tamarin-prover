@@ -163,10 +163,15 @@ pub struct LVar {
 
 impl Ord for LVar {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Haskell-faithful: idx <> sort <> name (idx FIRST).
-        self.idx.cmp(&other.idx)
-            .then_with(|| self.sort.cmp(&other.sort))
-            .then_with(|| self.name.cmp(other.name))
+        // Haskell-faithful: idx <> sort <> name (idx FIRST).  Destructure
+        // without `..` so a new field forces an ordering decision here, keeping
+        // the manual Ord in step with the derived Eq/Hash (which auto-include
+        // every field).
+        let LVar { name, sort, idx } = self;
+        let LVar { name: other_name, sort: other_sort, idx: other_idx } = other;
+        idx.cmp(other_idx)
+            .then_with(|| sort.cmp(other_sort))
+            .then_with(|| name.cmp(other_name))
     }
 }
 

@@ -754,6 +754,9 @@ pub fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
 /// wrapper.  Shared by `format_wf_block` (batch theory output) and the
 /// interactive server's `ppInteractive` console echo of the report at
 /// theory-load time (Web/Dispatch.hs:187,200-209).
+// grouped by topic; OUTPUT order driven by the topic_order Vec, map keyed only;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 pub fn render_wf_error_report(report: &[tamarin_parser::wf::WfError]) -> String {
     let mut out = String::new();
     // Group by topic, preserving FIRST-APPEARANCE order — mirrors HS's
@@ -896,6 +899,9 @@ fn sep_block_with_lead(lead: &str, items: &[(crate::pretty_hpj::Doc, crate::pret
 // =============================================================================
 
 #[allow(clippy::too_many_arguments)]
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn render_parsed_item(
     item: &p::TheoryItem,
     macros: &[p::Macro],
@@ -1006,6 +1012,9 @@ fn render_parsed_item(
 /// Names of arity-1 NoEq function symbols in the closed theory signature.
 /// Mirrors HS `lookupArity` reading the parser-state signature for
 /// `naryOpApp`'s `k == 1` tuple-folding (Theory/Text/Parser/Term.hs:58-93).
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn arity1_noeq_names(elab: &Theory) -> std::collections::HashSet<String> {
     crate::elaborate::arity1_noeq_names(elab.signature.maude_sig())
 }
@@ -1094,6 +1103,9 @@ fn contains_manual_rule_variants(
 /// Term.hs:84-87) to every term in a parser-AST fact.  Thin alias over the
 /// shared [`crate::elaborate::rewrite_arity1_fact`] so the rule
 /// pretty-printer and the lemma/formula paths share one implementation.
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn rewrite_arity1_fact(
     fa: &p::Fact,
     arity1: &std::collections::HashSet<String>,
@@ -1242,6 +1254,9 @@ fn rule_attributes_doc(attrs: &[p::RuleAttr]) -> crate::pretty_hpj::Doc {
     Doc::text("[").beside(inner).beside(Doc::text("]"))
 }
 
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1: &std::collections::HashSet<String>, manual_variants: bool, auto_sources: bool) -> String {
     let name = &parsed_rule.name;
     let mut out = String::new();
@@ -1855,6 +1870,9 @@ const ORACLE_RIBBON: usize = 67;
 // Lemma
 // =============================================================================
 
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], predicates: &[p::Predicate], proved: &[ProvedLemma], in_file: &str, _elab: &Theory, arity1: &std::collections::HashSet<String>) -> String {
     use crate::pretty_hpj::{self as hpj, Doc};
     let mut out = String::new();
@@ -1956,6 +1974,9 @@ fn quantifier_keyword(q: &p::TraceQuantifier) -> &'static str {
     }
 }
 
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro], predicates: &[p::Predicate], arity1: &std::collections::HashSet<String>) -> String {
     let header = match &lem.trace_quantifier {
         p::TraceQuantifier::ExistsTrace => "guarded formula characterizing all satisfying traces:",
@@ -2037,6 +2058,9 @@ fn expand_predicates_for_display(f: &p::Formula, predicates: &[p::Predicate]) ->
     crate::predicate_expand::expand_formula(f, predicates).unwrap_or_else(|_| f.clone())
 }
 
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], predicates: &[p::Predicate], _elab: &Theory, arity1: &std::collections::HashSet<String>) -> String {
     // HS `prettyRestriction` (TheoryObject.hs:846-857):
     //   The `Restriction` carries two formulas after `applyMacroInRestriction`:
@@ -2117,6 +2141,9 @@ fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], predicates
 /// then the combined `<fact><=><formula>` text (no spaces around `<=>`).
 /// The fact/formula terms are arity-1 folded (HS `naryOpApp` k==1 at parse
 /// time), matching the rule/restriction renderers.
+// arity-1 no-eq function-name set; membership-only (.contains), never iterated;
+// std kept (byte-inert) — iteration order never reaches output.
+#[allow(clippy::disallowed_types)]
 fn render_predicate(pr: &p::Predicate, arity1: &std::collections::HashSet<String>) -> String {
     let fact = crate::elaborate::rewrite_arity1_fact(&pr.fact, arity1);
     let formula = crate::elaborate::rewrite_arity1_formula(&pr.formula, arity1);

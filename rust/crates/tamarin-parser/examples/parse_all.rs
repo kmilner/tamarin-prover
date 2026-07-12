@@ -5,6 +5,10 @@
 //!
 //! With `--list-fail` it prints the first error of each failing file.
 
+// Example/dev tool: reports pass/fail counts to stdout by design; allow the
+// `disallowed_macros` convention freeze for this example binary.
+#![allow(clippy::disallowed_macros)]
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;

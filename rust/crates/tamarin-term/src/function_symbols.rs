@@ -72,10 +72,19 @@ impl std::fmt::Debug for NoEqSym {
 impl PartialEq for NoEqSym {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        (std::ptr::eq(self.name.as_ptr(), other.name.as_ptr()) || self.name == other.name)
-            && self.arity == other.arity
-            && self.privacy == other.privacy
-            && self.constructability == other.constructability
+        // Destructure without `..` so a new field forces an equality decision
+        // here and in the sibling Hash/Ord impls; all four fields participate.
+        let NoEqSym { name, arity, privacy, constructability } = self;
+        let NoEqSym {
+            name: other_name,
+            arity: other_arity,
+            privacy: other_privacy,
+            constructability: other_constructability,
+        } = other;
+        (std::ptr::eq(name.as_ptr(), other_name.as_ptr()) || name == other_name)
+            && arity == other_arity
+            && privacy == other_privacy
+            && constructability == other_constructability
     }
 }
 impl Eq for NoEqSym {}
@@ -89,26 +98,37 @@ impl Eq for NoEqSym {}
 impl std::hash::Hash for NoEqSym {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
-        self.arity.hash(state);
-        self.privacy.hash(state);
-        self.constructability.hash(state);
+        // Destructure without `..` so a new field forces a hash decision here,
+        // keeping this in step with Eq/Ord; all four fields are hashed.
+        let NoEqSym { name, arity, privacy, constructability } = self;
+        name.hash(state);
+        arity.hash(state);
+        privacy.hash(state);
+        constructability.hash(state);
     }
 }
 impl Ord for NoEqSym {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Field order: name, arity, privacy, constructability (consistent with
-        // Eq/Hash).  Only the name compare gains the ptr fast-path.
-        let name_ord = if std::ptr::eq(self.name.as_ptr(), other.name.as_ptr()) {
+        // Eq/Hash).  Only the name compare gains the ptr fast-path.  Destructure
+        // without `..` so a new field forces an ordering decision here.
+        let NoEqSym { name, arity, privacy, constructability } = self;
+        let NoEqSym {
+            name: other_name,
+            arity: other_arity,
+            privacy: other_privacy,
+            constructability: other_constructability,
+        } = other;
+        let name_ord = if std::ptr::eq(name.as_ptr(), other_name.as_ptr()) {
             std::cmp::Ordering::Equal
         } else {
-            self.name.cmp(other.name)
+            name.cmp(other_name)
         };
         name_ord
-            .then_with(|| self.arity.cmp(&other.arity))
-            .then_with(|| self.privacy.cmp(&other.privacy))
-            .then_with(|| self.constructability.cmp(&other.constructability))
+            .then_with(|| arity.cmp(other_arity))
+            .then_with(|| privacy.cmp(other_privacy))
+            .then_with(|| constructability.cmp(other_constructability))
     }
 }
 impl PartialOrd for NoEqSym {

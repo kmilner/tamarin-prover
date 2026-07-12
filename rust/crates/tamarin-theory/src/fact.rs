@@ -38,6 +38,37 @@ pub enum FactAnnotation {
     NoSources,
 }
 
+/// Variable fingerprint bit (cached-bloom skip).
+///
+/// SINGLE SHARED hashing site: both [`fact_bloom`] and the per-pass
+/// `dom_bloom` fold in `subst_system_once` call this — never introduce a
+/// second, ad-hoc var-hashing site (a divergent hash silently breaks the
+/// `bloom ⊇ frees` superset invariant the skip's soundness rests on).
+///
+/// `LVar`'s derived `Hash` is content-based (`&str` contents + sort + idx),
+/// so two independently-constructed content-equal vars hash equal (one from
+/// `subst.dom()`, one from a fact's `for_each_free`); `FxBuildHasher` is
+/// zero-seed deterministic, so the bit is stable process-wide. The hash is a
+/// FILTER only — it never reaches observable output, so byte-determinism is
+/// preserved. Do NOT "optimise" `LVar::Hash` to hash the interned name
+/// *pointer*: the superset invariant depends on content-based hashing.
+#[inline]
+pub fn var_bit(v: &LVar) -> u64 {
+    1u64 << (tamarin_utils::fx_hash_one(v) & 63)
+}
+
+/// Superset variable fingerprint over a term slice: a 1 in every
+/// bit position any free `LVar` of the terms hashes to, so `bloom ⊇ frees`
+/// by construction. `O(number of free-var occurrences)`.
+#[inline]
+pub fn fact_bloom<T: HasFrees>(terms: &[T]) -> u64 {
+    let mut b = 0u64;
+    for t in terms {
+        t.for_each_free(&mut |v| b |= var_bit(v));
+    }
+    b
+}
+
 /// A multiset-rewriting fact carrying a tag, optional annotations, and
 /// term arguments.
 #[derive(Debug, Clone)]
@@ -45,32 +76,64 @@ pub struct Fact<T> {
     pub tag: FactTag,
     pub annotations: BTreeSet<FactAnnotation>,
     pub terms: Vec<T>,
+    /// Cached variable fingerprint over `terms`.  `u64::MAX` =
+    /// "unknown, always descend" — the never-wrong-skip default (a fact that
+    /// reaches the skip with `MAX` simply descends: `MAX & dom != 0` while
+    /// `dom` is non-empty).  Placed LAST and NOT read by the manual `Eq`/`Ord`
+    /// impls, so it is invisible to equality, ordering, and dedup.  NEVER copy
+    /// this across a frees-changing rebuild — recompute or `MAX`.
+    ///
+    /// MODULE-PRIVATE (not `pub(crate)`): a stale-copy like `bloom: fa.bloom`
+    /// in a frees-changing rebuild is the classic soundness bug (a bloom that
+    /// no longer covers the rebuilt terms' frees breaks the `bloom ⊇ frees`
+    /// skip invariant).  Keeping the field private to this module makes such a
+    /// copy UNEXPRESSIBLE anywhere else — every out-of-module `Fact` must be
+    /// built through a constructor (`new`/`fresh`/`fresh_annotated`/`map`) that
+    /// sets the bloom correctly (computed, or the safe `MAX`), and any
+    /// post-construction `.terms` edit must call `recompute_bloom()`.
+    bloom: u64,
 }
 
-// Equality and ordering ignore annotations, matching the Haskell semantics.
+// Equality and ordering compare `tag` and `terms` only.  `annotations` is
+// excluded because HS `Eq`/`Ord LNFact` treat it as metadata; `bloom` is
+// excluded because it is an out-of-band skip fingerprint of the terms' frees
+// (a superset of them, or the `u64::MAX` sentinel), not part of a fact's
+// value — HS `LNFact` carries no such field.  Each impl destructures without
+// `..` so a new `Fact` field forces an inclusion decision in every sibling
+// impl at once.
 impl<T: PartialEq> PartialEq for Fact<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.tag == other.tag && self.terms == other.terms
+        let Fact { tag, terms, annotations: _, bloom: _ } = self;
+        let Fact { tag: other_tag, terms: other_terms, annotations: _, bloom: _ } = other;
+        tag == other_tag && terms == other_terms
     }
 }
 impl<T: Eq> Eq for Fact<T> {}
 impl<T: PartialOrd> PartialOrd for Fact<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match self.tag.partial_cmp(&other.tag) {
-            Some(std::cmp::Ordering::Equal) => self.terms.partial_cmp(&other.terms),
+        let Fact { tag, terms, annotations: _, bloom: _ } = self;
+        let Fact { tag: other_tag, terms: other_terms, annotations: _, bloom: _ } = other;
+        match tag.partial_cmp(other_tag) {
+            Some(std::cmp::Ordering::Equal) => terms.partial_cmp(other_terms),
             ord => ord,
         }
     }
 }
 impl<T: Ord> Ord for Fact<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.tag.cmp(&other.tag).then(self.terms.cmp(&other.terms))
+        let Fact { tag, terms, annotations: _, bloom: _ } = self;
+        let Fact { tag: other_tag, terms: other_terms, annotations: _, bloom: _ } = other;
+        tag.cmp(other_tag).then(terms.cmp(other_terms))
     }
 }
 
 impl<T> Fact<T> {
+    /// Generic constructor: stores `bloom = u64::MAX` (no `HasFrees` bound, so
+    /// the fingerprint cannot be computed here).  For LNFact producers whose
+    /// output reaches `subst_system_once`, prefer [`Fact::fresh`] so the
+    /// fast-path fires (a `MAX` bloom is SOUND but never skips).
     pub fn new(tag: FactTag, terms: Vec<T>) -> Self {
-        Fact { tag, annotations: BTreeSet::new(), terms }
+        Fact { tag, annotations: BTreeSet::new(), terms, bloom: u64::MAX }
     }
     pub fn with_annotations(mut self, ann: BTreeSet<FactAnnotation>) -> Self {
         self.annotations = ann;
@@ -81,12 +144,45 @@ impl<T> Fact<T> {
         self
     }
     pub fn arity(&self) -> usize { self.terms.len() }
+    /// Cached variable fingerprint.  `u64::MAX` means "not
+    /// computed — always descend".
+    #[inline]
+    pub fn bloom(&self) -> u64 { self.bloom }
+    /// Generic map: stores `bloom = u64::MAX` (result type `U` carries no
+    /// `HasFrees` bound).  A `MAX` bloom is a safe perf-miss; if a hot LNFact
+    /// producer routes through `map`, recompute via [`Fact::recompute_bloom`].
     pub fn map<U, F: FnMut(T) -> U>(self, f: F) -> Fact<U> {
         Fact {
             tag: self.tag,
             annotations: self.annotations,
             terms: self.terms.into_iter().map(f).collect(),
+            bloom: u64::MAX,
         }
+    }
+}
+
+impl<T: HasFrees> Fact<T> {
+    /// Bloom-COMPUTING constructor: use for every LNFact
+    /// producer whose output reaches `subst_system_once`, so the whole-fact
+    /// skip fast-path can fire.  The cached fingerprint is paid ONCE here and
+    /// reused on every unchanged pass the fact survives (P1 amortization).
+    pub fn fresh(tag: FactTag, terms: Vec<T>) -> Self {
+        let bloom = fact_bloom(&terms);
+        Fact { tag, annotations: BTreeSet::new(), terms, bloom }
+    }
+    /// Bloom-computing constructor with annotations.
+    pub fn fresh_annotated(
+        tag: FactTag,
+        annotations: BTreeSet<FactAnnotation>,
+        terms: Vec<T>,
+    ) -> Self {
+        let bloom = fact_bloom(&terms);
+        Fact { tag, annotations, terms, bloom }
+    }
+    /// Recompute the cached fingerprint from the CURRENT terms.  Call after any
+    /// external `.terms` mutation (never leave a stale bloom).
+    pub fn recompute_bloom(&mut self) {
+        self.bloom = fact_bloom(&self.terms);
     }
 }
 
@@ -99,11 +195,14 @@ impl<T: HasFrees> HasFrees for Fact<T> {
         for t in &self.terms { t.for_each_free(f); }
     }
     fn map_free_with(self, f: &mut dyn FnMut(LVar) -> LVar, monotone: bool) -> Self {
-        Fact {
-            tag: self.tag,
-            annotations: self.annotations,
-            terms: self.terms.into_iter().map(|t| t.map_free_with(f, monotone)).collect(),
-        }
+        // Freshen / rule-rename producer: this renames vars, so
+        // the rebuilt fact's frees ≠ the source frees.  RECOMPUTE the bloom
+        // from the renamed terms — NEVER copy `self`'s (would bloom on the old
+        // var names → possible wrong skip).
+        let terms: Vec<T> =
+            self.terms.into_iter().map(|t| t.map_free_with(f, monotone)).collect();
+        let bloom = fact_bloom(&terms);
+        Fact { tag: self.tag, annotations: self.annotations, terms, bloom }
     }
 }
 
@@ -202,13 +301,15 @@ pub fn is_kd_xor_fact(fa: &LNFact) -> bool {
 
 pub type LNFact = Fact<LNTerm>;
 
-pub fn fresh_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Fresh, vec![t]) }
-pub fn out_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Out, vec![t]) }
-pub fn in_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::In, vec![t]) }
-pub fn ku_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Ku, vec![t]) }
-pub fn kd_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Kd, vec![t]) }
+// LNFact producers: route through the bloom-COMPUTING
+// `Fact::fresh` so the dominant node/action-fact skip fires.
+pub fn fresh_fact(t: LNTerm) -> LNFact { Fact::fresh(FactTag::Fresh, vec![t]) }
+pub fn out_fact(t: LNTerm) -> LNFact { Fact::fresh(FactTag::Out, vec![t]) }
+pub fn in_fact(t: LNTerm) -> LNFact { Fact::fresh(FactTag::In, vec![t]) }
+pub fn ku_fact(t: LNTerm) -> LNFact { Fact::fresh(FactTag::Ku, vec![t]) }
+pub fn kd_fact(t: LNTerm) -> LNFact { Fact::fresh(FactTag::Kd, vec![t]) }
 // Intentionally retained: faithful HS port; no caller yet.
-pub fn ded_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Ded, vec![t]) }
+pub fn ded_fact(t: LNTerm) -> LNFact { Fact::fresh(FactTag::Ded, vec![t]) }
 
 /// `kLogFact` from Haskell's `Theory.Model.Fact:280`:
 ///   `kLogFact = protoFact Linear "K" . return`
@@ -219,12 +320,12 @@ pub fn ded_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Ded, vec![t]) }
 /// same tag (per the parser's fall-through for unknown fact
 /// names), so action goals like `K(t) @ j` match ISend instances.
 pub fn k_log_fact(t: LNTerm) -> LNFact {
-    Fact::new(FactTag::Proto(Multiplicity::Linear, "K", 1), vec![t])
+    Fact::fresh(FactTag::Proto(Multiplicity::Linear, "K", 1), vec![t])
 }
-pub fn term_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Term, vec![t]) }
+pub fn term_fact(t: LNTerm) -> LNFact { Fact::fresh(FactTag::Term, vec![t]) }
 
 pub fn proto_fact(mult: Multiplicity, name: &str, terms: Vec<LNTerm>) -> LNFact {
-    Fact::new(FactTag::Proto(mult, tamarin_term::intern::intern_str(name), terms.len()), terms)
+    Fact::fresh(FactTag::Proto(mult, tamarin_term::intern::intern_str(name), terms.len()), terms)
 }
 
 /// View a protocol or `In` fact's terms. Port of HS `protoOrInFactView`
@@ -261,11 +362,11 @@ pub fn proto_fact_ann(
     annotations: BTreeSet<FactAnnotation>,
     terms: Vec<LNTerm>,
 ) -> LNFact {
-    Fact {
-        tag: FactTag::Proto(mult, tamarin_term::intern::intern_str(name), terms.len()),
+    Fact::fresh_annotated(
+        FactTag::Proto(mult, tamarin_term::intern::intern_str(name), terms.len()),
         annotations,
         terms,
-    }
+    )
 }
 
 #[cfg(test)]
@@ -372,5 +473,130 @@ mod tests {
         let kd = kd_fact(msg_var("x", 0));
         assert!(ku.is_ku() && !ku.is_kd());
         assert!(kd.is_kd() && !kd.is_ku());
+    }
+
+    // =========================================================================
+    // Cached-bloom fingerprint skip: soundness invariants.
+    // =========================================================================
+
+    use tamarin_term::builtin::{msg_var as mv, fresh_var, pub_var, pair};
+    use tamarin_term::lterm::{LVar, LSort, LNTerm};
+    use tamarin_term::subst::{Subst, apply_vterm_changed};
+
+    /// Tiny deterministic PRNG (no external quickcheck dep) for the property
+    /// tests below.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn range(&mut self, n: u64) -> u64 { self.next() % n }
+    }
+
+    /// Build a pseudo-random `LNTerm` of bounded depth over a small var pool.
+    fn rand_term(r: &mut Lcg, depth: u32) -> LNTerm {
+        if depth == 0 || r.range(3) == 0 {
+            let i = r.range(6);
+            match r.range(3) {
+                0 => mv(&format!("x{i}"), r.range(4)),
+                1 => fresh_var(&format!("n{i}"), r.range(4)),
+                _ => pub_var(&format!("p{i}"), r.range(4)),
+            }
+        } else {
+            pair(rand_term(r, depth - 1), rand_term(r, depth - 1))
+        }
+    }
+
+    fn rand_fact(r: &mut Lcg) -> LNFact {
+        let arity = 1 + r.range(4) as usize;
+        let terms: Vec<LNTerm> = (0..arity).map(|_| rand_term(r, 3)).collect();
+        let tag = match r.range(4) {
+            0 => FactTag::Out,
+            1 => FactTag::Ku,
+            2 => FactTag::Proto(Multiplicity::Linear, "P", arity),
+            _ => FactTag::Proto(Multiplicity::Persistent, "Q", arity),
+        };
+        Fact::fresh(tag, terms)
+    }
+
+    /// Superset property: every var visited by `for_each_free` has its bit
+    /// set in `fact.bloom()` (`bloom ⊇ frees`), and structurally-equal facts
+    /// get equal blooms (deterministic function of content).
+    #[test]
+    fn bloom_is_superset_of_frees_and_content_deterministic() {
+        let mut r = Lcg(0x1234_5678);
+        for _ in 0..2000 {
+            let fa = rand_fact(&mut r);
+            let b = fa.bloom();
+            fa.for_each_free(&mut |v| {
+                assert_ne!(b & var_bit(v), 0,
+                    "bloom missing a bit for free var {v:?} — superset invariant broken");
+            });
+            // Recomputing from the same terms is identical (content-deterministic).
+            let b2 = fact_bloom(&fa.terms);
+            assert_eq!(b, b2);
+            // A structurally-equal rebuild gets an equal bloom.
+            let fa2 = Fact::fresh(fa.tag.clone(), fa.terms.clone());
+            assert_eq!(fa.bloom(), fa2.bloom());
+        }
+    }
+
+    /// Skip-equivalence property: `bloom(fact) & dom_bloom == 0` implies
+    /// the subst changes NO term of the fact (the skip never fires on a fact
+    /// the subst actually rewrites).
+    #[test]
+    fn bloom_miss_implies_no_change() {
+        let mut r = Lcg(0xDEAD_BEEF);
+        let mut fired = 0u64;
+        for _ in 0..4000 {
+            let fa = rand_fact(&mut r);
+            // Random subst: map a handful of vars to random terms (dropping
+            // trivial bindings via `from_list`, as the real eq-store does).
+            let ndom = 1 + r.range(4);
+            let pairs: Vec<(LVar, LNTerm)> = (0..ndom).map(|_| {
+                let i = r.range(6);
+                let v = LVar::new(format!("x{i}"), LSort::Msg, r.range(4));
+                (v, rand_term(&mut r, 2))
+            }).collect();
+            let subst: Subst<_, _> = Subst::from_list(pairs);
+            if subst.is_empty() { continue; }
+            let dom_bloom = subst.dom().fold(0u64, |b, v| b | var_bit(v));
+            if fa.bloom() & dom_bloom == 0 {
+                fired += 1;
+                for t in &fa.terms {
+                    assert!(apply_vterm_changed(&subst, t).is_none(),
+                        "skip fired but subst changed a term — UNSOUND: fact={fa:?}");
+                }
+            }
+        }
+        assert!(fired > 0, "test never exercised a real skip — weaken the generator");
+    }
+
+    /// Trait regression: two facts equal-but-for-bloom compare `==` and
+    /// `Ord`-equal.  Pins that the manual `Eq`/`Ord` stay bloom-invisible
+    /// (field placed LAST; no `Hash` derive added).
+    #[test]
+    fn bloom_is_invisible_to_eq_and_ord() {
+        let mut a = Fact::fresh(FactTag::Out, vec![mv("x", 0)]);
+        let mut b = a.clone();
+        a.bloom = 0;          // deliberately divergent fingerprints
+        b.bloom = u64::MAX;
+        assert_eq!(a, b, "Eq must ignore the bloom field");
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal, "Ord must ignore the bloom field");
+        assert!(a.partial_cmp(&b) == Some(std::cmp::Ordering::Equal));
+    }
+
+    /// `var_bit` determinism: two INDEPENDENTLY-constructed content-equal
+    /// `LVar`s hash to the same bit (guards against a future ptr-hash
+    /// "optimisation" of `LVar::Hash` that would break the superset invariant).
+    #[test]
+    fn var_bit_is_content_deterministic() {
+        let a = LVar::new(String::from("foo"), LSort::Msg, 7);
+        let b = LVar::new(format!("f{}{}", "o", "o"), LSort::Msg, 7);
+        assert_eq!(a, b);
+        assert_eq!(var_bit(&a), var_bit(&b),
+            "content-equal LVars must yield the same bloom bit");
+        assert_eq!(tamarin_utils::fx_hash_one(&a), tamarin_utils::fx_hash_one(&b));
     }
 }
