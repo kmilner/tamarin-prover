@@ -129,7 +129,23 @@ impl ProofState {
     pub fn new(
         parser_theory: &tamarin_parser::ast::Theory,
         maude_path: &str,
+        cli_cut: Option<tamarin_theory::constraint::solver::context::CutStrategy>,
+        in_file: &str,
     ) -> Result<Self, String> {
+        // Effective cut strategy — HS `closeTheory` precedence
+        // (TheoryLoader.hs:640-666): the CLI `--stop-on-trace` wins;
+        // the theory's `configuration:` block is consulted only when
+        // the flag is absent.  Steers the session's autoprove
+        // (`runAutoProver`'s `apCut`) and the shared web context.
+        let cut = match cli_cut {
+            Some(c) => c,
+            None => match &parser_theory.configuration {
+                Some(cfg) => tamarin_theory::prove::config_block_options(cfg)?
+                    .0
+                    .unwrap_or(tamarin_theory::constraint::solver::context::CutStrategy::Dfs),
+                None => tamarin_theory::constraint::solver::context::CutStrategy::Dfs,
+            },
+        };
         // Install the user-fn-symbol thread-locals for the WHOLE build —
         // every `formula_to_guarded` below (restrictions, lemma formulas,
         // reuse lemmas) resolves nullary/unary user funs through them.
@@ -138,8 +154,13 @@ impl ProofState {
             tamarin_theory::elaborate::collect_user_funs_for_theory(parser_theory));
         let _user_funs_guard =
             tamarin_theory::elaborate::set_user_funs_from_collected(&user_funs);
-        let typed = elaborate(parser_theory)
+        let mut typed = elaborate(parser_theory)
             .map_err(|e| format!("elaborate: {}", e.message))?;
+        // Oracle-path base (HS Parser.hs:304): a `heuristic: o "./oracle-…"`
+        // resolves against the theory file's directory
+        // (`hs_take_directory(in_file)` in prove.rs), both in the session
+        // built below and in raw-solve replay rankings.
+        typed.in_file = in_file.to_string();
         let sig = typed.signature.maude_sig.clone();
         let maude = MaudeHandle::start(maude_path, sig)
             .map_err(|e| format!("maude start: {:?}", e))?;
@@ -197,16 +218,11 @@ impl ProofState {
         // per-lemma clone starts from its own counter Arc floored at the
         // same `setup_counter_before` base.
         //
-        // NOTE: like the per-lemma `heuristic:` handling below,
-        // `typed.in_file` is empty on the web path, so an oracle-relative
-        // path in a `heuristic:` directive would resolve CWD-relative
-        // during a raw-solve replay ranking.  Same pre-existing
-        // limitation as the display sites; none of the observed
-        // skeleton-shipping theories use oracles.
         let session: Option<Arc<tamarin_theory::prove::ProverSession>> =
             match tamarin_theory::prove::ProverSession::build_with_in_file_and_heuristic(
                 parser_theory, maude.clone(), None, &typed.in_file,
-                tamarin_theory::prove::CliHeuristic::default())
+                tamarin_theory::prove::CliHeuristic::default(),
+                cut)
             {
                 Ok(s) => Some(Arc::new(s)),
                 Err(e) => {
@@ -237,7 +253,8 @@ impl ProofState {
                 }
             }
         }
-        let ctx = ProofContext::new_with_restrictions(maude, rules, ctx_restrictions);
+        let mut ctx = ProofContext::new_with_restrictions(maude, rules, ctx_restrictions);
+        ctx.cut = cut;
         // Build the initial system for every lemma.
         let mut by_lemma: BTreeMap<String, LemmaProofState> = BTreeMap::new();
         // Per-lemma search settings HS installs before ranking each lemma's
@@ -267,15 +284,18 @@ impl ProofState {
                 Some(h) => Some(h.to_string()),
                 None => typed.heuristic.first().cloned(),
             };
-            // NOTE: oracle-relative paths in a web `heuristic:` directive are
-            // NOT yet prefixed with the theory dir (HS
-            // `prepend_theory_dir_to_oracle_paths`, prove.rs:130, is private to
-            // that module).  The observed web cases (`use_induction`, SAPiC
-            // `p`) are not oracles; a future oracle-on-web `heuristic:` case
-            // must thread that prefixing through here.
             let heuristic = heuristic_raw.map(|h| {
-                tamarin_theory::constraint::solver::goals::parse_heuristic_str_with_tactics(
-                    &h, &typed.in_file, &typed.tactic)
+                let mut rankings =
+                    tamarin_theory::constraint::solver::goals::parse_heuristic_str_with_tactics(
+                        &h, &typed.in_file, &typed.tactic);
+                // Oracle paths resolve against the theory file's directory
+                // (HS `oraclePath = workDir </> relPath`, System.hs:574-575)
+                // — same prefixing the batch session applies
+                // (prove.rs `resolve_lemma_rankings`); without it the dmn
+                // family's `heuristic: o "./oracle-…"` exec fails cwd-relative.
+                tamarin_theory::prove::prepend_theory_dir_to_oracle_paths(
+                    &mut rankings, &typed.in_file);
+                rankings
             });
             lemma_settings.insert(
                 lname.clone(),
@@ -523,6 +543,11 @@ impl ProofState {
             ctx.use_induction = s.use_induction;
             ctx.heuristic = s.heuristic.clone();
         }
+        // Oracle argv[1] (HS `runProcess oraclePath [lemmaName]`,
+        // ProofMethod.hs:607): oracle scripts branch on the lemma name
+        // (e.g. oracle-dmn-basic), so an empty name selects the wrong
+        // branch and the ranking silently degenerates to the pre-sort.
+        ctx.lemma_name = lemma.to_string();
     }
 
     /// Find the system at the given path (root if empty).
@@ -821,13 +846,6 @@ fn write_applicable_methods(
     // the search loop which tries each in order); for the UI we filter via
     // `exec_proof_method` so the user-visible numbering matches the actual
     // click semantics.
-    // NOTE: this ranks at heuristic depth `0`, whereas Haskell
-    // `subProofSnippet` uses `length proofPath` and the method-apply route
-    // `apply_method_and_redirect` (theory.rs) passes `sub.len()`.  For
-    // multi-ranking heuristics at depth>0 the displayed numbering here can
-    // therefore disagree with the numbering the apply route selects from.
-    // Left as-is to avoid changing observed output; see
-    // `apply_method_and_redirect`'s `length proofPath` comment.
     // Each entry is `(method, expl)` — `expl` is HS's `rankProofMethods`
     // explanation string (`"nr. N …"` for SolveGoal, `""` otherwise),
     // rendered by `prettyPM` as a trailing `// <expl>` line comment.
@@ -1190,7 +1208,7 @@ lemma trivial: exists-trace
 end
 "#;
         let pt = tamarin_parser::parse_theory(src, &[]).expect("parse");
-        let state = ProofState::new(&pt, &mp).expect("build state");
+        let state = ProofState::new(&pt, &mp, None, "").expect("build state");
         // Should have one lemma initialised.
         let root = state.get_root("trivial").expect("trivial root");
         assert!(matches!(root.method, ProofMethod::Sorry(_)));
@@ -1208,7 +1226,7 @@ lemma trivial: exists-trace
 end
 "#;
         let pt = tamarin_parser::parse_theory(src, &[]).expect("parse");
-        let state = ProofState::new(&pt, &mp).expect("build state");
+        let state = ProofState::new(&pt, &mp, None, "").expect("build state");
         // Apply simplify at the root.
         let path: Vec<String> = Vec::new();
         let r = state.apply_at_path("trivial", &path, ProofMethod::Simplify);

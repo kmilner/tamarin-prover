@@ -97,7 +97,7 @@ pub fn graph_options_from_params(params: &HashMap<String, String>) -> GraphOptio
 /// The data type is `data SimplificationLevel = SL0 | SL1 | SL2 | SL3`
 /// (`Graph.hs`), so its derived `Read` parses only the bare
 /// constructor tokens. Following `Read`'s lexer it skips leading/trailing
-/// whitespace and accepts a single matched pair of surrounding parentheses;
+/// whitespace and accepts one or more matched pairs of surrounding parentheses;
 /// numeric input (e.g. `"2"`) fails. Returns `None` on any non-match.
 fn read_simplification_level(s: &str) -> Option<SimplificationLevel> {
     let mut t = s.trim();

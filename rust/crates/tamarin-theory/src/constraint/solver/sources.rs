@@ -1499,8 +1499,16 @@ fn saturate_sources_with_simp_opt(
         // We build a per-task context with the pooled handle swapped
         // in via `ctx.with_swapped_maude(...)`.  The PooledMaude guard
         // releases back to the pool on drop at end of the closure.
+        // `refine_one_source` runs the solver (implied formulas, atom
+        // insertion), whose term conversions read the user-fun
+        // thread-locals — replicate the calling thread's sets onto each
+        // worker (a stolen thread outside any guard has EMPTY sets and
+        // would mis-elaborate user nullary/unary symbols).
+        let user_funs_snapshot = crate::elaborate::snapshot_user_funs();
         let per_source: Vec<(Vec<(Vec<String>, System)>, bool, usize)> =
             saturated_indexed.into_par_iter().map(|(_i, src)| {
+                let _user_funs_guard =
+                    crate::elaborate::set_user_funs_from_collected(&user_funs_snapshot);
                 if let Some(pool) = &ctx.maude_pool {
                     let pooled = pool.acquire();
                     // Give the worker a FRESH counter (not the pooled handle's
@@ -4735,7 +4743,7 @@ fn apply_source_case_premise(
     // Gen_Stop node's `ChainKey(kZero)` action and gfalse never enters
     // sFormulas → Rust does an extra solve step where Haskell sees
     // `by contradiction /* from formulas */`.  Same pattern as the
-    // action-path edge fact-equality fix at sources.rs:4549-4568.
+    // action-path edge fact-equality fix (the E.5 step in `conjoin_refine_arm`).
     // SCOPING (HS-faithful): the E.5 edge-fact solve must only touch edges
     // INTRODUCED by the grafted source case, NOT pre-existing LIVE edges.
     // HS's `conjoinSystem` (Reduction.hs:660-690) does NO edge solve at all —
@@ -4750,11 +4758,12 @@ fn apply_source_case_premise(
     // SplitLater merge into RS's pinned 1-unifier APPLY — which collapses
     // `#a3`'s multiset nonce onto the witness `no1.0` (HS keeps it the fresh
     // `no1.1`, with `#a3`'s y's fresh `.2`).  This is the SAME live-edge
-    // hazard already guarded on the ACTION-path E.5 (sources.rs:4549-4568,
-    // citing Joux_EphkRev's collapsed em-exponent splitEqs cascade); the
-    // premise path was missing the guard.  A grafted edge has at least one
-    // endpoint that is NOT a pre-existing live node — only those get the
-    // eager solve.  `prem_live_node_ids` is computed once above the loop.
+    // hazard already guarded on the ACTION-path E.5 (the E.5 step in
+    // `conjoin_refine_arm`, citing Joux_EphkRev's collapsed em-exponent
+    // splitEqs cascade); the premise path was missing the guard.  A grafted
+    // edge has at least one endpoint that is NOT a pre-existing live node —
+    // only those get the eager solve.  `prem_live_node_ids` is computed once
+    // above the loop.
     let edge_eqs = grafted_edge_eqs(&r.sys, &prem_live_node_ids);
     // HS-faithful deferral: HS's `_applySource` -> `conjoinSystem`
     // (Sources.hs:447-469, Reduction.hs:839-866) never fact-solves grafted

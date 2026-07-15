@@ -68,7 +68,7 @@ impl std::fmt::Debug for NoEqSym {
 // in the proof search.  Correctness does NOT depend on the interning
 // invariant: equal data pointers always imply equal content (same allocation),
 // and on a pointer MISmatch we fall back to the full byte comparison — so the
-// boolean/total-order is identical to the previous derived, content-based one.
+// boolean/total-order is identical to a derived, content-based one.
 impl PartialEq for NoEqSym {
     #[inline]
     fn eq(&self, other: &Self) -> bool {

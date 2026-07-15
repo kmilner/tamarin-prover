@@ -34,7 +34,7 @@ pub fn base_trans_null(p: &ProcessPosition, tildex: &BTreeSet<LVar>) -> Vec<Rule
     vec![(vec![st], vec![], vec![], vec![])]
 }
 
-/// `lol`-erase: HS works over `LNTerm` (untyped) for the rule facts; the
+/// Type-erase: HS works over `LNTerm` (untyped) for the rule facts; the
 /// translation calls `toLNTerm` / `toLVar` on SAPIC terms.  Convert a typed
 /// SAPIC term to a plain `LNTerm` (drop the type tag).
 pub fn to_ln_term(t: &SapicTerm) -> LNTerm {

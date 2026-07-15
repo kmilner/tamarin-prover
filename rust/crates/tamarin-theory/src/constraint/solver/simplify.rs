@@ -18,7 +18,8 @@ use crate::constraint::solver::reduction::{ChangeIndicator, Reduction};
 /// attributed against HS's `[CONTRA-FIRE]` histogram.
 fn mark_contradictory_labeled(red: &mut Reduction, pass: &'static str) {
     if tamarin_utils::env_gate!("TAM_RS_TRACE_SIMP_CONTRA") {
-        eprintln!("[SIMP_CONTRA] pass={}", pass);
+        eprintln!("[SIMP_CONTRA] path={} pass={}",
+            crate::constraint::solver::trace::case_path_string(), pass);
     }
     red.mark_contradictory();
 }
@@ -3253,6 +3254,19 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
 /// — observed in TPM_Exclusive_Secrets::left_reachable.
 fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::fact::FactTag;
+    // `TAM_RS_TRACE_EDGES=1`: dump the full edge list at pass entry —
+    // pair of HS's `TAM_HS_TRACE_EDGES` hook (Simplify.hs:372-376),
+    // for locating the first edge-set divergence inside a branch.
+    if tamarin_utils::env_gate!("TAM_RS_TRACE_EDGES") {
+        let mut es: Vec<String> = red.sys.edges.iter().map(|e| format!(
+            "({}.{},{})->({}.{},{})",
+            e.src.0.name, e.src.0.idx, e.src.1.0,
+            e.tgt.0.name, e.tgt.0.idx, e.tgt.1.0)).collect();
+        es.sort();
+        eprintln!("[RS_EDGES_ENTER] path={} edges={} {}",
+            crate::constraint::solver::trace::case_path_string(),
+            es.len(), es.join(" "));
+    }
     // Lookup: is this conclusion of this node a persistent fact?
     // Haskell `factTagMultiplicity` (Theory/Model/Fact.hs:354):
     //   ProtoFact multi _ _ -> multi

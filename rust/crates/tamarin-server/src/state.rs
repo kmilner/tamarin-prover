@@ -215,23 +215,24 @@ impl TheoryStore {
     pub fn ensure_proof_state(
         &self,
         idx: usize,
-        maude_path: &str,
+        cfg: &crate::ServerConfig,
     ) -> Result<Arc<ProofState>, String> {
         // Fast path: already materialised.  Clone out the `Arc<Theory>`
         // we need, then release the store lock before the ~1s
         // `ProofState::new` (Maude boot + source precompute) so unrelated
         // handlers — and other tokio workers — aren't blocked for its
         // duration.
-        let parser_theory = {
+        let (parser_theory, in_file) = {
             let inner = self.inner.lock();
             let entry = inner.by_idx.get(&idx)
                 .ok_or_else(|| format!("theory index {} not found", idx))?;
             if let Some(ps) = &entry.proof_state {
                 return Ok(ps.clone());
             }
-            entry.parser_theory.clone()
+            (entry.parser_theory.clone(), entry.origin.label())
         };
-        let ps = Arc::new(ProofState::new(&parser_theory, maude_path)?);
+        let ps = Arc::new(ProofState::new(
+            &parser_theory, &cfg.maude_path, cfg.stop_on_trace, &in_file)?);
         // Re-lock and double-check: another thread may have built (and
         // stored) the proof state while we held no lock.  If so, prefer
         // the already-stored one so all callers share a single instance.

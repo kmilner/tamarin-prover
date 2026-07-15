@@ -119,6 +119,12 @@ pub fn load_from_source(
     eprintln!("[Theory {}] Theory translated", parser_theory.name);
     let mut typed = elaborate(&parser_theory)
         .map_err(|e| LoadError::Elaborate(e.message))?;
+    // Oracle path resolution base (HS Parser.hs:304 sets `inFile` at load;
+    // `heuristic: o "./oracle-…"` then resolves against the theory's own
+    // directory, `hs_take_directory`).  Local files carry their on-disk
+    // path; uploads keep the bare filename (dir "." — as in HS, where an
+    // uploaded theory has no on-disk home).
+    typed.in_file = origin.label();
     let maude_sig = typed.signature.maude_sig.clone();
 
     // Subterm-convergence check on the signature's subterm-rule set
@@ -183,6 +189,10 @@ pub fn load_from_source(
     // binding lives to the end of the function).
     let _sapic_funs_guard =
         tamarin_theory::elaborate::set_user_funs_for_theory(&parser_theory);
+    // HS `Acc.checkWellformedness t` (translateTheory, TheoryLoader.hs:455)
+    // runs on the PRE-translation theory — before `apply_sapic` injects the
+    // SAPIC-generated rules (mirrors run.rs's CLI-side placement).
+    let acc_wf = tamarin_accountability::check_wellformedness(&parser_theory);
     let user_set_heuristic = !typed.heuristic.is_empty();
     // HS `Sapic.checkWellformedness` (Warnings.hs) is part of `preReport`, which
     // is PREPENDED to the rest of the report (run.rs:685-695).  A hard
@@ -190,8 +200,20 @@ pub fn load_from_source(
     let sapic_wf = tamarin_sapic::apply::apply_sapic(
         &mut parser_theory, &mut typed, user_set_heuristic,
     ).map_err(|e| LoadError::Elaborate(e.message))?;
-    if !sapic_wf.is_empty() {
+    // Accountability translation (HS `Sapic.translate >=> Acc.translate`,
+    // TheoryLoader.hs:430): expands each `… accounts for` lemma into its
+    // verification-condition lemmas + case-test predicates, injecting into
+    // BOTH `parser_theory` (web renderers) and `typed` (lemma list, proof
+    // state).  Without this the web UI has no pages for the VC sub-lemmas
+    // batch `--prove` proves.  No-op for theories without accountability
+    // lemmas / case tests.
+    tamarin_accountability::translate(&mut parser_theory, &mut typed)
+        .map_err(|e| LoadError::Elaborate(e.to_string()))?;
+    // `preReport` order (run.rs:922-927): SAPIC warnings, then the
+    // accountability RP check, then the rest.
+    if !sapic_wf.is_empty() || !acc_wf.is_empty() {
         let mut new_report = sapic_wf;
+        new_report.extend(acc_wf);
         new_report.extend(std::mem::take(&mut wf_report));
         wf_report = new_report;
     }
@@ -211,6 +233,30 @@ pub fn load_from_source(
         wf_report.retain(|e| e.topic != topic);
         let lhs_rhs = tamarin_parser::wf::fact_lhs_occur_no_rhs(&post_thy);
         insert_wf_before(&mut wf_report, lhs_rhs, &[
+            "Formula terms", " Formula guardedness",
+            "Lemma annotations", "Multiplication restriction of rules",
+            "Nat Sorts", "Subterm Convergence Warning",
+            "Message Derivation Checks", "Derivation Checks",
+        ]);
+        // HS `publicNamesReport` runs on the TRANSLATED rules — the
+        // parser-level report cannot see the source process a generated
+        // rule carries as its `process=` attribute (run.rs:950-973, e.g.
+        // CentralizedMonitor's `rule "Init":  name 'C', 'c'`).  Same
+        // replace + splice as the batch path; the boundary list is
+        // WF_TOPIC_ORDER minus "Unbound variables" (unboundReport runs
+        // BEFORE publicNames in HS, so it must not act as a boundary),
+        // headed by the variable-sorts topic.
+        let caps_topic = "Public constants with mismatching capitalization";
+        wf_report.retain(|e| e.topic != caps_topic);
+        let public_names =
+            tamarin_theory::elaborate::sapic_public_names_report(&typed);
+        insert_wf_before(&mut wf_report, public_names, &[
+            "Variable with mismatching sorts or capitalization",
+            "Reserved names", "Special facts",
+            "Fr facts must only use a fresh- or a msg-variable",
+            "Fact arity issues", "Fact multiplicity issues",
+            "Fact capitalization issues",
+            "Facts occur in the left-hand-side but not in any right-hand-side ",
             "Formula terms", " Formula guardedness",
             "Lemma annotations", "Multiplication restriction of rules",
             "Nat Sorts", "Subterm Convergence Warning",

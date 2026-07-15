@@ -35,7 +35,7 @@ README_PATH="${README_PATH:-$repo_root/rust/README.md}"
 TIMEOUT="${TIMEOUT:-600}"
 DERIV="${DERIV:-30}"
 CORES="${CORES:-1 4 16}"
-FILES="${FILES:-classic/NSPK3.spthy ake/bilinear/Joux.spthy features/auto-sources/tamarin-repo/sapic/statVerifLeftRight/stateverif_left_right.spthy sapic/fast/Yubikey/Yubikey.spthy csf19-wrapping/gcm.spthy wireguard/wireguard.spthy features/auto-sources/spore/CCITT_X509_3.spthy}"
+FILES="${FILES:-classic/NSPK3.spthy ake/bilinear/Joux.spthy features/auto-sources/tamarin-repo/sapic/statVerifLeftRight/stateverif_left_right.spthy sapic/fast/Yubikey/Yubikey.spthy accountability/csf21-acc-unbounded/mixvote/mixvote_SmHh-multi-session.spthy csf19-wrapping/gcm.spthy wireguard/wireguard.spthy features/auto-sources/spore/CCITT_X509_3.spthy}"
 
 WRITE=0
 for arg in "$@"; do

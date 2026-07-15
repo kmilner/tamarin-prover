@@ -82,6 +82,11 @@ pub struct ServerConfig {
     /// run at theory load (HS interactive default 5s; 0 disables).  Set
     /// from the CLI flag by `interactive` setup.
     pub derivcheck_timeout: u32,
+    /// CLI `--stop-on-trace` (None = flag absent).  Merged with each
+    /// theory's in-file `configuration:` block at `ProofState::new` time
+    /// per HS `closeTheory` precedence (TheoryLoader.hs:640-666): the CLI
+    /// value wins; the block is consulted only when this is `None`.
+    pub stop_on_trace: Option<tamarin_theory::constraint::solver::context::CutStrategy>,
 }
 
 impl ServerConfig {
@@ -93,6 +98,7 @@ impl ServerConfig {
             maude_path,
             max_steps: 500,
             derivcheck_timeout: 5,
+            stop_on_trace: None,
         }
     }
 }

@@ -339,8 +339,17 @@ pub fn pretty_closed_theory(
     // to the open-as-closed renderer when `containsManualRuleVariants` holds,
     // which suppresses loop-breaker comments on trivial-AC-variant rules.
     let manual_variants = contains_manual_rule_variants(parsed, elaborated, auto_sources);
+    // Item renderers convert formulas (`formula_to_guarded` on lemmas /
+    // restrictions), whose term conversions read the user-fun
+    // thread-locals — replicate the calling thread's sets onto each
+    // render worker (a stolen thread outside any guard has EMPTY sets).
+    let user_funs_snapshot = crate::elaborate::snapshot_user_funs();
     let rendered: Vec<Option<String>> = parsed.items.par_iter()
-        .map(|item| render_parsed_item(item, &macros, &predicates, elaborated, proved, in_file, &arity1, manual_variants, auto_sources))
+        .map(|item| {
+            let _user_funs_guard =
+                crate::elaborate::set_user_funs_from_collected(&user_funs_snapshot);
+            render_parsed_item(item, &macros, &predicates, elaborated, proved, in_file, &arity1, manual_variants, auto_sources)
+        })
         .collect();
     for b in rendered.into_iter().flatten() {
         out.push('\n');
@@ -2456,6 +2465,15 @@ pub(crate) fn render_goal_for_oracle(g: &crate::constraint::constraints::Goal) -
     // (The `--prove` display path renders the disjunction AFTER a `solve( `
     // prefix, so the nest is never at the doc start there and both lay/lay2
     // agree — this divergence is oracle-stdin-specific.)
+    //
+    // ALWAYS plain: HS builds this string with the plain `render $
+    // prettyGoal` regardless of the caller's rendering context
+    // (ProofMethod.hs:607).  The web proof-pane ranks while its
+    // `HtmlDocGuard::enable()` is active — without forcing plain mode the
+    // oracle receives `<span class=…>`/`&lt;`-laden goal strings its
+    // regexes cannot match (dmn `*_min` panes ranked in bare goal-nr
+    // order while HS's oracle reordered).
+    let _plain = crate::pretty_hpj::HtmlDocGuard::disable();
     solve_goal_to_doc(g).render_with(ORACLE_LINE_LENGTH, ORACLE_RIBBON)
 }
 

@@ -598,6 +598,14 @@ impl System {
     /// raw `.eq_store =` write in the solver that bypasses this.
     #[inline]
     pub fn set_eq_store(&mut self, es: Arc<EquationStore>) {
+        // `TAM_DBG_EQ_FALSE_WIPE=1`: a false (mzero-marked) store being
+        // replaced by a non-false one resurrects a dead case — print the
+        // installing call chain (RUST_BACKTRACE=1 for symbols).
+        if tamarin_utils::env_gate!("TAM_DBG_EQ_FALSE_WIPE")
+            && self.content.eq_store.0.is_false() && !es.is_false() {
+            eprintln!("[EQ_FALSE_WIPE] set_eq_store false->ok\n{}",
+                std::backtrace::Backtrace::force_capture());
+        }
         // Module-private `SealedEqStore` constructor: the only place (with
         // `take_eq_store`/`eq_store_mut`) a sealed value is produced.
         self.content.eq_store = SealedEqStore(es);

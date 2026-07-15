@@ -389,7 +389,18 @@ pub fn exec_proof_method(
             // (the check inspects the post-dedup `M.toList cases`).
             let cleaned: Vec<System> =
                 remove_redundant_cases_ctx(ctx, |s: &System| s, cleaned);
-            if cleaned.is_empty() { return None; }
+            // Empty case-map: `simplifySystem` mzero'd every branch (the
+            // restriction / formula set is contradictory).  HS's `Simplify`
+            // arm (ProofMethod.hs:421-427) inspects `M.toList cases`; the
+            // empty list matches the `_ -> return cases` branch, so it
+            // returns `Just M.empty` — Simplify SUCCEEDS with zero cases.
+            // `proveSystemDFS` (Proof.hs:1043) then takes Simplify as the
+            // head method and builds a childless node, which `prettyProof`
+            // (Proof.hs:1084) renders as a `by simplify` leaf closing the
+            // (exists-trace) proof.  Returning `None` here instead would
+            // drop Simplify from the ranked list and let `Induction` win —
+            // the divergence this arm must avoid.
+            if cleaned.is_empty() { return Some(Vec::new()); }
             let cleaned_input = cleanup(sys);
             if cleaned.len() == 1 {
                 // Single-case path: HS's `Simplify` arm (ProofMethod.hs)
@@ -558,11 +569,26 @@ pub fn exec_proof_method(
                     // simplify can fan out per case — flat-map.
                     let kept_raw: Vec<(String, System)> = cases.into_iter()
                         .flat_map(|(name, sys, seed)| {
+                            // `TAM_RS_TRACE_CASE_SIMP=1`: bracket each
+                            // per-case simplify so interleaved trace hooks
+                            // (EDGES/SIMP_CONTRA/SET_NODES) attribute to a
+                            // named case.
+                            let dbg = tamarin_utils::env_gate!("TAM_RS_TRACE_CASE_SIMP");
+                            if dbg {
+                                eprintln!("[CASE_SIMP] begin name={} path={}",
+                                    name,
+                                    crate::constraint::solver::trace::case_path_string());
+                            }
                             let systems = simplify(sys, seed);
+                            let n_arms = systems.len();
                             let out: Vec<(String, System)> = systems.into_iter()
                                 .filter(|s| keep(s, &name))
                                 .map(|s| (name.clone(), s))
                                 .collect();
+                            if dbg {
+                                eprintln!("[CASE_SIMP] end name={} arms={} kept={}",
+                                    name, n_arms, out.len());
+                            }
                             out
                         })
                         .collect();

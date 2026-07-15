@@ -53,9 +53,12 @@ pub async fn post(
             Ok(entry) => {
                 let idx = state.store.insert(entry);
                 tracing::info!(idx, file = %filename, "uploaded theory");
-                // Haskell appends a wellformedness-warning suffix when the
-                // report is non-empty; the Rust load path does not surface
-                // that report, so we emit the no-warning message only.
+                // Haskell appends a ` WARNING: ignoring the following
+                // wellformedness errors: …` suffix to this alert when the
+                // report is non-empty (Handler.hs:807-811).  The Rust port
+                // emits the bare message; the same report is still surfaced on
+                // the theory page (the `wf-warning` banner + the source/message
+                // `/* WARNING */` block, both from `entry.wf_report`).
                 alert_msg = Some("Loaded new theory!".into());
             }
             // HS `postRootR` (src/Web/Handler.hs:803):

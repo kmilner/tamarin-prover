@@ -354,6 +354,23 @@ pub fn underline_topic(title: &str) -> String {
     s
 }
 
+/// Assemble a topic-grouped `WfReport` from pre-built body strings (empty
+/// `bodies` yields an empty report).  `underline_topic` already ends the
+/// `====` rule with a newline, so the extra `\n` is HS's `$-$` blank line
+/// before the bodies; the bodies are joined by the `\n  \n` that HS's
+/// `nest 2 (vcat (intersperse (text "") …))` renders a blank separator line
+/// as (a 2-space `nest 2`'d `text ""`).  Each body already carries its own
+/// 2-space `nest 2` indent.
+fn grouped_topic_block(topic: &str, bodies: Vec<String>) -> WfReport {
+    if bodies.is_empty() {
+        return Vec::new();
+    }
+    let mut msg = underline_topic(topic);
+    msg.push('\n');
+    msg.push_str(&bodies.join("\n  \n"));
+    vec![WfError::new(topic, msg)]
+}
+
 /// HS `numbered'` index width: `nWidth = length (show n)` where `n` is the
 /// number of items (PrettyPrint/Class.hs:257-258).  Each index is rendered as
 /// `flushRight nWidth (show i)` — i.e. left-padded with spaces to this width —
@@ -1354,16 +1371,7 @@ pub fn fresh_names_report(thy: &Theory) -> WfReport {
                 r.name, fresh_lits.join(", ")));
         }
     }
-    if bodies.is_empty() {
-        return Vec::new();
-    }
-    // `underline_topic` ends with the `====` rule + newline; the extra `\n` is
-    // HS's `$-$` blank line before the (nest-2) bodies.  Bodies are joined by a
-    // `nest 2`'d blank `text ""` line, rendering as `\n  \n`.
-    let mut msg = underline_topic(topic);
-    msg.push('\n');
-    msg.push_str(&bodies.join("\n  \n"));
-    vec![WfError::new(topic, msg)]
+    grouped_topic_block(topic, bodies)
 }
 
 // =============================================================================
@@ -1394,6 +1402,18 @@ pub fn public_names_report(thy: &Theory) -> WfReport {
             if k == NameKind::Pub { pairs.push((r.name.clone(), n)); }
         }
     }
+    public_names_report_from_pairs(pairs)
+}
+
+/// The clash-detection + rendering half of `publicNamesReport'`
+/// (Wellformedness.hs:463-484), factored out so the SAPIC post-translation
+/// re-check can feed it `(showRuleCaseName, pubName)` pairs harvested from the
+/// ELABORATED rules (whose `process=` attribute carries the source process, the
+/// way HS `universeBi` walks it) — the parser AST stores that attribute as a
+/// rendered string, so the parser-level walk above cannot see it.  `pairs` must
+/// arrive in rule order (matching HS `thyProtoRules`), first-occurrence-wins:
+/// `clashesOn` keeps the earliest `(rule, name)` per distinct public name.
+pub fn public_names_report_from_pairs(pairs: Vec<(String, String)>) -> WfReport {
     if pairs.is_empty() { return Vec::new(); }
     // HS `show` of a (public) Name constant is the quoted form `'name'`.
     let shw = |n: &str| format!("'{}'", n);
@@ -1730,24 +1750,12 @@ pub fn lemma_attribute_report(thy: &Theory) -> WfReport {
             && l.attributes.iter().any(|a| matches!(a, LemmaAttr::Reuse)))
         .map(|l| format!("  Lemma `{}': cannot reuse 'exists-trace' lemmas", l.name))
         .collect();
-    if bodies.is_empty() {
-        return Vec::new();
-    }
-    // `underline_topic` already ends with a newline after the `===` rule;
-    // the extra `\n` is HS's `$-$` blank line before the (nest-2) bodies.
-    // Bodies are joined by a blank line that is ITSELF `nest 2`'d — HS
-    // `nest 2 (vcat (intersperse (text "") bodies))` indents the empty
-    // separator line to two spaces, so the join separator is `\n  \n`,
-    // not `\n\n`.  (NB: the corpus has at most one reuse-exists lemma per
-    // file, so this multi-body path is exercised only synthetically; the
-    // per-lemma error COUNT in the `N wellformedness check failed` summary
-    // still collapses to one here — matching that would require the wider
-    // `format_wf_block` refactor that renders topic headers from raw
-    // body-only entries.)
-    let mut msg = underline_topic(topic);
-    msg.push('\n');
-    msg.push_str(&bodies.join("\n  \n"));
-    vec![WfError::new(topic, msg)]
+    // NB: the corpus has at most one reuse-exists lemma per file, so the
+    // multi-body path is exercised only synthetically; the per-lemma error
+    // COUNT in the `N wellformedness check failed` summary still collapses to
+    // one here — matching that would require the wider `format_wf_block`
+    // refactor that renders topic headers from raw body-only entries.
+    grouped_topic_block(topic, bodies)
 }
 
 // =============================================================================
@@ -2172,13 +2180,7 @@ pub fn nat_well_sorted_report(thy: &Theory) -> WfReport {
     // of LemmaItem/RestrictionItem/PredicateItem (Wellformedness.hs:327-329).
     // That formula-term walk is not yet implemented here; the nat checks that
     // fire in the corpus all sit inside rules.
-    if bodies.is_empty() {
-        return Vec::new();
-    }
-    let mut msg = underline_topic(topic);
-    msg.push('\n');
-    msg.push_str(&bodies.join("\n  \n"));
-    vec![WfError::new(topic, msg)]
+    grouped_topic_block(topic, bodies)
 }
 
 /// Faithful port of HS `nonWellSorted` (Wellformedness.hs:293-303): collect

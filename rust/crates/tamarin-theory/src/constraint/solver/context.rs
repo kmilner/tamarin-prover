@@ -167,6 +167,12 @@ pub struct ProofContext {
     /// to false; set by `prove_lemma` based on the lemma's
     /// trace-quantifier attribute (per-lemma, so owned).
     pub is_exists_trace: bool,
+    /// The solved-leaf extraction strategy for this lemma's auto-prover,
+    /// mirroring HS `apCut` (Theory/Proof.hs:702) threaded from
+    /// `--stop-on-trace` (TheoryLoader.hs:356-360).  `Dfs` is the default
+    /// (`fromMaybe CutDFS`); consumed once per lemma by `run_proof_search`
+    /// (search.rs).  Per-lemma / theory-global, so owned.
+    pub cut: CutStrategy,
     /// Pending typing assumptions (from `[sources]`-tagged lemmas)
     /// applied during `ensure_saturated`'s refinement step.  Set by
     /// `prove_lemma` before any source-case access; refinement is
@@ -239,6 +245,7 @@ impl Clone for ProofContext {
             use_induction: self.use_induction,
             injective_fact_insts: self.injective_fact_insts.clone(),
             is_exists_trace: self.is_exists_trace,
+            cut: self.cut,
             typing_assumptions: self.typing_assumptions.clone(),
             heuristic: self.heuristic.clone(),
             lemma_name: self.lemma_name.clone(),
@@ -250,6 +257,52 @@ impl Clone for ProofContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UseInduction { UseInduction, AvoidInduction }
+
+/// How the auto-prover cuts the proof tree around solved leaves,
+/// mirroring HS `SolutionExtractor` (Theory/Proof.hs:695) as selected
+/// by `runAutoProver` (Theory/Proof.hs:736-741).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutStrategy {
+    /// HS `CutDFS` → `cutOnSolvedDFS` (Theory/Proof.hs:856-886): parallel
+    /// iterative-deepening DFS, doubling `dMax` from 4.  Selects the leftmost
+    /// (preorder, CaseName order) solved leaf among those shallower than the
+    /// first `dMax` (4, 8, 16, …) to admit any solved leaf — within that
+    /// depth bucket a deeper-but-leftmost leaf beats a shallower one further
+    /// right, so this is NOT globally-shallowest.  The default when
+    /// `--stop-on-trace` is absent
+    /// (HS `constructAutoProver`: `fromMaybe CutDFS`, TheoryLoader.hs:705).
+    Dfs,
+    /// HS `CutSingleThreadDFS` → `cutOnSolvedSingleThreadDFS`
+    /// (Theory/Proof.hs:795-816): single-thread depth-first with NO depth
+    /// bound and NO iterative deepening.  `findSolved`'s `foldMap` over the
+    /// children map descends the leftmost branch (CaseName order) to
+    /// completion before its siblings and stops at the first solved leaf, so
+    /// a deep solved leaf under the leftmost branch wins over a shallower one
+    /// further right even when the shallower leaf sits inside `Dfs`'s first
+    /// depth bucket (where `Dfs` would cut the deep branch off and pick it).
+    SeqDfs,
+    /// HS `CutBFS` → `cutOnSolvedBFS` (Theory/Proof.hs:930-957): iterative
+    /// level-deepening over the DFS proof tree.  At each level `l` the tree
+    /// is forced to depth `l` and walked in CaseName order with threaded
+    /// state: a Solved leaf at exactly depth `l` flips TraceFound; a node
+    /// still pending at depth `l` is cut to `sorry /* bound reached */`
+    /// (`sorry /* ignored (attack exists) */` once TraceFound).  On
+    /// TraceFound the CUT tree is the result — those sorry leaves are part
+    /// of the printed proof; a level that completes with nothing pending
+    /// returns the full tree unchanged.
+    Bfs,
+    /// HS `CutNothing` → `id` (Theory/Proof.hs:740): no cut at all — the
+    /// full proof tree is built and printed; sibling exploration does not
+    /// stop when a trace is found.
+    Nothing,
+    /// HS `CutAfterSorry` → `cutAfterFirstSorry` (Theory/Proof.hs:989-999):
+    /// preorder walk in CaseName order; the first `Sorry` or Solved leaf
+    /// aborts, and every node visited after the abort becomes a bare
+    /// `sorry` leaf (children dropped, system annotation kept).  Under the
+    /// unbounded default prover the only aborter is a Solved leaf, so this
+    /// reads as "stop at the first trace, sorry out the remainder".
+    AfterSorry,
+}
 
 impl ProofContext {
     pub fn new(maude: MaudeHandle, rules: Vec<OpenProtoRule>) -> Self {
@@ -294,6 +347,7 @@ impl ProofContext {
             use_induction: self.use_induction,
             injective_fact_insts: self.injective_fact_insts.clone(),
             is_exists_trace: self.is_exists_trace,
+            cut: self.cut,
             typing_assumptions: self.typing_assumptions.clone(),
             heuristic: self.heuristic.clone(),
             lemma_name: self.lemma_name.clone(),
@@ -824,6 +878,7 @@ impl ProofContext {
             use_induction: UseInduction::AvoidInduction,
             injective_fact_insts,
             is_exists_trace: false,
+            cut: CutStrategy::Dfs,
             typing_assumptions: Vec::new(),
             heuristic: None,
             lemma_name: String::new(),

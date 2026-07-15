@@ -132,7 +132,7 @@ thread_local! {
     ///     BEFORE it enters the layout, exactly as the `Document (HtmlDoc d)`
     ///     instance (`Html.hs:102-105`) — so the stored bytes are already escaped
     ///     and the HughesPJ fill measures each token at its escaped-entity width
-    ///     (`<`/`>` = 4, `&`/`'` = 5, `"` = 6).  This subsumes the older
+    ///     (`<`/`>` = 4, `&`/`'` = 5, `"` = 6).  This is a superset of the
     ///     width-only [`HtmlEntityWidthGuard`].
     ///   * the highlight combinators ([`keyword`]/[`operator`]/[`comment`] via
     ///     [`Doc::highlight`]) wrap their argument in a `<span class="hl_*">…</span>`
@@ -156,6 +156,16 @@ impl HtmlDocGuard {
     /// restored when the returned guard is dropped.
     pub fn enable() -> Self {
         HtmlDocGuard(HTML_MODE.with(|c| c.replace(true)))
+    }
+
+    /// Force PLAIN mode for the current thread (previous value restored on
+    /// drop).  For plain-text side channels rendered while an enclosing
+    /// page render holds an `enable()` guard — e.g. the oracle/tactic
+    /// goal strings, which HS produces with the plain `render $
+    /// prettyGoal` regardless of the surrounding widget (ProofMethod.hs:607):
+    /// HTML spans/entities in oracle stdin break the oracle's regexes.
+    pub fn disable() -> Self {
+        HtmlDocGuard(HTML_MODE.with(|c| c.replace(false)))
     }
 }
 

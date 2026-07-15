@@ -209,9 +209,9 @@ fn dump_sys(sys: &crate::constraint::system::System) {
     for (id, rule) in sys.nodes.iter() {
         eprintln!("    {}:{} prems=[{}] concs=[{}] acts=[{}]",
             id.name, id.idx,
-            rule.premises.iter().map(|p| state_trace_fact_brief(p).to_string()).collect::<Vec<_>>().join(","),
-            rule.conclusions.iter().map(|c| state_trace_fact_brief(c).to_string()).collect::<Vec<_>>().join(","),
-            rule.actions.iter().map(|a| state_trace_fact_brief(a).to_string()).collect::<Vec<_>>().join(","));
+            rule.premises.iter().map(state_trace_fact_brief).collect::<Vec<_>>().join(","),
+            rule.conclusions.iter().map(state_trace_fact_brief).collect::<Vec<_>>().join(","),
+            rule.actions.iter().map(state_trace_fact_brief).collect::<Vec<_>>().join(","));
     }
     eprintln!("  edges: {}", sys.edges.len());
 }

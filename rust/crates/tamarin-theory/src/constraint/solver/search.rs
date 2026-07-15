@@ -9,13 +9,17 @@
 //! (Simplify + every open goal as `SolveGoal`, plus `Induction` in the
 //! initial state per `pcUseInduction`) and picks the first method whose
 //! `exec_proof_method` succeeds — mirroring `rankProofMethods` /
-//! `execMethods`.  The driver runs iterative-deepening DFS with
-//! memoized re-expansion (only `Sorry: depth limit` leaves are re-run
-//! across iterations), optional per-child parallel expansion, oracle
-//! handling, and solved-path extraction — a port of HS's
-//! `cutOnSolvedDFS`.
+//! `execMethods`.  The driver dispatches on `ProofContext::cut`: the
+//! default runs iterative-deepening DFS with memoized re-expansion
+//! (only `Sorry: depth limit` leaves are re-run across iterations),
+//! optional per-child parallel expansion, oracle handling, and
+//! solved-path extraction — a port of HS's `cutOnSolvedDFS`; the
+//! `--stop-on-trace=seqdfs` strategy instead runs a single serial
+//! unbounded-depth pass — HS's `cutOnSolvedSingleThreadDFS` (see
+//! `run_proof_search`).
 //!
-//! Termination is bounded by the ID-DFS depth alone (`MAX_DEPTH`,
+//! Under the default `Dfs` strategy, termination is bounded by the
+//! ID-DFS depth alone (`MAX_DEPTH`,
 //! doubling from 4) — `cutOnSolvedDFS` (Proof.hs:854-884) has only
 //! `dMax` and no step/node budget, doubling `dMax` from 4 with no
 //! upper bound.  HS terminates because it deepens over a finite proof
@@ -33,7 +37,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::constraint::solver::context::ProofContext;
+use crate::constraint::solver::context::{CutStrategy, ProofContext};
 use crate::constraint::solver::proof_method::{
     exec_proof_method, is_finished, ProofMethod, Result as MethodResult,
 };
@@ -69,6 +73,15 @@ pub enum NodeStatus {
     Unfinishable,
     /// Exceeded the `max_steps` budget.
     Sorry,
+}
+
+/// Map a terminal `is_finished` result to its leaf [`NodeStatus`].
+fn node_status_of(r: &MethodResult) -> NodeStatus {
+    match r {
+        MethodResult::Solved => NodeStatus::Solved,
+        MethodResult::Contradictory(_) => NodeStatus::Contradictory,
+        MethodResult::Unfinishable => NodeStatus::Unfinishable,
+    }
 }
 
 /// HS `ProofStatus` (Proof.hs:397-408) — the aggregate status of a WHOLE
@@ -167,6 +180,15 @@ fn keep_sys() -> bool {
     *V.get_or_init(|| std::env::var_os("TAM_RS_KEEP_SYS").is_some())
 }
 
+/// Per-child parallel expansion is ON by default;
+/// `TAM_RS_DISABLE_PARALLEL_EXPAND=1` forces serial sibling expansion
+/// (debug escape hatch).  Output-neutrality depends on every worker
+/// closure replicating the calling thread's user-fun thread-locals
+/// (`snapshot_user_funs` / `set_user_funs_from_collected` in the
+/// fan-out preamble): a stolen worker thread outside any lemma guard
+/// has EMPTY sets, and `term_to_lnterm` on such a thread lifts a
+/// declared nullary constant (e.g. ocsps-msr's `true/0`) to a free
+/// variable, nondeterministically changing unifier-arm survival.
 #[inline]
 fn disable_parallel_expand() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -183,10 +205,12 @@ fn disable_parallel_expand() -> bool {
 ///
 /// HS-faithful: HS has NO per-lemma wall-clock deadline — its iterative
 /// deepening runs to completion.  So by DEFAULT we apply NO cutoff either
-/// (a far-future deadline that never fires); termination is still
+/// (a far-future deadline that never fires); under the default `Dfs`
+/// strategy termination is still
 /// guaranteed by the ID-DFS depth cap (`MAX_DEPTH`), doubling from 4
 /// with only the far-out `usize::MAX/4` loop-termination guard (no
-/// fixed numeric cap).  A cutoff is
+/// fixed numeric cap), while `seqdfs` has no depth cut at all (like its
+/// HS counterpart — see `run_proof_search`).  A cutoff is
 /// applied ONLY when the caller explicitly opts in via the
 /// `TAM_PROVE_DEADLINE_MS` env var (e.g. corpus sweeps that want to bound
 /// per-lemma wall time).
@@ -213,8 +237,10 @@ thread_local! {
 
     /// ID-DFS depth limit for the current iteration.  `usize::MAX` =
     /// no limit (the thread-local's initial/reset value, used outside an
-    /// active search).  Set per iteration in `run_proof_search`'s ID-DFS
-    /// loop, which always starts at depth 4 and doubles up to the cap.
+    /// active search, and the fixed value for the whole of a `seqdfs`
+    /// search).  Under the default `Dfs` strategy it is set per iteration
+    /// in `run_proof_search`'s ID-DFS loop, which always starts at depth 4
+    /// and doubles up to the cap.
     static MAX_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 
     /// Set to true by `expand` whenever a node hits `MAX_DEPTH`.  The
@@ -241,11 +267,16 @@ fn clear_deadline()                     { DEADLINE.with(|d| d.set(None));     }
 /// far-out `usize::MAX/4` loop-termination guard (no fixed numeric cap),
 /// and the per-lemma
 /// wall-clock timeout (`deadline`).  See the `budget = usize::MAX`
-/// note in the loop body.
+/// note in each strategy arm.
 ///
 /// Returns the root proof node. The final status is the OR of children
 /// (Solved if all children solved, Contradictory if any contradictory,
 /// etc.) — matching Haskell's notion of "complete" proofs.
+///
+/// The search strategy is dispatched on `ctx.cut` (HS `apCut`):
+/// `CutStrategy::SeqDfs` (HS `cutOnSolvedSingleThreadDFS`) runs a single
+/// unbounded-depth serial pass; `CutStrategy::Dfs` (HS `cutOnSolvedDFS`,
+/// the default) runs the iterative-deepening DFS described below.
 ///
 /// **Iterative-deepening DFS** — port of Haskell's `cutOnSolvedDFS`
 /// (Proof.hs:854-884).  Starts at `max_depth=4` and doubles up with
@@ -306,12 +337,10 @@ pub fn run_proof_search(
             })
             .ok();
     }
-    // HS's `cutOnSolvedDFS` (Proof.hs:855-861) doubles `dMax` from 4 with NO
-    // upper bound; we mirror that, keeping only a far-out cap as a loop-
-    // termination guard for genuinely non-terminating strategies.  No real
-    // Tamarin proof approaches this depth, so the cap never flips a verdict.
-    let cap: usize = usize::MAX / 4;
-    let mut current_max_depth: usize = 4;
+    // `max_steps` is accepted for call-site signature compatibility but is
+    // not used as a cutoff (see the `budget = usize::MAX` note in each arm):
+    // HS's cut strategies bound the search by proof depth / wall-clock only.
+    let _ = max_steps;
     let mut root = ProofNode {
         method: ProofMethod::Sorry(Some("initial".into())),
         sys: initial,
@@ -319,65 +348,252 @@ pub fn run_proof_search(
         status: NodeStatus::Open,
         annotated: true,
     };
-    let mut first_iter = true;
-    loop {
-        MAX_DEPTH.with(|m| m.set(current_max_depth));
-        DEPTH_LIMIT_HIT.with(|f| f.set(false));
-        // HS-faithful: `cutOnSolvedDFS` (Proof.hs:856-863) bounds the
-        // search by the ID-DFS depth `dMax` (our `MAX_DEPTH`) and the
-        // per-lemma wall-clock timeout ONLY — it has NO step/node budget.
-        // The caller's `max_steps` was a non-faithful crutch that cut off
-        // exploration of *wide* (but correct) trees prematurely: e.g.
-        // csf17 keylessssl-modified::exists_detect_no_C_compromise, whose
-        // witness is reachable but sits beneath a broad fan-out of
-        // contradiction branches.  A finite step budget can turn a Solved
-        // exists-trace into Sorry once the loop-breaker count is HS-faithful
-        // (wider source cases), so we run unbudgeted as HS does: `MAX_DEPTH`
-        // doubles unbounded (mirroring HS's `dMax`), with only the far-out
-        // `cap` (`usize::MAX / 4`) as a loop-termination guard, and `deadline`
-        // catching wall-clock runaway.  `max_steps` is accepted for call-site
-        // signature compatibility but is not used as a cutoff.
-        let _ = max_steps;
-        let mut budget = usize::MAX;
-        if first_iter {
+    match ctx.cut {
+        CutStrategy::SeqDfs => {
+            // HS `cutOnSolvedSingleThreadDFS` (Theory/Proof.hs:795-816):
+            // single-thread DFS with NO iterative deepening and NO depth
+            // bound.  One unbounded-depth `expand` pass descends the leftmost
+            // branch (CaseName order) to completion, short-circuiting on the
+            // first solved leaf — the serial branch's `any_solved` early-break
+            // (gated below on `CutStrategy::SeqDfs`) mirrors `findSolved`'s
+            // `foldMap` over the children map.  `extract_solved_path` below
+            // then prunes to that leaf, HS's `extractSolved path prf0`.
+            // `MAX_DEPTH = usize::MAX` disables the depth cut entirely, so no
+            // branch becomes a `depth limit` Sorry, `DEPTH_LIMIT_HIT` never
+            // fires, and no re-expansion is needed.  Like HS (the FIXME at
+            // Theory/Proof.hs:793) this can fail to terminate on an infinite
+            // leftmost branch; the wall-clock `deadline` is the only backstop.
+            MAX_DEPTH.with(|m| m.set(usize::MAX));
+            DEPTH_LIMIT_HIT.with(|f| f.set(false));
+            let mut budget = usize::MAX;
             expand(ctx, &mut root, &mut budget, &deadline, 0);
-            first_iter = false;
-        } else {
-            // Re-expand only `Sorry: depth limit` leaves (Haskell-faithful
-            // memoization — the cached tree IS the proof tree, only the
-            // unforced "depth limit" thunks need (re-)expansion).
-            re_expand_depth_limited(ctx, &mut root, &mut budget, &deadline, 0);
         }
-        if matches!(root.status, NodeStatus::Solved | NodeStatus::Contradictory) {
-            break;
+        CutStrategy::Nothing => {
+            // HS `CutNothing` → `id` (Proof.hs:740): the full DFS proof
+            // tree with NO cut and NO stop-on-solved.  Like SeqDfs this is
+            // one unbounded-depth serial pass (the serial sibling loop's
+            // abort policy below never fires for `Nothing`), and like HS
+            // it may not terminate when a branch recurses forever; the
+            // wall-clock `deadline` is the only backstop.
+            MAX_DEPTH.with(|m| m.set(usize::MAX));
+            DEPTH_LIMIT_HIT.with(|f| f.set(false));
+            let mut budget = usize::MAX;
+            expand(ctx, &mut root, &mut budget, &deadline, 0);
         }
-        if std::time::Instant::now() >= deadline {
-            break;
+        CutStrategy::AfterSorry => {
+            // HS `CutAfterSorry` → `cutAfterFirstSorry` (Proof.hs:989-999).
+            // HS's `M.mapAccum go` never forces a lazy subtree past the
+            // abort point; the eager mirror is the serial sibling loop's
+            // AfterSorry policy (below): the first Solved-or-Sorry child in
+            // preorder aborts, and the remaining sibling cases are inserted
+            // as bare-`sorry` leaves instead of being expanded — exactly
+            // the nodes HS's `go True` rewrites to `Sorry Nothing`.
+            MAX_DEPTH.with(|m| m.set(usize::MAX));
+            DEPTH_LIMIT_HIT.with(|f| f.set(false));
+            let mut budget = usize::MAX;
+            expand(ctx, &mut root, &mut budget, &deadline, 0);
         }
-        let hit_depth = DEPTH_LIMIT_HIT.with(|f| f.get());
-        if !hit_depth {
-            // No branch hit the depth limit — going deeper won't help.
-            break;
+        CutStrategy::Bfs => {
+            // HS `cutOnSolvedBFS` (Proof.hs:930-957): force the tree one
+            // level deeper per round and walk it with `checkLevel`'s
+            // threaded state.  `checkLevel 0`'s `M.null cs` guard FORCES
+            // each level-`level` node's case map (so a zero-case solve
+            // renders as its own `by solve(…)` closure) without forcing
+            // the child subtrees — the eager mirror expands with
+            // `MAX_DEPTH = level + 1` (level-`level` nodes execute their
+            // method; their children are `depth limit` stubs standing in
+            // for HS's unforced thunks, and the `checkLevel` walk below
+            // never descends past `remaining == 0`, so the stubs never
+            // reach the output).  Deepening re-expands only the stub
+            // frontier, like the Dfs arm.
+            let cap: usize = usize::MAX / 4;
+            let mut level: usize = 1;
+            loop {
+                MAX_DEPTH.with(|m| m.set(level + 1));
+                DEPTH_LIMIT_HIT.with(|f| f.set(false));
+                let mut budget = usize::MAX;
+                if level == 1 {
+                    expand(ctx, &mut root, &mut budget, &deadline, 0);
+                } else {
+                    re_expand_depth_limited(ctx, &mut root, &mut budget, &deadline, 0);
+                }
+                // HS's poor-man's logging (Proof.hs:934,941) — `trace` to
+                // stderr, unconditional.
+                eprintln!("searching for attacks at depth: {}", level);
+                let mut found = false;
+                let mut incomplete = false;
+                bfs_check_level(&root, level, &mut found, &mut incomplete, false);
+                if found {
+                    eprintln!("attack found at depth: {}", level);
+                    let mut f2 = false;
+                    let mut i2 = false;
+                    if let Some(cut_tree) =
+                        bfs_check_level(&root, level, &mut f2, &mut i2, true) {
+                        root = cut_tree;
+                    }
+                    break;
+                }
+                // CompleteProof / UnfinishableProof: nothing was cut at
+                // this level — the tree is fully explored; keep it whole.
+                if !incomplete {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                if level >= cap {
+                    break;
+                }
+                level += 1;
+            }
         }
-        if current_max_depth >= cap {
-            // Depth cap reached; accept whatever we have.
-            break;
+        CutStrategy::Dfs => {
+            // HS's `cutOnSolvedDFS` (Proof.hs:855-861) doubles `dMax` from 4
+            // with NO upper bound; we mirror that, keeping only a far-out cap
+            // as a loop-termination guard for genuinely non-terminating
+            // strategies.  No real Tamarin proof approaches this depth, so the
+            // cap never flips a verdict.
+            let cap: usize = usize::MAX / 4;
+            let mut current_max_depth: usize = 4;
+            let mut first_iter = true;
+            loop {
+                MAX_DEPTH.with(|m| m.set(current_max_depth));
+                DEPTH_LIMIT_HIT.with(|f| f.set(false));
+                // HS-faithful: `cutOnSolvedDFS` (Proof.hs:856-863) bounds the
+                // search by the ID-DFS depth `dMax` (our `MAX_DEPTH`) and the
+                // per-lemma wall-clock timeout ONLY — it has NO step/node
+                // budget.  A finite step budget would cut off exploration of
+                // *wide* (but correct) trees prematurely — e.g. csf17
+                // keylessssl-modified::exists_detect_no_C_compromise, whose
+                // witness is reachable but sits beneath a broad fan-out of
+                // contradiction branches — turning a Solved exists-trace into
+                // Sorry (the loop-breaker count is HS-faithful, so source
+                // cases are wide).  So the caller's `max_steps` is ignored
+                // and we run unbudgeted as HS does: `MAX_DEPTH` doubles
+                // unbounded (mirroring HS's `dMax`), with only the far-out
+                // `cap` (`usize::MAX / 4`) as a loop-termination guard, and
+                // `deadline` catching wall-clock runaway.
+                let mut budget = usize::MAX;
+                if first_iter {
+                    expand(ctx, &mut root, &mut budget, &deadline, 0);
+                    first_iter = false;
+                } else {
+                    // Re-expand only `Sorry: depth limit` leaves
+                    // (Haskell-faithful memoization — the cached tree IS the
+                    // proof tree, only the unforced "depth limit" thunks need
+                    // (re-)expansion).
+                    re_expand_depth_limited(ctx, &mut root, &mut budget, &deadline, 0);
+                }
+                if matches!(root.status, NodeStatus::Solved | NodeStatus::Contradictory) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                let hit_depth = DEPTH_LIMIT_HIT.with(|f| f.get());
+                if !hit_depth {
+                    // No branch hit the depth limit — going deeper won't help.
+                    break;
+                }
+                if current_max_depth >= cap {
+                    // Depth cap reached; accept whatever we have.
+                    break;
+                }
+                current_max_depth = current_max_depth.saturating_mul(2).min(cap);
+            }
         }
-        current_max_depth = current_max_depth.saturating_mul(2).min(cap);
     }
     MAX_DEPTH.with(|m| m.set(usize::MAX));
     DEPTH_LIMIT_HIT.with(|f| f.set(false));
     clear_deadline();
-    // HS-faithful: `cutOnSolvedDFS` (Proof.hs:854-884) calls
-    // `extractSolved path prf0` once a Solved leaf is found, pruning
-    // the proof tree to JUST the solved-witness path.  All
-    // Contradictory siblings are removed.  Without this, Rust's
-    // proof_steps count includes failed branches HS prunes — e.g.
-    // NSPK3 session_key_setup_possible reports 30 steps vs HS 5.
-    if matches!(root.status, NodeStatus::Solved) {
+    // HS-faithful: `cutOnSolvedDFS` / `cutOnSolvedSingleThreadDFS`
+    // (Proof.hs:854-884, 795-816) call `extractSolved path prf0` once a
+    // Solved leaf is found, pruning the proof tree to JUST the
+    // solved-witness path.  All Contradictory siblings are removed.
+    // Without this, Rust's proof_steps count includes failed branches HS
+    // prunes — e.g. NSPK3 session_key_setup_possible reports 30 steps vs
+    // HS 5.  The other extractors keep their trees: `CutNothing` = `id`,
+    // `CutBFS` returns its level-cut tree, `CutAfterSorry` its
+    // sorry-stubbed tree.
+    if matches!(ctx.cut, CutStrategy::Dfs | CutStrategy::SeqDfs)
+        && matches!(root.status, NodeStatus::Solved)
+    {
         extract_solved_path(&mut root);
     }
     root
+}
+
+/// HS `cutOnSolvedBFS`'s `checkLevel` (Proof.hs:942-957) over the eager
+/// level-bounded tree: walk to depth `remaining` in CaseName order,
+/// threading `found` (HS TraceFound) and `incomplete` (HS
+/// IncompleteProof) exactly as HS's `State ProofStatus` does.  At depth 0:
+/// a Solved leaf flips `found`; a node still pending (our
+/// `sorry /* depth limit */` frontier mark = HS's node-with-children)
+/// becomes `sorry /* bound reached */`, or
+/// `sorry /* ignored (attack exists) */` once `found` is set; every other
+/// leaf is untouched.  With `build` set the transformed tree is returned
+/// (statuses re-rolled); a scan pass (`build = false`) returns `None`.
+fn bfs_check_level(
+    node: &ProofNode,
+    remaining: usize,
+    found: &mut bool,
+    incomplete: &mut bool,
+    build: bool,
+) -> Option<ProofNode> {
+    if remaining == 0 {
+        let solved_leaf = matches!(
+            &node.method,
+            ProofMethod::Finished(MethodResult::Solved)
+        );
+        if solved_leaf {
+            *found = true;
+            return build.then(|| node.clone());
+        }
+        let pending = !node.children.is_empty()
+            || matches!(
+                &node.method,
+                ProofMethod::Sorry(Some(msg)) if msg == "depth limit"
+            );
+        if pending {
+            let msg = if *found {
+                "ignored (attack exists)"
+            } else {
+                *incomplete = true;
+                "bound reached"
+            };
+            return build.then(|| ProofNode {
+                method: ProofMethod::Sorry(Some(msg.into())),
+                sys: node.sys.clone(),
+                children: BTreeMap::new(),
+                status: NodeStatus::Sorry,
+                annotated: node.annotated,
+            });
+        }
+        return build.then(|| node.clone());
+    }
+    if node.children.is_empty() {
+        return build.then(|| node.clone());
+    }
+    let mut new_children: BTreeMap<String, ProofNode> = BTreeMap::new();
+    for (name, child) in &node.children {
+        let t = bfs_check_level(child, remaining - 1, found, incomplete, build);
+        if build {
+            new_children.insert(
+                name.clone(),
+                t.expect("bfs_check_level: build pass returned None"),
+            );
+        }
+    }
+    build.then(|| {
+        let status = rollup_from_children(&new_children);
+        ProofNode {
+            method: node.method.clone(),
+            sys: node.sys.clone(),
+            children: new_children,
+            status,
+            annotated: node.annotated,
+        }
+    })
 }
 
 /// HS-faithful `extractSolved` (Proof.hs:879-884, the non-diff
@@ -468,11 +684,14 @@ fn re_expand_depth_limited(
         return;
     }
     // Recurse into children.  Any depth-limited descendant gets
-    // re-expanded in place.  Match `expand`'s early-break-on-Solved.
+    // re-expanded in place.  Match `expand`'s early-break-on-Solved —
+    // except under `Bfs`, whose level walk (like HS `checkLevel`'s
+    // `traverse`) forces every sibling regardless of solved ones.
     let names: Vec<String> = node.children.keys().cloned().collect();
+    let early_break = !matches!(ctx.cut, CutStrategy::Bfs);
     let mut found_solved = false;
     for name in names {
-        if found_solved { break; }
+        if early_break && found_solved { break; }
         if *budget == 0 { break; }
         if std::time::Instant::now() >= *deadline { break; }
         if let Some(child) = node.children.get_mut(&name) {
@@ -605,11 +824,7 @@ fn expand_inner(
     }
     // Already terminal.
     if let Some(r) = is_finished(ctx, &node.sys) {
-        node.status = match &r {
-            MethodResult::Solved => NodeStatus::Solved,
-            MethodResult::Contradictory(_) => NodeStatus::Contradictory,
-            MethodResult::Unfinishable => NodeStatus::Unfinishable,
-        };
+        node.status = node_status_of(&r);
         node.method = ProofMethod::Finished(r);
         return;
     }
@@ -640,7 +855,10 @@ fn expand_inner(
     //     UseInduction   -> (Induction, "") : simplify : gs
     //
     // Then `execMethods` filters to those that succeed.
-    let candidates = candidate_methods(&node.sys, ctx, depth);
+    // `candidate_methods_open`: the terminal check above just proved
+    // `is_finished(ctx, &node.sys)` is `None`, and nothing has touched
+    // `node.sys` since — skip the guarded entry's redundant re-sweep.
+    let candidates = candidate_methods_open(&node.sys, ctx, depth);
     let (method, cases) = {
         let mut pick: Option<(ProofMethod, Vec<(String, System)>)> = None;
         for m in candidates {
@@ -708,28 +926,30 @@ fn expand_inner(
     // Per-child parallelism (env-opt: `TAM_RS_DISABLE_PARALLEL_EXPAND=1`
     // disables; default ON).  Mirrors HS's `parTraversable nfProofMethod`
     // at `Theory/Proof.hs:871` (the `nfProofMethod` helper at 871-877)
-    // inside `cutOnSolvedDFS`: HS evaluates
-    // each child's proof-method/info/children in parallel via the Eval
-    // monad strategy.  We do the equivalent by running each child's
-    // `expand` on a rayon worker.  Faithful: case sort order, per-child
-    // sys cloning, rollup semantics are unchanged.  Trade-off: parallel
-    // mode drops the `any_solved` early-break short-circuit, so it may
-    // explore siblings HS's lazy `foldMap` would prune.  This is
-    // output-neutral wasted work: `run_proof_search` finishes by calling
-    // `extract_solved_path`, which walks `node.children` (a key-sorted
-    // BTreeMap) and prunes to the first Solved leaf in key order —
-    // re-imposing exactly HS's `foldMap` + `extractSolved` first-in-map
-    // selection.  The extra exploration only costs CPU; the pruned output
-    // is identical.  Gated off for exists-trace lemmas (see below) so we
-    // never pay that cost where the early-break matters for speed.
+    // inside `cutOnSolvedDFS`: HS evaluates each child's
+    // proof-method/info/children in parallel via the Eval monad strategy.
+    // We do the equivalent by running each child's `expand` on a rayon
+    // worker.  Faithful: case sort order, per-child sys cloning, rollup
+    // semantics are unchanged.  Trade-off: parallel mode drops the
+    // `any_solved` early-break short-circuit, so it may explore siblings
+    // HS's lazy `foldMap` would prune.  This is output-neutral wasted
+    // work: `run_proof_search` finishes by calling `extract_solved_path`,
+    // which walks `node.children` (a key-sorted BTreeMap) and prunes to
+    // the first Solved leaf in key order — re-imposing exactly HS's
+    // `foldMap` + `extractSolved` first-in-map selection.  The extra
+    // exploration only costs CPU; the pruned output is identical.  Gated
+    // off for exists-trace lemmas (see below) so we never pay that cost
+    // where the early-break matters for speed.
     // Bounded by rayon's global pool sized via `--processors=N`.
     //
-    // Thread-locals propagated to workers: MAX_DEPTH (read-only), and
+    // Thread-locals propagated to workers: MAX_DEPTH (read-only),
     // DEPTH_LIMIT_HIT (each worker sets its local, aggregated OR after
-    // the parallel pass).  case_path is best-effort under parallel:
-    // each worker seeds its stack from the parent's snapshot at entry.
+    // the parallel pass), and the user-fun sets (snapshot installed per
+    // worker — see `disable_parallel_expand`).  case_path is best-effort
+    // under parallel: each worker seeds its stack from the parent's
+    // snapshot at entry.
     let n_cases = cases.len();
-    let dbg_serial_only = disable_parallel_expand();
+    let serial_only = disable_parallel_expand();
     // Gate parallel mode on all-traces lemmas only.  Exists-trace
     // lemmas rely on the `any_solved` early-break (HS's lazy `foldMap`
     // short-circuit on `TraceFound`) — once a single witness branch
@@ -740,8 +960,18 @@ fn expand_inner(
     // All-traces lemmas never short-circuit on Solved (Solved means a
     // counter-example was found; valid lemmas never see this), so for
     // those parallel exploration of every sibling matches HS exactly.
-    let parallel = !dbg_serial_only
+    let parallel = !serial_only
         && !ctx.is_exists_trace
+        // Only `Dfs` (HS `cutOnSolvedDFS`, itself `parTraversable`-parallel)
+        // expands siblings in parallel.  seqdfs (HS
+        // `cutOnSolvedSingleThreadDFS`) is single-threaded by definition —
+        // it descends the leftmost branch to completion and short-circuits
+        // on the first solved leaf; parallel sibling exploration would
+        // defeat that early-break, exploring (and possibly hanging on)
+        // branches HS's `foldMap` prunes.  The bfs/none/sorry extractors
+        // route through the serial branch's per-strategy abort policy
+        // (below), which the parallel branch does not implement.
+        && matches!(ctx.cut, CutStrategy::Dfs)
         && n_cases >= 2
         && depth <= 16;  // bound recursion-level parallel splits; deeper
                          // splits hurt more than help under rayon's
@@ -757,6 +987,13 @@ fn expand_inner(
         let path_snapshot: Vec<String> =
             crate::constraint::solver::trace::case_path_snapshot();
         let deadline_snapshot = *deadline;
+        // Snapshot the user-fun sets for the workers: `term_to_lnterm` /
+        // `term_to_gterm` (insert_atom, formula conversions) read them via
+        // thread-locals, and a stolen worker thread outside any lemma
+        // guard has EMPTY sets — a declared nullary constant (ocsps-msr's
+        // `true/0`) would elaborate as a free variable on that worker,
+        // nondeterministically changing unifier-arm survival.
+        let user_funs_snapshot = crate::elaborate::snapshot_user_funs();
         // `run_proof_search` runs on a rayon WORKER thread, so
         // `into_par_iter().collect()` runs the per-case closures ON THIS SAME
         // THREAD, mutating per-search thread-locals (`DEPTH_LIMIT_HIT`,
@@ -775,6 +1012,8 @@ fn expand_inner(
             DEPTH_LIMIT_HIT.with(|f| f.set(false));
             DEADLINE.with(|d| d.set(Some(deadline_snapshot)));
             crate::constraint::solver::trace::case_path_set(&path_snapshot);
+            let _user_funs_guard =
+                crate::elaborate::set_user_funs_from_collected(&user_funs_snapshot);
             let push_path = !name.is_empty();
             if push_path { crate::constraint::solver::trace::case_path_push(&name); }
             // Per-worker MaudeHandle: siblings must not share `ctx.maude`'s
@@ -846,12 +1085,51 @@ fn expand_inner(
             node.children.insert(name, child);
         }
     } else {
-        // Serial branch keeps a local `any_solved` purely to drive the
-        // Haskell-lazy early break; the final node status is rolled up
-        // from `node.children` by `rollup_from_children` below.
-        let mut any_solved = false;
+        // Serial branch: the local `abort` flag mirrors each extractor's
+        // lazy sibling cut; the final node status is rolled up from
+        // `node.children` by `rollup_from_children` below.
+        //
+        //   Dfs / SeqDfs:  stop on the first TraceFound — HS `findSolved`'s
+        //                  `foldMap`-with-`Solution` short-circuit.
+        //   Bfs / Nothing: never stop — HS forces every sibling
+        //                  (`checkLevel`'s `traverse` / `id`).
+        //   AfterSorry:    stop on the first Solved-or-Sorry subtree, and
+        //                  keep the remaining cases as bare-`sorry` LEAVES —
+        //                  HS `cutAfterFirstSorry`'s `go True` rewrites every
+        //                  node visited after the abort to `Sorry Nothing`
+        //                  with its children dropped and its annotation
+        //                  kept, which is exactly a case HS never forces.
+        let mut abort = false;
         for (name, sys) in cases {
-            if any_solved { break; }  // Haskell-lazy: stop on first TraceFound.
+            if abort {
+                match ctx.cut {
+                    CutStrategy::AfterSorry => {
+                        // HS `go True` (cutAfterFirstSorry, Proof.hs:993-996)
+                        // still forces the visited node's METHOD (not its
+                        // children): a node whose method evaluates to
+                        // `Finished _` is preserved after the abort —
+                        // NSPK3 renders `by contradiction /* cyclic */`
+                        // leaves amid the sorry stubs — while every
+                        // still-open node becomes a bare `sorry` leaf.
+                        let (method, status) = match is_finished(ctx, &sys) {
+                            Some(r) => {
+                                let st = node_status_of(&r);
+                                (ProofMethod::Finished(r), st)
+                            }
+                            None => (ProofMethod::Sorry(None), NodeStatus::Sorry),
+                        };
+                        node.children.insert(name, ProofNode {
+                            method,
+                            sys,
+                            children: BTreeMap::new(),
+                            status,
+                            annotated: true,
+                        });
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
             let mut child = ProofNode {
                 method: ProofMethod::Sorry(None),
                 sys,
@@ -866,9 +1144,13 @@ fn expand_inner(
             if push_path { crate::constraint::solver::trace::case_path_push(&name); }
             expand(ctx, &mut child, budget, deadline, depth + 1);
             if push_path { crate::constraint::solver::trace::case_path_pop(); }
-            if matches!(child.status, NodeStatus::Solved) {
-                any_solved = true;
-            }
+            abort = match ctx.cut {
+                CutStrategy::Dfs | CutStrategy::SeqDfs =>
+                    matches!(child.status, NodeStatus::Solved),
+                CutStrategy::Bfs | CutStrategy::Nothing => false,
+                CutStrategy::AfterSorry =>
+                    matches!(child.status, NodeStatus::Solved | NodeStatus::Sorry),
+            };
             node.children.insert(name, child);
         }
     }
@@ -981,6 +1263,29 @@ pub fn candidate_methods(
     ctx: &ProofContext,
     depth: usize,
 ) -> Vec<ProofMethod> {
+    // HS `stoppingMethod` (rankProofMethods, ProofMethod.hs:749-751):
+    // `(Finished <$> isFinished ctxt sys) <|> …` — a finished system's
+    // method list is exactly `[Finished r]`, displacing Simplify and every
+    // goal.  The web display/apply paths call here directly — e.g. an
+    // accountability `⊤` VC lemma's root, whose one applicable method is
+    // `contradiction` (HS redirects on it; an empty list here made RS
+    // alert "prover failed").
+    if let Some(r) = is_finished(ctx, sys) {
+        return vec![ProofMethod::Finished(r)];
+    }
+    candidate_methods_open(sys, ctx, depth)
+}
+
+/// [`candidate_methods`] minus the `stoppingMethod` guard, for callers that
+/// have ALREADY run [`is_finished`] on `sys` and got `None` (`expand_inner`
+/// checks the terminal case immediately before ranking): `is_finished` is
+/// the full contradiction sweep, and re-running it here doubled its cost on
+/// every expanded node (measured +7% wall on CCITT_X509_3).
+fn candidate_methods_open(
+    sys: &System,
+    ctx: &ProofContext,
+    depth: usize,
+) -> Vec<ProofMethod> {
     let mut out: Vec<ProofMethod> = Vec::new();
     // Haskell-faithful: build the FULL ranked goal list, not just the
     // first one (ProofMethod.hs:520-540).  Haskell's `proofMethods`
@@ -1031,6 +1336,11 @@ pub fn candidate_methods_with_expl(
 ) -> Vec<(ProofMethod, String)> {
     use crate::constraint::constraints::Goal;
     use crate::constraint::solver::annotated_goals::Usefulness;
+    // HS `stoppingMethod` — see `candidate_methods`; keeps the DISPLAYED
+    // numbering in lockstep with the apply path.
+    if let Some(r) = is_finished(ctx, sys) {
+        return vec![(ProofMethod::Finished(r), String::new())];
+    }
     // Oracle ranked nothing with quitOnEmpty → ApplySorry (expl "").
     let goals = match rank_goals_or_abort(sys, ctx, depth) {
         Ok(gs) => gs,

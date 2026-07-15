@@ -9,7 +9,16 @@
 //!
 //!   --prove[=LEMMA]            select a lemma (or prefix*) to prove. Repeatable.
 //!   --lemma[=LEMMA]            (synonym for --prove without proving — kept for parity)
-//!   --stop-on-trace=DFS|...    trace-search policy (parsed, not yet routed in port)
+//!   --stop-on-trace=DFS|BFS|SEQDFS|SORRY|NONE
+//!                              trace-search policy (HS SolutionExtractor:
+//!                              CutDFS default / CutBFS /
+//!                              CutSingleThreadDFS / CutAfterSorry /
+//!                              CutNothing), routed in prove-mode; when the
+//!                              flag is absent the theory's in-file
+//!                              `configuration:` block is consulted
+//!                              (run.rs `effective_config`).  Without
+//!                              --prove every value parses and is ignored,
+//!                              as in HS.
 //!   --bound=N, -bN             proof-depth bound
 //!   --saturation=N, -sN        saturation iterations (parsed, not yet routed)
 //!   --heuristic=...            heuristic ranking sequence (overrides per-lemma)
@@ -41,11 +50,10 @@
 //!   -h|-?|--help               print help and exit
 //!   -V|--version               print version and exit
 //!
-//! Subcommands recognised but unimplemented in the Rust port (clear
-//! error message issued):
+//! Subcommands:
 //!
-//!   variants      compute intruder-rule variants
-//!   test          self-test
+//!   variants      dump the DH/BP intruder-rule variants
+//!   test          install self-check (maude + GraphViz `dot` availability)
 //!
 //! `interactive` subcommand flags (mirrors `Main/Mode/Interactive.hs`):
 //!

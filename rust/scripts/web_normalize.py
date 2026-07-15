@@ -54,6 +54,13 @@ _VOLATILE = [
     # parenthetical to a placeholder on BOTH sides.  The load path never
     # contains a `)`, so `[^)]*` stops at the closing paren.
     (re.compile(r"Loaded at [^)]*"), "Loaded at #"),
+    # web_parity.sh stages each theory in a fresh `mktemp -d` workdir, and the
+    # cached HS manifest generally comes from a DIFFERENT run (different
+    # tmpdir) than the live RS crawl.  Absolute paths under it leak into the
+    # sequent pane's oracle banner ("Goals sorted according to an oracle …
+    # located at /tmp/tmp.XXXX/thy/oracle-…"), so canonicalise the random
+    # tmpdir component on both sides.
+    (re.compile(r"/tmp/tmp\.[A-Za-z0-9]+/"), "/tmp/tmp.#/"),
 ]
 
 

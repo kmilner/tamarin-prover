@@ -308,6 +308,199 @@ pub fn check_guarded_wf(parser_thy: &p::Theory) -> Vec<tamarin_parser::wf::WfErr
     out
 }
 
+/// Post-translation port of HS `publicNamesReport'` (Wellformedness.hs:463-484)
+/// for SAPIC theories.  HS runs the FULL `checkWellformedness` on the TRANSLATED
+/// theory, so `publicNames = universeBi ru` walks each generated rule INCLUDING
+/// the source subprocess HS attaches to it.  The parser-level
+/// `wf::public_names_report` runs BEFORE translation (on the process-only
+/// theory, no generated rules) and — even post-translation — the parser AST
+/// stores the process only as a rendered `process="…"` string, so a constant
+/// appearing solely inside the process (the `'C'` in `insert <'roles', x, 'C'>`)
+/// is invisible to it.  Walk the ELABORATED rules' facts AND their `process`
+/// attribute here to recover those constants.
+///
+/// The root `Init` rule carries the WHOLE process (`base_init`,
+/// tamarin-sapic base_translation.rs:952; HS `baseInit`,
+/// Basetranslation.hs:313 — the rule's annotation is `anP`, the full
+/// process) and is emitted first, so under `clashesOn`'s
+/// first-occurrence dedup it wins every public name — reproducing HS's
+/// `rule "Init":  name 'C', 'c'` attribution.
+pub fn sapic_public_names_report(thy: &Theory) -> Vec<tamarin_parser::wf::WfError> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for r in thy.items.iter().filter_map(|it| match it {
+        TheoryItem::Rule(r) => Some(r),
+        _ => None,
+    }) {
+        // HS `showRuleCaseName ru = prettyProtoRuleName (ruleName ru)`
+        // (Rule.hs:1225-1227) = `prefixIfReserved n` for a `StandRule n`.
+        let case_name = crate::rule::prefix_if_reserved(r.name());
+        let mut names: Vec<String> = Vec::new();
+        for f in r.rule.premises.iter()
+            .chain(&r.rule.actions)
+            .chain(&r.rule.conclusions)
+        {
+            for t in &f.terms {
+                collect_pub_names(t, &mut names);
+            }
+        }
+        if let Some(proc) = &r.rule.info.attributes.process {
+            collect_process_pub_names(proc, &mut names);
+        }
+        for n in names {
+            pairs.push((case_name.clone(), n));
+        }
+    }
+    tamarin_parser::wf::public_names_report_from_pairs(pairs)
+}
+
+/// Collect the id of every public-sorted `Name` constant in a term, in
+/// traversal order (HS `filter ((LSortPub ==) . sortOfName) (universeBi t)`).
+/// Generic over the variable type so it serves both `LNTerm` (rule facts) and
+/// `SapicTerm` (process terms).
+fn collect_pub_names<V>(t: &VTerm<Name, V>, out: &mut Vec<String>) {
+    match t {
+        Term::Lit(Lit::Con(n)) => {
+            if tamarin_term::lterm::sort_of_name(n) == LSort::Pub {
+                out.push(n.id.0.to_string());
+            }
+        }
+        Term::Lit(Lit::Var(_)) => {}
+        Term::App(_, args) => {
+            for a in args.iter() {
+                collect_pub_names(a, out);
+            }
+        }
+    }
+}
+
+/// Walk every node of a SAPIC process (`pfoldMap`), collecting public-name
+/// constants from each node's terms — the `universeBi` reach over the source
+/// subprocess HS attaches to a generated rule.  HS's `universeBi` is
+/// field-exhaustive: it also descends into each node's
+/// `ProcessParsedAnnotation.location` term and into a `Cond` combinator's
+/// condition formula (both `Data` in HS), so those are harvested here too.
+/// Collection order within a rule differs from HS's (HS walks `rInfo` first,
+/// facts after) but is immaterial: `clashesOn` dedups by (spelling) with the
+/// surviving pair keyed only on (rule name, spelling), which is identical for
+/// every occurrence inside one rule.
+fn collect_process_pub_names(p: &crate::sapic::PlainProcess, out: &mut Vec<String>) {
+    use crate::sapic::{Process, ProcessCombinator as PC, SapicAction as SA};
+    crate::sapic::pfold_map(p, &mut |node| {
+        let ann = match node {
+            Process::Null(a) => a,
+            Process::Action(_, a, _) => a,
+            Process::Comb(_, a, _, _) => a,
+        };
+        if let Some(loc) = &ann.location {
+            collect_pub_names(loc, out);
+        }
+        match node {
+            Process::Null(_) => {}
+            Process::Action(ac, _, _) => match ac {
+                SA::ChIn { chan, msg, .. } => {
+                    if let Some(c) = chan { collect_pub_names(c, out); }
+                    collect_pub_names(msg, out);
+                }
+                SA::ChOut { chan, msg } => {
+                    if let Some(c) = chan { collect_pub_names(c, out); }
+                    collect_pub_names(msg, out);
+                }
+                SA::Insert(a, b) => {
+                    collect_pub_names(a, out);
+                    collect_pub_names(b, out);
+                }
+                SA::Delete(a) | SA::Lock(a) | SA::Unlock(a) => collect_pub_names(a, out),
+                SA::Event(fa) => {
+                    for t in &fa.terms { collect_pub_names(t, out); }
+                }
+                SA::ProcessCall(_, args) => {
+                    for t in args { collect_pub_names(t, out); }
+                }
+                SA::Msr { prems, acts, concs, .. } => {
+                    for fa in prems.iter().chain(acts).chain(concs) {
+                        for t in &fa.terms { collect_pub_names(t, out); }
+                    }
+                }
+                SA::Rep | SA::New(_) => {}
+            },
+            Process::Comb(c, _, _, _) => match c {
+                PC::CondEq(a, b) => {
+                    collect_pub_names(a, out);
+                    collect_pub_names(b, out);
+                }
+                PC::Lookup(t, _) => collect_pub_names(t, out),
+                PC::Let { left, right, .. } => {
+                    collect_pub_names(left, out);
+                    collect_pub_names(right, out);
+                }
+                // `Cond` stores its condition as an UN-elaborated parser-AST
+                // formula (see `ProcessCombinator::Cond`); HS stores an
+                // elaborated `SapicNFormula` whose `'c'` literals are `Name`s
+                // that `universeBi` collects.  Harvest the parser `PubLit`s —
+                // bare nullary-constant tokens stay `Var`/`App` in the parser
+                // AST and are correctly NOT collected (in HS they are `FApp`s,
+                // not `Name`s).
+                PC::Cond(f) => collect_parser_formula_pub_names(f, out),
+                PC::Parallel | PC::Ndc => {}
+            },
+        }
+        Vec::<()>::new()
+    });
+}
+
+/// Collect public-name constants (parser `PubLit`, HS `Name PubName`) from a
+/// parser-AST formula, in traversal order.  Serves `collect_process_pub_names`
+/// for the `Cond` combinator, whose condition never leaves the parser AST.
+fn collect_parser_formula_pub_names(f: &p::Formula, out: &mut Vec<String>) {
+    use tamarin_parser::ast::{Atom, Formula};
+    match f {
+        Formula::False | Formula::True => {}
+        Formula::Atom(a) => match a {
+            Atom::Eq(x, y) | Atom::Less(x, y) | Atom::LessMset(x, y)
+            | Atom::Subterm(x, y) => {
+                collect_parser_term_pub_names(x, out);
+                collect_parser_term_pub_names(y, out);
+            }
+            Atom::Action(fa, t) => {
+                for x in &fa.args { collect_parser_term_pub_names(x, out); }
+                collect_parser_term_pub_names(t, out);
+            }
+            Atom::Last(t) => collect_parser_term_pub_names(t, out),
+            Atom::Pred(fa) => {
+                for x in &fa.args { collect_parser_term_pub_names(x, out); }
+            }
+        },
+        Formula::Not(x) => collect_parser_formula_pub_names(x, out),
+        Formula::And(x, y) | Formula::Or(x, y) | Formula::Implies(x, y)
+        | Formula::Iff(x, y) => {
+            collect_parser_formula_pub_names(x, out);
+            collect_parser_formula_pub_names(y, out);
+        }
+        Formula::Forall(_, x) | Formula::Exists(_, x) => {
+            collect_parser_formula_pub_names(x, out);
+        }
+    }
+}
+
+/// Collect public-name constants from a parser-AST term (the `PubLit`
+/// variant), recursively.
+fn collect_parser_term_pub_names(t: &p::Term, out: &mut Vec<String>) {
+    use tamarin_parser::ast::Term as PT;
+    match t {
+        PT::PubLit(n) => out.push(n.clone()),
+        PT::Var(_) | PT::FreshLit(_) | PT::NatLit(_) | PT::Number(_)
+        | PT::NumberOne | PT::NatOne | PT::DhNeutral => {}
+        PT::App(_, args) | PT::Pair(args) => {
+            for a in args { collect_parser_term_pub_names(a, out); }
+        }
+        PT::AlgApp(_, a, b) | PT::Diff(a, b) | PT::BinOp(_, a, b) => {
+            collect_parser_term_pub_names(a, out);
+            collect_parser_term_pub_names(b, out);
+        }
+        PT::PatMatch(inner) => collect_parser_term_pub_names(inner, out),
+    }
+}
+
 /// Elaborate a parser theory into a typed `Theory`. The signature
 /// is initialised from the union of `builtins:` declarations. Before
 /// the structural conversion runs, predicate atoms are expanded
@@ -449,6 +642,20 @@ fn collect_user_funs(items: &[p::TheoryItem]) -> CollectedUserFuns {
         private,
         destructor,
     }
+}
+
+/// The set of 0-arity function-symbol names for a theory: every user
+/// `functions: f/0` declaration plus each enabled builtin's nullary constants.
+/// Mirrors HS's parser-state `nullaryApp` lookup (Theory/Text/Parser/Term.hs:
+/// 139-143), which resolves a bare `<name>` token to `FApp (NoEq <sym>) []`
+/// rather than `Var <name>` when `<name>` is 0-arity in the signature.  The
+/// `_restrict` / SAPIC-`Cond` restriction lift (`rule_restriction`) needs this
+/// set to keep such constants inlined in the generated restriction formula
+/// (HS `rewrite` treats a `FApp` as a non-variable and never abstracts it,
+/// whereas the un-resolved parser-AST `Var` would be abstracted into a fresh
+/// fact argument).
+pub fn nullary_fun_names(items: &[p::TheoryItem]) -> BTreeSet<String> {
+    collect_user_funs(items).nullary
 }
 
 /// The `(name, privacy, constructability)` of every NoEq function symbol a
@@ -669,6 +876,22 @@ pub fn set_user_funs_from_collected(funs: &CollectedUserFuns) -> UserFunsForTheo
     }
 }
 
+/// Snapshot the calling thread's user-fun thread-locals so a rayon
+/// fan-out can replicate them onto its worker threads (which spawn with
+/// EMPTY sets).  Capture this BEFORE `par_iter`, then install per worker
+/// with [`set_user_funs_from_collected`]; a worker that converts terms
+/// without them mis-classifies user nullary/unary symbols (e.g. a
+/// declared `true/0` lifts to a free variable), silently changing term
+/// identity relative to the calling thread.
+pub fn snapshot_user_funs() -> CollectedUserFuns {
+    CollectedUserFuns {
+        unary: USER_UNARY_FUNS.with(|c| c.borrow().clone()),
+        nullary: USER_NULLARY_FUNS.with(|c| c.borrow().clone()),
+        private: USER_PRIVATE_FUNS.with(|c| c.borrow().clone()),
+        destructor: USER_DESTRUCTOR_FUNS.with(|c| c.borrow().clone()),
+    }
+}
+
 fn elaborate_already_expanded(parser_thy: &p::Theory) -> Result<Theory, ElabError> {
     let mut sig = SignaturePure::empty(parser_thy.is_diff);
     if parser_thy.is_diff {
@@ -864,11 +1087,7 @@ fn elaborate_items(
             p::TheoryItem::Tactic(t) => {
                 out.tactic.push(crate::tactic::Tactic::parse(&t.name, &t.raw));
             }
-            p::TheoryItem::Restriction(r) => {
-                let or = OpenRestriction::new(r.name.clone(), r.formula.clone());
-                out.items.push(TheoryItem::Restriction(or));
-            }
-            p::TheoryItem::LegacyAxiom(r) => {
+            p::TheoryItem::Restriction(r) | p::TheoryItem::LegacyAxiom(r) => {
                 let or = OpenRestriction::new(r.name.clone(), r.formula.clone());
                 out.items.push(TheoryItem::Restriction(or));
             }

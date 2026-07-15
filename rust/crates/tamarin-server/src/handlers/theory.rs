@@ -88,7 +88,7 @@ pub async fn interactive_overview(
     // needs no proof state (help/edit/add/delete) would show `(0 cases)` and a
     // proto-only rule count.  Best-effort: a Maude failure leaves the counts
     // as-is.
-    let _ = state.store.ensure_proof_state(idx, &state.cfg.maude_path);
+    let _ = state.store.ensure_proof_state(idx, &state.cfg);
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
@@ -156,7 +156,7 @@ fn apply_method_and_redirect(
 ) -> axum::Json<Value> {
     // Ensure the proof state at the *source* idx is built (so we can
     // navigate to the sub-path and rank candidate methods there).
-    let src_ps = match state.store.ensure_proof_state(idx, &state.cfg.maude_path) {
+    let src_ps = match state.store.ensure_proof_state(idx, &state.cfg) {
         Ok(p) => p,
         Err(e) => return json_resp::alert(format!("proof state init failed: {}", e)),
     };
@@ -218,7 +218,7 @@ fn apply_method_and_redirect(
         Some(n) => n,
         None => return json_resp::alert(format!("theory index {} not found", idx)),
     };
-    let new_ps = match state.store.ensure_proof_state(new_idx, &state.cfg.maude_path) {
+    let new_ps = match state.store.ensure_proof_state(new_idx, &state.cfg) {
         Ok(p) => p,
         Err(e) => return json_resp::alert(format!(
             "proof state init failed on fresh idx: {}", e)),
@@ -229,8 +229,8 @@ fn apply_method_and_redirect(
     // Build the redirect URL.  Haskell's `getTheoryPathMR` for
     // `TheoryMethod` (`src/Web/Handler.hs:1013-1016`) advances the target
     // via `nextSmartThyPath newThy (TheoryProof lemma proofPath)`, i.e. it
-    // walks INTO the freshly created child case of the grown tree.  We now
-    // do the same: re-fetch the entry at `new_idx` (its `proof_state` Arc is
+    // walks INTO the freshly created child case of the grown tree.  We do
+    // the same: re-fetch the entry at `new_idx` (its `proof_state` Arc is
     // the one `apply_at_path` just grew) and run the shared
     // `next_thy_path_inner` (smart) over it.  For a `TheoryProof` input that
     // arm always yields another `TheoryProof` (child path, next-lemma root,
@@ -275,7 +275,7 @@ fn materialise_proof_state_if_needed(
         | path_parse::TheoryPath::Rules
         | path_parse::TheoryPath::Source { .. });
     if !needs { return; }
-    let _ = state.store.ensure_proof_state(idx, &state.cfg.maude_path);
+    let _ = state.store.ensure_proof_state(idx, &state.cfg);
 }
 
 /// Mirror Haskell `titleThyPath` (`src/Web/Theory.hs:1586-1607`).
@@ -441,7 +441,7 @@ pub async fn source_(
     // ensure it here (best-effort — a Maude failure falls back to the
     // `by sorry` bodies).  Mirrors the framed-page
     // handler's unconditional `ensure_proof_state`.
-    let _ = state.store.ensure_proof_state(idx, &state.cfg.maude_path);
+    let _ = state.store.ensure_proof_state(idx, &state.cfg);
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
@@ -453,7 +453,7 @@ pub async fn message_deduction(
     Path(idx): Path<usize>,
 ) -> Response {
     // See `source_` — identical output, identical proof-state need.
-    let _ = state.store.ensure_proof_state(idx, &state.cfg.maude_path);
+    let _ = state.store.ensure_proof_state(idx, &state.cfg);
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
@@ -535,7 +535,7 @@ pub async fn autoprove(
     // replayed into the tree at `ProofState::new` time) is simply REPLACED
     // at the focused path: we search from the path node's stored system via
     // `run_proof_search` and never consult the skeleton.
-    let src_ps = match state.store.ensure_proof_state(idx, &state.cfg.maude_path) {
+    let src_ps = match state.store.ensure_proof_state(idx, &state.cfg) {
         Ok(p) => p,
         Err(e) => return json_resp::alert(
             format!("proof state init failed: {}", e)).into_response(),
@@ -560,7 +560,7 @@ pub async fn autoprove(
         .store
         .clone_at_new_idx_forking_proof_state(idx)
         .unwrap_or(idx);
-    let new_ps = match state.store.ensure_proof_state(new_idx, &state.cfg.maude_path) {
+    let new_ps = match state.store.ensure_proof_state(new_idx, &state.cfg) {
         Ok(p) => p,
         Err(e) => return json_resp::alert(
             format!("proof state init failed on fresh idx: {}", e)).into_response(),
@@ -754,7 +754,7 @@ pub async fn autoprove_all(
     // idx (HS `modifyTheory`; forking preserves prior proof trees — see
     // `autoprove`).  Each lemma is then proved from its root system into
     // the fork.
-    if let Err(e) = state.store.ensure_proof_state(idx, &state.cfg.maude_path) {
+    if let Err(e) = state.store.ensure_proof_state(idx, &state.cfg) {
         return json_resp::alert(format!("proof state init failed: {}", e))
             .into_response();
     }
@@ -762,7 +762,7 @@ pub async fn autoprove_all(
         .store
         .clone_at_new_idx_forking_proof_state(idx)
         .unwrap_or(idx);
-    let new_ps = match state.store.ensure_proof_state(new_idx, &state.cfg.maude_path) {
+    let new_ps = match state.store.ensure_proof_state(new_idx, &state.cfg) {
         Ok(p) => p,
         Err(e) => return json_resp::alert(
             format!("proof state init failed on fresh idx: {}", e)).into_response(),
@@ -953,7 +953,7 @@ pub async fn download(
     // modifications (applied proof steps, autoprove results) are
     // reflected in the saved file.  Same body as the `source_` handler,
     // different content-type/disposition.
-    let _ = state.store.ensure_proof_state(idx, &state.cfg.maude_path);
+    let _ = state.store.ensure_proof_state(idx, &state.cfg);
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
@@ -1274,7 +1274,7 @@ fn resolve_system_for_path(
         path_parse::TheoryPath::Lemma(n) => (n.clone(), Vec::new()),
         _ => return None,
     };
-    let ps = state.store.ensure_proof_state(idx, &state.cfg.maude_path)
+    let ps = state.store.ensure_proof_state(idx, &state.cfg)
         .ok()?;
     ps.get_system_at(&lemma_name, &sub)
 }
@@ -1454,7 +1454,7 @@ pub async fn proof_step(
         };
     let case_path: Vec<String> = segs[1..case_path_end].to_vec();
     let method_segs = &segs[method_segs_start..];
-    let ps = match state.store.ensure_proof_state(idx, &state.cfg.maude_path) {
+    let ps = match state.store.ensure_proof_state(idx, &state.cfg) {
         Ok(p) => p,
         Err(e) => return json_resp::alert(format!("proof state init failed: {}", e)),
     };

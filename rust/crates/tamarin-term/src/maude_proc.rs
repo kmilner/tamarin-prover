@@ -124,16 +124,15 @@ struct MaudeProcessInner {
     /// every search step — so the same subterm gets reduced repeatedly
     /// during a single proof.  Caching cuts those repeat round-trips.
     reduce_cache: tamarin_utils::FastMap<LNTerm, LNTerm>,
-    /// Memo for `match_eqs_const_subject` EMPTY-result queries.  Still
-    /// read and written by `match_eqs_const_subject` on every call;
-    /// that matcher is now reached only from tests, but the cache is retained
-    /// for those
-    /// tests / potential future reuse.  AC-heavy patterns re-issue many
-    /// identical all-empty matches across fixpoint passes, so caching the
-    /// empty answer skips the repeat round-trips.  Caching the empty
-    /// answer is safe — no witness LVars to renumber.  Non-empty results
-    /// are NOT cached (witnesses need fresh-renaming per use, same reason
-    /// `unifiable_cache` only stores booleans).
+    /// Memo for `match_eqs_const_subject` EMPTY-result queries, read and
+    /// written on every call to that matcher.  The matcher is reached only
+    /// from tests; the cache stays wired for them and for potential reuse.
+    /// AC-heavy patterns re-issue many identical all-empty matches across
+    /// fixpoint passes, so caching the empty answer skips the repeat
+    /// round-trips.  Caching the empty answer is safe — no witness LVars to
+    /// renumber.  Non-empty results are NOT cached (witnesses need
+    /// fresh-renaming per use, same reason `unifiable_cache` only stores
+    /// booleans).
     match_empty_cache: tamarin_utils::FastMap<(Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>), ()>,
     /// Memo for the RAW REPLY BYTES of the witness-producing Maude commands
     /// (`unify in MSG`, `variant unify in MSG`, `get variants in MSG`), keyed
@@ -1071,13 +1070,11 @@ impl MaudeHandle {
     /// constants of a special "skolem" sort; we mirror that with the
     /// synthetic-Name trick.
     ///
-    /// NOT currently wired into any production path; the only remaining
-    /// callers are this file's in-module tests.  Kept because it mirrors a
-    /// real HS
-    /// distinction: HS's `matchAction`/`matchTerm` (Guarded.hs:803-815)
-    /// delegate to Maude via `solveMatchLTerm`, with HS's `SkConst`
-    /// encoding from `skolemizeGuarded` represented here as synthetic
-    /// named constants.
+    /// NOT wired into any production path; the only callers are this file's
+    /// in-module tests.  Kept because it mirrors a real HS distinction:
+    /// HS's `matchAction`/`matchTerm` (Guarded.hs:803-815) delegate to Maude
+    /// via `solveMatchLTerm`, with HS's `SkConst` encoding from
+    /// `skolemizeGuarded` represented here as synthetic named constants.
     pub fn match_eqs_const_subject(
         &self,
         eqs: &[Equal<LNTerm>],

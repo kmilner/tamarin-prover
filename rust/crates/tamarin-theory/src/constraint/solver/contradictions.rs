@@ -1491,6 +1491,9 @@ fn has_sort_conflated_lvars(sys: &System) -> bool {
         }
         if *conflict.borrow() { return true; }
     }
+    // Copy the bool out first so the `Ref` temporary drops before `conflict`
+    // at end of scope; a direct `*conflict.borrow()` tail would outlive
+    // `conflict` (E0597).
     let c = *conflict.borrow();
     c
 }
@@ -1530,7 +1533,6 @@ fn has_fresh_fact_sort_violation(sys: &System) -> bool {
                 Term::Lit(Lit::Var(v)) if v.sort == LSort::Fresh => {}
                 Term::Lit(Lit::Var(v)) if v.sort == LSort::Msg => {
                     // Msg can narrow to Fresh later — don't flag.
-                    let _ = v;
                 }
                 _ => return true,
             }

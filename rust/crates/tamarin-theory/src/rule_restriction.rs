@@ -25,7 +25,7 @@
 //! restriction flows through `render_parsed_restriction` and the rewritten
 //! action through `render_rule` unchanged.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tamarin_parser::ast as p;
 
@@ -58,6 +58,9 @@ pub fn lift_rule_restrictions(thy: &mut p::Theory) -> Result<(), ExpandError> {
         p::TheoryItem::Predicates(ps) => Some(ps.clone()),
         _ => None,
     }).flatten().collect();
+    // The 0-arity function-symbol set the restriction formulas resolve their
+    // bare constant tokens against (HS `nullaryApp`, resolved at parse time).
+    let nullary = crate::elaborate::nullary_fun_names(&thy.items);
 
     // Build a new item list, expanding rules-with-restrictions into
     // [generated restrictions..., rewritten rule].  Other items pass
@@ -66,7 +69,7 @@ pub fn lift_rule_restrictions(thy: &mut p::Theory) -> Result<(), ExpandError> {
     for item in std::mem::take(&mut thy.items) {
         match item {
             p::TheoryItem::Rule(rule) if !rule.embedded_restrictions.is_empty() => {
-                let (restrs, new_rule) = lift_one_rule(rule, &predicates)?;
+                let (restrs, new_rule) = lift_one_rule(rule, &predicates, &nullary)?;
                 // HS adds the restrictions to the theory accumulated so far,
                 // THEN adds the rule → restrictions precede the rule.
                 for r in restrs {
@@ -91,6 +94,7 @@ pub fn lift_rule_restrictions(thy: &mut p::Theory) -> Result<(), ExpandError> {
 pub fn lift_one_rule(
     rule: p::Rule,
     predicates: &[p::Predicate],
+    nullary: &BTreeSet<String>,
 ) -> Result<(Vec<p::Restriction>, p::Rule), ExpandError> {
     let rname = rule.name.clone();
     // HS applies the `let` block to (ps, as, cs, rs) at parse time, in the
@@ -116,6 +120,16 @@ pub fn lift_one_rule(
         let idx = i + 1;
         // HS `liftedExpandFormula thy` — expand predicate atoms.
         let expanded = expand_formula(&phi, predicates)?;
+        // HS resolves a bare `<name>` token to a 0-arity `FApp (NoEq …) []`
+        // during PARSING (`nullaryApp`), so by the time `rewrite` runs the
+        // constant is a function application, not a variable — and `rewrite`
+        // keeps it inlined.  The RS parser leaves it as `Var{name, Untagged,
+        // idx 0}`; resolve those to `App(name, [])` here (an argument-less
+        // `FApp` has no free-variable-containing args, so `rewrite`'s
+        // abstraction clauses at Restriction.hs:98-111 never fire on it), so
+        // a constant like `NormalReq` stays in the restriction formula
+        // instead of becoming a fresh fact argument.
+        let expanded = resolve_nullary_constants(&expanded, nullary);
         // HS `fromRuleRestriction (rname ++ "_" ++ show i) f`.
         let sub_name = format!("{}_{}", rname, idx);
         let (restr, action) = from_rule_restriction(&sub_name, &expanded);
@@ -188,6 +202,32 @@ fn from_rule_restriction(rname: &str, f: &p::Formula) -> (p::Restriction, p::Fac
     let action = mk_fact(rname, action_args);
 
     (restriction, action)
+}
+
+/// Resolve every bare 0-arity constant token in a formula from `Var{name,
+/// Untagged, idx 0}` to `App(name, [])`, matching HS's parse-time `nullaryApp`
+/// resolution (Theory/Text/Parser/Term.hs:139-143).  `nullary` is the theory's
+/// 0-arity function-symbol set (user `functions: f/0` + enabled builtins'
+/// constants).  Applied to a restriction formula BEFORE `rewrite` so a constant
+/// is a `FApp` (kept inline) rather than a `Var` (abstracted into a fact arg).
+/// The `Untagged`/`idx 0` gate mirrors the one in `term_to_lnterm`'s `mk_var`
+/// closure (elaborate.rs), which performs the same recovery for rule terms.
+fn resolve_nullary_constants(f: &p::Formula, nullary: &BTreeSet<String>) -> p::Formula {
+    crate::macro_expand::map_formula_terms(f, &|t| resolve_nullary_term(t, nullary))
+}
+
+/// Recursively resolve nullary-constant `Var`s to `App(name, [])` within a term.
+fn resolve_nullary_term(t: &p::Term, nullary: &BTreeSet<String>) -> p::Term {
+    match t {
+        p::Term::Var(v)
+            if matches!(v.sort, p::SortHint::Untagged)
+                && v.idx == 0
+                && nullary.contains(&v.name) =>
+        {
+            p::Term::App(v.name.clone(), Vec::new())
+        }
+        _ => rebuild_term(t, |c| resolve_nullary_term(c, nullary)),
+    }
 }
 
 /// HS `mkFact = protoFactAnn Linear (restrPrefix ++ rname) S.empty`

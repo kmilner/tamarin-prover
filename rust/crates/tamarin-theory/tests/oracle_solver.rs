@@ -632,7 +632,7 @@ fn corpus_verdict_match_coverage_probe() {
 
     // Configure rayon thread-pool with a larger stack — Goal-Ord + Sk
     // matcher path is recursively deeper on some protocols than rayon's
-    // default 2 MiB worker stack tolerates.  16 MiB is plenty.
+    // default 2 MiB worker stack tolerates.  64 MiB is plenty.
     let _ = rayon::ThreadPoolBuilder::new()
         .stack_size(64 * 1024 * 1024)
         .build_global();

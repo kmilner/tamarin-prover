@@ -1546,7 +1546,7 @@ pub fn normalize_witness_lvars(g: &Guarded) -> Guarded {
 }
 
 /// Copy-on-write core of [`normalize_witness_lvars`]: returns `None` when `g`
-/// carries no `~mw` witness var (the common case — `collect_witness_vars` finds
+/// carries no `x`-named witness var (the common case — `collect_witness_vars` finds
 /// nothing) OR when the witness substitution touches no leaf
 /// (`subst_guarded_cow` returns `None`), so a caller can reuse `g` by move/borrow
 /// instead of deep-cloning.  `Some(_)` is byte-identical to the eager rebuild.

@@ -743,7 +743,8 @@ mod tests {
     /// Arity-0 facts (no args) cannot have monotonic behaviour and
     /// must be excluded.  Per Haskell `behaviourLen = max 0 (arity-1)`
     /// is 0; combined with the candidate filter check, arity-0 facts
-    /// get filtered.  Our impl has an explicit `if arity == 0 continue`.
+    /// get filtered.  Our impl drops them via the candidate loop's
+    /// `if conc.terms.is_empty()` guard (HS `guard (not (null (factTerms conc)))`).
     #[test]
     fn arity_zero_facts_are_not_injective() {
         use crate::fact::{Fact, FactTag, Multiplicity};

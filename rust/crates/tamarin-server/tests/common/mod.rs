@@ -70,6 +70,7 @@ pub async fn start_server_with_theory(fixture_name: &str) -> TestServer {
         max_steps: 200,
         // Match ServerConfig::new's default (HS interactive default 5s).
         derivcheck_timeout: 5,
+        stop_on_trace: None,
     };
 
     // Load theory before starting server.

@@ -317,6 +317,9 @@ fn run_interactive(args: &Args) -> Result<i32, RunError> {
     // `-d/--derivcheck-timeout` — same default expression as the batch
     // path's derivation-check block (default 5).
     cfg.derivcheck_timeout = args.derivcheck_timeout.unwrap_or(5) as u32;
+    // CLI `--stop-on-trace` — merged with each theory's `configuration:`
+    // block at load time (`ProofState::new`), HS `closeTheory` precedence.
+    cfg.stop_on_trace = cli_cut(args);
 
     // Positional args are theory files (Haskell uses a working
     // directory, but we accept either: a single dir arg, or one-or-more
@@ -437,6 +440,62 @@ fn guess_frontend_dist(data_dir: &std::path::Path) -> Option<std::path::PathBuf>
     None
 }
 
+/// Resolve the effective cut strategy + auto-sources for one theory —
+/// HS `closeTheory`'s configuration-block routing (TheoryLoader.hs:640-666).
+///
+/// The in-file `configuration: "…"` string accepts exactly two flags
+/// (`theoryConfFlags`, TheoryLoader.hs:656-659): `--stop-on-trace[=v]`
+/// (`flagOpt "dfs"` — valueless means `dfs`) and `--auto-sources`
+/// (`flagNone`).  Precedence: the CLI `--stop-on-trace` wins when given
+/// (`configStopOnTrace` consults the block only when the CLI flag is
+/// absent); `--auto-sources` is OR-combined (`configAutoSources`).  Bare
+/// (non-flag) tokens land in cmdargs' positional catch-all
+/// (`flagArg (updateArg "") ""`) and are ignored; an unknown flag or
+/// stop-on-trace value aborts the run (cmdargs `processValue` /
+/// `error e` on `ArgumentError`, TheoryLoader.hs:661).
+///
+/// The strategy only steers prove-mode (`constructAutoProver` is used
+/// solely when `thyOpts.proveMode`, TheoryLoader.hs:606); without
+/// `--prove` the non-prove default `CutDFS` applies.
+fn effective_config(
+    args: &Args,
+    parsed: &tamarin_parser::ast::Theory,
+) -> Result<(tamarin_theory::constraint::solver::context::CutStrategy, bool), RunError> {
+    use tamarin_theory::constraint::solver::context::CutStrategy;
+    let (block_cut, block_auto_sources) = match &parsed.configuration {
+        Some(cfg) => tamarin_theory::prove::config_block_options(cfg)
+            .map_err(RunError)?,
+        None => (None, false),
+    };
+    let cut = if args.prove_mode {
+        match &args.stop_on_trace {
+            Some(crate::cli::StopOnTrace::Dfs) => CutStrategy::Dfs,
+            Some(crate::cli::StopOnTrace::SeqDfs) => CutStrategy::SeqDfs,
+            Some(crate::cli::StopOnTrace::Bfs) => CutStrategy::Bfs,
+            Some(crate::cli::StopOnTrace::Sorry) => CutStrategy::AfterSorry,
+            Some(crate::cli::StopOnTrace::None) => CutStrategy::Nothing,
+            None => block_cut.unwrap_or(CutStrategy::Dfs),
+        }
+    } else {
+        CutStrategy::Dfs
+    };
+    Ok((cut, args.auto_sources || block_auto_sources))
+}
+
+/// Map the CLI `--stop-on-trace` value (if given) to its `CutStrategy` —
+/// the interactive server merges this with each theory's own
+/// `configuration:` block at load time (`ProofState::new`).
+fn cli_cut(args: &Args) -> Option<tamarin_theory::constraint::solver::context::CutStrategy> {
+    use tamarin_theory::constraint::solver::context::CutStrategy;
+    args.stop_on_trace.as_ref().map(|s| match s {
+        crate::cli::StopOnTrace::Dfs => CutStrategy::Dfs,
+        crate::cli::StopOnTrace::SeqDfs => CutStrategy::SeqDfs,
+        crate::cli::StopOnTrace::Bfs => CutStrategy::Bfs,
+        crate::cli::StopOnTrace::Sorry => CutStrategy::AfterSorry,
+        crate::cli::StopOnTrace::None => CutStrategy::Nothing,
+    })
+}
+
 /// Clone the parser theory and expand its macros in place, mirroring HS
 /// `thyProtoRules`'s `applyMacroInRule (theoryMacros thy)`.  Used for the
 /// WF re-checks that must see macro-expanded rules.
@@ -549,6 +608,12 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             "--output-module is not yet ported to the Rust prover.".to_string(),
         ));
     }
+    // `--stop-on-trace` selects HS's `SolutionExtractor` (Theory/Proof.hs:695,
+    // TheoryLoader.hs:355-362) and, when the CLI flag is absent, HS
+    // additionally consults the theory's in-file `configuration:` block
+    // (`configStopOnTrace`, TheoryLoader.hs:640-666) — a PER-THEORY value,
+    // so the effective strategy is resolved inside the file loop by
+    // `effective_config` once the theory is parsed.
     // --output-json / --output-dot: trace graph serialisation isn't
     // ported yet (HS emits a graph of the attack-trace nodes/edges
     // for any falsified lemma — `outputTraces`, Batch.hs:251-271).  Don't
@@ -654,6 +719,11 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             }
         };
         marker("Theory loaded");
+
+        // Effective cut strategy + auto-sources for THIS theory: CLI flags
+        // merged with the in-file `configuration:` block per HS
+        // `closeTheory` (TheoryLoader.hs:640-666).
+        let (cut, auto_sources) = effective_config(args, &parsed)?;
 
         // Wellformedness checks — mirrors HS `checkWellformedness`
         // (`Theory.Tools.Wellformedness:1270`).  Runs on every file
@@ -803,19 +873,55 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         let _sapic_funs_guard =
             tamarin_theory::elaborate::set_user_funs_for_theory(&parsed);
         {
+            // HS `Acc.checkWellformedness t` (translateTheory, TheoryLoader.hs:455)
+            // runs on the PRE-translation theory `t` — the report is computed
+            // from `thy`, not from the `transThy` that `Sapic.translate` /
+            // `Acc.translate` produce.  So it must see the ORIGINAL rules /
+            // restrictions / case tests, BEFORE `apply_sapic` injects the
+            // SAPIC-generated rules (a pure-SAPIC theory has no MSR rules at this
+            // point, so `rulesContainPubConst` / `caseTestsInstantiatedByPubVars`
+            // scan an empty rule set).  Compute it here, before the mutation.
+            let acc_wf = tamarin_accountability::check_wellformedness(&parsed);
+
             let user_set_heuristic = !elaborated.heuristic.is_empty();
             let sapic_wf = tamarin_sapic::apply::apply_sapic(
                 &mut parsed, &mut elaborated, user_set_heuristic,
             ).map_err(|e| RunError(format!(
                 "SAPIC translation error in {}: {}", in_file, e.message)))?;
-            // HS `Sapic.checkWellformedness` (Warnings.hs:37-38) is part of
-            // `preReport`, which is PREPENDED to the rest of the report
-            // (`preReport ++ postReport`, TheoryLoader.hs:455/631).  Prepend
-            // the SAPIC-process warnings so they render FIRST in the
-            // wellformedness block (and the trailing `N wellformedness check
-            // failed` summary counts them via `wf_report.len()`).
-            if !sapic_wf.is_empty() {
+
+            // Accountability translation (HS `Acc.translate`, TheoryLoader.hs:430):
+            // `Sapic.translate >=> Acc.translate`.  Expands each
+            // `... accounts for` lemma into its verification-condition lemmas +
+            // case-test predicates, injecting into BOTH `parsed` (rendering) and
+            // `elaborated` (prove loop).  A no-op for theories with neither
+            // accountability lemmas nor case tests (a `test` without any acc
+            // lemma still gets its predicate appended, as in HS).  Runs inside
+            // `_sapic_funs_guard` so the generated lemmas' embedded case-test
+            // formulas resolve their user function symbols with the theory's
+            // private/destructor flags.
+            if let Err(e) = tamarin_accountability::translate(&mut parsed, &mut elaborated) {
+                // HS: the exceptions `Acc.translate` throws — `CaseTestsUndefined`
+                // (Accountability.hs:45) and the `UndefinedPredicate` /
+                // `DuplicateItem` parsing exceptions its `liftedAddLemma` /
+                // `liftedAddPredicate` folds raise (Parser.hs:141-152,
+                // Parser/Signature.hs:313-316) — escape to GHC's runtime, which
+                // writes `tamarin-prover: <show exception>` to stderr and exits
+                // 1 — no batch `error:` / `[Theory …]` wrapper (the maude banner
+                // + the `Theory loaded`/`Theory translated` markers already
+                // printed).
+                eprintln!("tamarin-prover: {}", e);
+                return Ok(1);
+            }
+
+            // HS `preReport = Sapic.checkWellformedness t ++ Acc.checkWellformedness t`
+            // (TheoryLoader.hs:455), PREPENDED to the rest of the report
+            // (`preReport ++ postReport`): SAPIC-process warnings first, then the
+            // accountability RP check (computed above, pre-translation), then
+            // every other wellformedness entry.  The trailing `N wellformedness
+            // check failed` summary counts them via `wf_report.len()`.
+            if !sapic_wf.is_empty() || !acc_wf.is_empty() {
                 let mut new_report = sapic_wf;
+                new_report.extend(acc_wf);
                 new_report.extend(std::mem::take(&mut wf_report));
                 wf_report = new_report;
             }
@@ -840,6 +946,31 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             // formulaReports), matching HS check order.
             insert_report_before(&mut wf_report, lhs_rhs,
                 &WF_TOPIC_ORDER[WF_AFTER_FACT_LHS..]);
+
+            // HS `publicNamesReport` (Wellformedness.hs:463-484) also runs on
+            // the TRANSLATED rules (`checkWellformedness` over the OpenTranslated
+            // theory).  Our parser-level `public_names_report` ran pre-translation
+            // (no generated rules) and cannot see the source process a rule
+            // carries as its `process=` attribute; re-run over the ELABORATED
+            // rules (facts + process attribute) so a constant appearing only in
+            // the process — e.g. `'C'` in `insert <'roles', x, 'C'>` clashing
+            // with `'c'` — is surfaced, attributed to the root `Init` rule
+            // exactly as HS.  Position: publicNames is HS check index 4, so it
+            // splices before the first entry from a LATER check — ruleSorts (HS
+            // index 5, our `variable_sort_clashes` topic) or any
+            // `WF_TOPIC_ORDER` topic except "Unbound variables"
+            // (`unboundReport`, HS index 2, runs BEFORE publicNames, so its
+            // entries must not act as a boundary).
+            let caps_topic = "Public constants with mismatching capitalization";
+            wf_report.retain(|e| e.topic != caps_topic);
+            let public_names =
+                tamarin_theory::elaborate::sapic_public_names_report(&elaborated);
+            let after_public_names: Vec<&str> = std::iter::once(
+                    "Variable with mismatching sorts or capitalization")
+                .chain(WF_TOPIC_ORDER.iter().copied()
+                    .filter(|t| *t != "Unbound variables"))
+                .collect();
+            insert_report_before(&mut wf_report, public_names, &after_public_names);
         }
 
         // Spawn a single Maude handle for this file.  Used by:
@@ -1190,13 +1321,13 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             // deconstructions, annotate the rules with AUTO_* actions and add
             // the `AUTO_typing` sources lemma — to the elaborated theory (so it
             // renders + is iterated below) and the proving session alike.
-            if args.auto_sources {
+            if auto_sources {
                 tamarin_theory::auto_sources::apply_auto_sources(
                     &mut parsed, &mut elaborated, maude.clone(), file_maude_pool.clone());
             }
             let session = tamarin_theory::prove::ProverSession::build_with_in_file_and_heuristic(
                 &parsed, maude.clone(), file_maude_pool.clone(), in_file,
-                cli_heuristic.clone()).ok();
+                cli_heuristic.clone(), cut).ok();
 
             // HS prints "[Theory X] Theory closed" right after `closeTheory`
             // (TheoryLoader.hs:596) and BEFORE the proof search, which it
@@ -1244,7 +1375,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                         s, &lemma_name, budget),
                     (None, _) => tamarin_theory::prove::prove_lemma_with_pool_file_heuristic(
                         &parsed, &lemma_name, maude.clone(),
-                        file_maude_pool.clone(), budget, in_file, &cli_heuristic),
+                        file_maude_pool.clone(), budget, in_file, &cli_heuristic, cut),
                 };
                 let (verdict, proof_steps, proof_body) = match outcome {
                     Ok(root) => {
@@ -1395,7 +1526,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             &wf_block,
             &build_info,
             in_file,
-            args.auto_sources,
+            auto_sources,
         );
         emit_output(args, in_file, &body)?;
 

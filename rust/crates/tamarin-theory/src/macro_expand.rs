@@ -82,8 +82,29 @@ pub fn apply_macros_term(macros: &[p::Macro], term: &p::Term) -> p::Term {
         p::Term::PatMatch(inner) => p::Term::PatMatch(
             Box::new(apply_macros_term(macros, inner)),
         ),
-        // Literals and bare variables: no recursion (HS Macro.hs:51 `Lit l -> lit l`).
-        p::Term::Var(_) | p::Term::PubLit(_) | p::Term::FreshLit(_)
+        // A BARE identifier (no `$~#%` prefix, no `:sort` suffix, no `.idx`)
+        // naming a 0-ary macro is a macro CALL: HS's `nullaryApp` parser
+        // alternative (Term.hs:143-148) runs before `plit` and matches any
+        // arity-0 name in `funSyms ∪ macroNames`, so such an identifier
+        // reaches HS's `applyMacros` as `fApp (NoEq (m,(0,..))) []`, never
+        // as a variable.  RS's surface parser is signature-less and yields
+        // `Var`, so resolve here.  Any sort/index decoration means HS's
+        // `symbol` match would have left trailing input and backtracked to
+        // `plit` — a genuine variable; leave those (and 0-ary FUNCTION
+        // names, which `term_to_lnterm`'s USER_NULLARY_FUNS branch lifts)
+        // untouched.
+        p::Term::Var(v) => {
+            if v.idx == 0 && v.sort == p::SortHint::Untagged && v.typ.is_none() {
+                if let Some(m) = find_matching_macro(&v.name, 0, macros) {
+                    let expanded = subst_term_by_name(&m.body, &BTreeMap::new());
+                    // Re-expand the EXPANDED body to handle nested macros.
+                    return apply_macros_term(macros, &expanded);
+                }
+            }
+            term.clone()
+        }
+        // Literals: no recursion (HS Macro.hs:51 `Lit l -> lit l`).
+        p::Term::PubLit(_) | p::Term::FreshLit(_)
         | p::Term::NatLit(_) | p::Term::Number(_) | p::Term::NumberOne
         | p::Term::NatOne | p::Term::DhNeutral => term.clone(),
     }
@@ -320,6 +341,37 @@ mod tests {
 
     fn parse(src: &str) -> p::Theory {
         parse_theory(src, &[]).expect("parse")
+    }
+
+    #[test]
+    fn bare_nullary_macro_name_expands() {
+        // HS `nullaryApp` (Term.hs:143-148) parses a BARE arity-0 macro
+        // name as a 0-ary application, so `konst` and `konst()` are the
+        // same call.  A sorted/indexed variable of the same name is NOT
+        // a call.
+        let src = "theory T begin\n\
+            builtins: hashing\n\
+            macros: konst() = h('seed')\n\
+            rule R: [ In(konst) ] --[ M(konst.1, konst:pub) ]-> [ ]\n\
+            end\n";
+        let mut thy = parse(src);
+        expand_theory_macros(&mut thy);
+        let rule = thy.items.iter().find_map(|i| match i {
+            p::TheoryItem::Rule(r) => Some(r),
+            _ => None,
+        }).unwrap();
+        // Premise In(konst) → In(h('seed')).
+        assert!(matches!(&rule.premises[0].args[0],
+            p::Term::App(n, args) if n == "h" && args.len() == 1),
+            "got {:?}", rule.premises[0].args[0]);
+        // konst.1 (indexed) and konst:pub (sorted) stay variables.
+        assert!(matches!(&rule.actions[0].args[0],
+            p::Term::Var(v) if v.name == "konst" && v.idx == 1),
+            "got {:?}", rule.actions[0].args[0]);
+        assert!(matches!(&rule.actions[0].args[1],
+            p::Term::Var(v) if v.name == "konst"
+                && v.sort != p::SortHint::Untagged),
+            "got {:?}", rule.actions[0].args[1]);
     }
 
     #[test]

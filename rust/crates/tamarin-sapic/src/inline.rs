@@ -321,8 +321,6 @@ fn apply_m_comb(
     }
 }
 
-/// Apply `subst` to a SAPIC term, preserving AC normal form and each variable's
-/// SAPIC type (the substitution keys carry both typed and untyped forms).
 /// `applyMatchVars subst vs` (Process.hs:304-309): `fromList . concatMap
 /// extractVars . toList` where `extractVars v = maybe [v] varsVTerm (imageOf
 /// subst v)`.  A match var `v` is replaced by ALL the variables of its image

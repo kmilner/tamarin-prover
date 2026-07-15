@@ -107,6 +107,13 @@ one_file() {
     local hs_manifest="$CACHE/$key.hs.json"
     local wd; wd=$(mktemp -d)
     mkdir -p "$wd/thy"; cp "$f" "$wd/thy/"
+    # Sibling oracle scripts: `heuristic: o "./oracle-…"` resolves relative
+    # to the server's theory dir on both engines (upstream's deforacle
+    # recipe) — stage them next to the theory or oracle rankings fail.
+    local __of
+    for __of in "$(dirname "$f")"/oracle*; do
+        [ -f "$__of" ] && cp "$__of" "$wd/thy/"
+    done
 
     # Phase 1: HS (cached)
     if [ ! -f "$hs_manifest" ]; then

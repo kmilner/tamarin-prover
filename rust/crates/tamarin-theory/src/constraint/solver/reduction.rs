@@ -2245,15 +2245,15 @@ impl<'ctx> Reduction<'ctx> {
                 // adding to formulas, AND inserting the empty DisjG goal
                 // alongside.  Both contradictions-check and goal-ranker
                 // can then close the case (HS picks whichever fires first).
-                // The `:1808` entry guard returned when `g` was already in
+                // The entry guard returned when `g` was already in
                 // `formulas`/`solved_formulas`, and the only statement since
                 // (`match g.clone()`) does not mutate `self.sys`, so `g` is
                 // provably not yet in `formulas` here: always trace "Disj"
                 // and push.  Mirrors HS `insertFormula` (Reduction.hs:473-482),
                 // which likewise inserts without re-checking membership.
                 debug_assert!(!crate::guarded::stores_contains(&self.sys.formulas, &g),
-                    "insert_formula_inner empty-Disj arm: the :1808 entry \
-                     guard already excludes formulas-membership");
+                    "insert_formula_inner empty-Disj arm: the entry guard \
+                     already excludes formulas-membership");
                 crate::constraint::solver::trace::trace_form(
                     "Disj",
                     || crate::constraint::solver::trace::guarded_repr(&g));
@@ -2272,14 +2272,14 @@ impl<'ctx> Reduction<'ctx> {
                 // Store the formula AND insert a corresponding split
                 // goal. The goal itself uses the same vector, allowing
                 // `solve_disj_goal` to resume later.
-                // The `:1808` entry guard returned when `g` was already in
+                // The entry guard returned when `g` was already in
                 // `formulas`/`solved_formulas`, and the only statement since
                 // (`match g.clone()`) does not mutate `self.sys`, so `g` is
                 // provably not yet in `formulas` here: always trace "Disj"
                 // and push.  Mirrors HS `insertFormula` (Reduction.hs:473-482),
                 // which likewise inserts without re-checking membership.
                 debug_assert!(!crate::guarded::stores_contains(&self.sys.formulas, &g),
-                    "insert_formula_inner Disj arm: the :1808 entry guard \
+                    "insert_formula_inner Disj arm: the entry guard \
                      already excludes formulas-membership");
                 crate::constraint::solver::trace::trace_form(
                     "Disj",
@@ -4130,8 +4130,8 @@ pub(crate) static SUBST_SYSTEM_SKIPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
-    /// Master enable for the cached-bloom fact skip in `subst_system_once`
-    /// . Default `true`.  The verify oracle
+    /// Master enable for the cached-bloom fact skip in `subst_system_once`.
+    /// Default `true`.  The verify oracle
     /// `verify_subst_skip_is_noop` force-DISABLES it for its re-run so the
     /// full per-term descent runs during verification — otherwise a wrong
     /// bloom skip would reproduce identically in both the live pass and the
@@ -5610,21 +5610,6 @@ impl<'ctx> Reduction<'ctx> {
         self.maude.fresh_idx()
     }
 
-    /// `solveAction` — port of the Action arm of `solveGoal`.
-    ///
-    /// Three cases:
-    /// 1. **Node `i` already exists** in the graph and `fa` is among
-    ///    its actions ⇒ Linear (already satisfied).
-    /// 2. **Node `i` already exists** but `fa` is *not* in its actions
-    ///    ⇒ fork once per existing action, unifying `fa` against each.
-    /// 3. **Node `i` doesn't exist** ⇒ fork once per non-silent rule,
-    ///    fresh-instantiating the rule and unifying `fa` against each
-    ///    of its actions.
-    ///
-    /// The XOR-coercion special case for `KU(t1 ⊕ t2 ⊕ ...)` is
-    /// deferred — it produces multiple intruder-rule shapes that
-    /// require partition enumeration we haven't ported.
-    ///
     /// Collapse a computed `cases`/`case_counters` pair into a `GoalCases`
     /// result, shared by the goal solvers whose fork loops end the same
     /// way.  Empty ⇒ `Contradictory`.  Single case ⇒ adopt it in place
@@ -5651,6 +5636,21 @@ impl<'ctx> Reduction<'ctx> {
         GoalCases::Cases(cases)
     }
 
+    /// `solveAction` — port of the Action arm of `solveGoal`.
+    ///
+    /// Three cases:
+    /// 1. **Node `i` already exists** in the graph and `fa` is among
+    ///    its actions ⇒ Linear (already satisfied).
+    /// 2. **Node `i` already exists** but `fa` is *not* in its actions
+    ///    ⇒ fork once per existing action, unifying `fa` against each.
+    /// 3. **Node `i` doesn't exist** ⇒ fork once per non-silent rule,
+    ///    fresh-instantiating the rule and unifying `fa` against each
+    ///    of its actions.
+    ///
+    /// A `KU(t1 ⊕ t2 ⊕ …)` goal takes a dedicated XOR path ahead of the
+    /// generic rule enumeration (mirrors HS `solveAction`, Goals.hs:259-272):
+    /// `twoPartitions` of the summands yields one `coerce` case for the
+    /// degenerate partition and one `c_xor` case per proper split.
     pub fn solve_action_goal(
         &mut self,
         i: &crate::constraint::constraints::NodeId,

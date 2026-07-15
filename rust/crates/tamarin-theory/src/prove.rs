@@ -105,17 +105,34 @@ fn hs_combine(a: &str, b: &str) -> String {
 /// (System.hs:574-575).  `work_dir` is `Some(dir)` for the in-file heuristic
 /// (= `takeDirectory inFile`, Parser.hs:304) or `None` for the CLI
 /// heuristic (HS `defaultOracle = Oracle Nothing Nothing` ⇒ `fromMaybe "."`).
-/// NOTE: HS's `normalise` collapses `.` and redundant separators (not `..`);
-/// we apply a minimal `normalise` matching the cases that affect the leading
-/// `./` (the only part the OS exec distinguishes between PATH-lookup and
-/// CWD-relative).
+/// The relPath is normalised BEFORE the join (`normalise "./oracle-x"` =
+/// `"oracle-x"`), so a `heuristic: o "./oracle-x"` under a real theory dir
+/// yields `<dir>/oracle-x` — the web sequent pane prints this path verbatim
+/// ("Goals sorted according to an oracle … located at <path>").  The
+/// leading `./` of a CWD-relative result comes from the join with workDir
+/// `"."`, exactly as in HS.
 fn resolve_oracle_path(oracle_path: &str, work_dir: Option<&str>) -> String {
     let p = std::path::Path::new(oracle_path);
     if p.is_absolute() {
         return oracle_path.to_string();
     }
     let wd = work_dir.unwrap_or(".");
-    hs_combine(wd, oracle_path)
+    hs_combine(wd, &hs_normalise_relative(oracle_path))
+}
+
+/// HS `System.FilePath.normalise` restricted to the relative-path case the
+/// caller guards (absolute paths return early): drop `.` segments and
+/// redundant separators.  (`..` is NOT collapsed, as in HS.)
+fn hs_normalise_relative(p: &str) -> String {
+    let segs: Vec<&str> = p
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    if segs.is_empty() {
+        ".".to_string()
+    } else {
+        segs.join("/")
+    }
 }
 
 /// Prepend the theory file's directory to any Oracle/OracleSmart rankings
@@ -127,7 +144,7 @@ fn resolve_oracle_path(oracle_path: &str, work_dir: Option<&str>) -> String {
 /// `"."`-for-no-dir prefix (via [`hs_take_directory`]) is what gives the
 /// oracle path its leading `./` so Unix `exec` resolves it from the CWD rather
 /// than doing a PATH lookup.
-fn prepend_theory_dir_to_oracle_paths(
+pub fn prepend_theory_dir_to_oracle_paths(
     rankings: &mut [crate::constraint::solver::goals::GoalRanking],
     in_file: &str,
 ) {
@@ -142,6 +159,54 @@ fn prepend_theory_dir_to_oracle_paths(
             _ => {}
         }
     }
+}
+
+/// Parse a theory's in-file `configuration:` block — HS `closeTheory`'s
+/// `theoryConfFlags` (TheoryLoader.hs:640-666).  Exactly two flags are
+/// accepted: `--stop-on-trace[=v]` (`flagOpt "dfs"` — valueless means
+/// `dfs`; value matched case-insensitively per HS `stopOnTrace`,
+/// TheoryLoader.hs:355-362) and `--auto-sources` (`flagNone`).  Bare
+/// (non-flag) tokens land in cmdargs' positional catch-all
+/// (`flagArg (updateArg "") ""`) and are ignored; an unknown flag or
+/// stop-on-trace value is an error (cmdargs `processValue` / HS
+/// `error e` on `ArgumentError`, TheoryLoader.hs:661).
+///
+/// Returns `(stop_on_trace, auto_sources)`; callers merge with the CLI
+/// per HS precedence — CLI `--stop-on-trace` wins when given
+/// (`configStopOnTrace`), `--auto-sources` is OR-combined
+/// (`configAutoSources`).
+pub fn config_block_options(
+    cfg: &str,
+) -> Result<(Option<crate::constraint::solver::context::CutStrategy>, bool), String> {
+    use crate::constraint::solver::context::CutStrategy;
+    let mut stop_on_trace: Option<CutStrategy> = None;
+    let mut auto_sources = false;
+    for tok in cfg.split_whitespace() {
+        if tok == "--auto-sources" {
+            auto_sources = true;
+        } else if let Some(rest) = tok.strip_prefix("--stop-on-trace") {
+            let value = if let Some(v) = rest.strip_prefix('=') {
+                v
+            } else if rest.is_empty() {
+                "dfs"
+            } else {
+                return Err(format!("configuration block: unknown flag: {}", tok));
+            };
+            stop_on_trace = Some(match value.to_ascii_lowercase().as_str() {
+                "dfs" => CutStrategy::Dfs,
+                "bfs" => CutStrategy::Bfs,
+                "seqdfs" => CutStrategy::SeqDfs,
+                "sorry" => CutStrategy::AfterSorry,
+                "none" => CutStrategy::Nothing,
+                other => return Err(format!(
+                    "unknown stop-on-trace method: {}", other)),
+            });
+        } else if tok.starts_with("--") {
+            return Err(format!("configuration block: unknown flag: {}", tok));
+        }
+        // Bare token: cmdargs positional catch-all — ignored.
+    }
+    Ok((stop_on_trace, auto_sources))
 }
 
 /// The CLI-supplied heuristic / oracle flags, carried verbatim from the
@@ -284,7 +349,7 @@ struct CachedSources {
 ///
 /// Profile showed ~3s of `ProofContext::new` work (intruder rules,
 /// `close_intr_rule` Maude variants, DH/BP cached variants, per-rule
-/// per-rule variant precomputation, `precompute_sources`, `precompute_full_sources`)
+/// variant precomputation, `precompute_sources`, `precompute_full_sources`)
 /// re-running per lemma.  On wireguard's 8 lemmas that was ~24s
 /// (HS amortises this across the file).  By sharing the template
 /// `ProofContext` we recover that cost; per-lemma we still run the
@@ -298,6 +363,11 @@ pub struct ProverSession {
     /// fields).  When `cli_heuristic.raw` is `Some`, it OVERRIDES the per-lemma
     /// / theory heuristic for EVERY lemma (HS `selectHeuristic`, Proof.hs:707).
     cli_heuristic: CliHeuristic,
+    /// Solved-leaf extraction strategy (HS `apCut`, threaded from
+    /// `--stop-on-trace`, TheoryLoader.hs:356-360).  Theory-global (HS
+    /// stores it once in `TheoryLoadOptions.stopOnTrace`), so it is set on
+    /// every per-lemma `ProofContext` in [`Self::setup_per_lemma_ctx`].
+    cut: crate::constraint::solver::context::CutStrategy,
     /// File-level RAII guard for `set_user_funs_for_theory`.  Kept
     /// alive for the whole session so per-lemma `term_to_lnterm`
     /// calls see the right user-fn-symbol set on the BUILDING thread.
@@ -511,6 +581,7 @@ impl ProverSession {
         pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
         in_file: &str,
         cli_heuristic: CliHeuristic,
+        cut: crate::constraint::solver::context::CutStrategy,
     ) -> Result<Self, ProveError> {
         // RAII-set the user-fn-symbol thread-locals for the WHOLE
         // session.  Per-lemma `term_to_lnterm` calls during search
@@ -558,6 +629,7 @@ impl ProverSession {
         Ok(ProverSession {
             theory,
             cli_heuristic,
+            cut,
             _user_funs_guard,
             user_funs,
             restrictions,
@@ -588,6 +660,9 @@ impl ProverSession {
             lemma.trace_quantifier,
             crate::theory::TraceQuantifier::ExistsTrace,
         );
+        // HS `apCut` is theory-global (one `TheoryLoadOptions.stopOnTrace`),
+        // so stamp the session's cut onto every per-lemma context.
+        ctx.cut = self.cut;
         let session_in_file = &theory.in_file;
         ctx.heuristic = resolve_heuristic(
             &self.cli_heuristic, lemma, theory.heuristic.first().map(|s| s.as_str()),
@@ -919,7 +994,8 @@ pub fn prove_lemma(
 ) -> Result<ProofNode, ProveError> {
     prove_lemma_with_pool_file_heuristic(
         parser_theory, lemma_name, maude, None, max_steps, "",
-        &CliHeuristic::default())
+        &CliHeuristic::default(),
+        crate::constraint::solver::context::CutStrategy::Dfs)
 }
 
 /// Like [`prove_lemma`] but accepts a `MaudePool` (consulted ONLY inside
@@ -939,6 +1015,7 @@ pub fn prove_lemma_with_pool_file_heuristic(
     max_steps: usize,
     in_file: &str,
     cli_heuristic: &CliHeuristic,
+    cut: crate::constraint::solver::context::CutStrategy,
 ) -> Result<ProofNode, ProveError> {
     let trace = tamarin_utils::env_gate!("TAM_DBG_PHASE");
     // Per-phase wall-clock instrumentation, gated by TAM_DBG_PHASE.
@@ -1069,6 +1146,9 @@ pub fn prove_lemma_with_pool_file_heuristic(
         lemma.trace_quantifier,
         crate::theory::TraceQuantifier::ExistsTrace,
     );
+    // Solved-leaf extraction strategy (HS `apCut`, threaded from
+    // `--stop-on-trace`).  Consumed once by `run_proof_search` below.
+    ctx.cut = cut;
 
     // Resolve the goal-ranking heuristic.  HS `selectHeuristic prover ctx =
     // ... apDefaultHeuristic prover <|> L.get pcHeuristic ctx` (Proof.hs:707):
