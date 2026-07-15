@@ -290,7 +290,7 @@ pub fn gatom_to_atom(a: &GAtom) -> p::Atom {
 /// assigns a bare (sigil-less) variable `LSortMsg` (the prefix parser for
 /// `LSortMsg` consumes no sigil), so our `Untagged` hint maps to `Msg`.
 /// `Suffix(X)` is the `:msg|:pub|…` form and folds onto its base sort.
-fn normalise_msg_sort(s: p::SortHint) -> p::SortHint {
+pub fn normalise_msg_sort(s: p::SortHint) -> p::SortHint {
     use p::{SortHint as S, SuffixSort as SS};
     match s {
         S::Untagged => S::Msg,

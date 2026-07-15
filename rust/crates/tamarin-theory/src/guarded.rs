@@ -1591,20 +1591,7 @@ pub fn normalize_bound_lvars(g: &Guarded) -> Guarded {
 /// duplicate IH-Disjs at depth 2 — one with `sk:Msg` and one with
 /// `sk:Untagged`.
 pub fn normalize_sort_hints(g: &Guarded) -> Guarded {
-    fn norm_sort(s: p::SortHint) -> p::SortHint {
-        match s {
-            p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) =>
-                p::SortHint::Pub,
-            p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) =>
-                p::SortHint::Fresh,
-            p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node) =>
-                p::SortHint::Node,
-            p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat) =>
-                p::SortHint::Nat,
-            p::SortHint::Msg | p::SortHint::Suffix(p::SuffixSort::Msg)
-            | p::SortHint::Untagged => p::SortHint::Msg,
-        }
-    }
+    use crate::guarded_types::normalise_msg_sort as norm_sort;
     fn norm_binding(b: &GBinding) -> GBinding {
         GBinding { name: b.name.clone(), sort: norm_sort(b.sort) }
     }

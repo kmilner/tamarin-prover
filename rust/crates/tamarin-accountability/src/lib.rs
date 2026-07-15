@@ -19,6 +19,7 @@ mod generation;
 use tamarin_parser::ast as p;
 use tamarin_parser::wf::WfError;
 
+use tamarin_theory::elaborate::elaborate_lemma_attr;
 use tamarin_theory::theory::{self as t, Theory, TheoryItem};
 
 use crate::formula::{from_p_formula, frees, sort_rank, to_p_formula, Fm};
@@ -339,23 +340,6 @@ fn inject_lemma(
         plaintext: "generation".to_string(),
     };
     elaborated.items.push(TheoryItem::Lemma(elab_lemma));
-}
-
-/// Map a parser-AST lemma attribute to the elaborated form (the two enums are
-/// 1:1; mirrors the private `elaborate::elaborate_lemma_attr`).
-fn elaborate_lemma_attr(a: &p::LemmaAttr) -> t::LemmaAttr {
-    match a {
-        p::LemmaAttr::Sources => t::LemmaAttr::Sources,
-        p::LemmaAttr::Reuse => t::LemmaAttr::Reuse,
-        p::LemmaAttr::DiffReuse => t::LemmaAttr::DiffReuse,
-        p::LemmaAttr::UseInduction => t::LemmaAttr::UseInduction,
-        p::LemmaAttr::HideLemma(s) => t::LemmaAttr::HideLemma(s.clone()),
-        p::LemmaAttr::Heuristic(s) => t::LemmaAttr::Heuristic(s.clone()),
-        p::LemmaAttr::Output(xs) => t::LemmaAttr::Output(xs.clone()),
-        p::LemmaAttr::Left => t::LemmaAttr::Left,
-        p::LemmaAttr::Right => t::LemmaAttr::Right,
-        p::LemmaAttr::Hint(s) => t::LemmaAttr::Hint(s.clone()),
-    }
 }
 
 // =============================================================================

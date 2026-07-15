@@ -1164,7 +1164,7 @@ fn elaborate_items(
     Ok(())
 }
 
-fn elaborate_lemma_attr(a: &p::LemmaAttr) -> LemmaAttr {
+pub fn elaborate_lemma_attr(a: &p::LemmaAttr) -> LemmaAttr {
     match a {
         p::LemmaAttr::Sources => LemmaAttr::Sources,
         p::LemmaAttr::Reuse => LemmaAttr::Reuse,

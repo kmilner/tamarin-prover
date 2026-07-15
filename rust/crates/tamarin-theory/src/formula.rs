@@ -4,12 +4,17 @@
 //! The Haskell version uses a locally-nameless representation: bound
 //! variables are `BVar::Bound(de_bruijn_idx)`, free variables are `Free(v)`.
 //!
-//! Not yet ported (as of this writing): `nnf`, `pullquants`, `prenex`, `pnf`,
-//! `simplifyFormula` — pure transforms on `ProtoFormula`, addable
-//! incrementally. (The guarded-formula simplifier `simplifyGuarded` is ported
-//! separately as `simplify_guarded_with` in guarded.rs.) (Pretty-printing of
-//! the parser-AST formula representation lives in `pretty_formula.rs`; this
-//! `ProtoFormula` has no pretty-printer.)
+//! The pure transforms (`nnf`, `pullquants`, `prenex`, `pnf`,
+//! `simplifyFormula`) are not ported on THIS type. Formula.hs's
+//! `quantify`/`shiftFreeIndices`/`simplifyFormula` (plus Generation.hs's
+//! `pullQuantifiers`/`mergeQuantifiers`) ARE ported in
+//! `tamarin-accountability/src/formula.rs`, over a parallel locally-nameless
+//! type (`Fm`) whose leaves are `guarded_types` parser-AST atoms rather than
+//! this module's real-term `ProtoAtom`s — check there before porting a
+//! transform here. (The guarded-formula simplifier `simplifyGuarded` is a
+//! DIFFERENT HS function, ported as `simplify_guarded_with` in guarded.rs.)
+//! (Pretty-printing of the parser-AST formula representation lives in
+//! `pretty_formula.rs`; this `ProtoFormula` has no pretty-printer.)
 
 use crate::atom::{ProtoAtom, Unit2};
 use tamarin_term::lterm::{BVar, LVar, Name};

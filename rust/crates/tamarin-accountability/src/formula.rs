@@ -18,26 +18,14 @@
 use tamarin_parser::ast as p;
 use tamarin_theory::guarded_types::{
     self as gt, atom_to_gatom_free, close_subst, collect_free_atom, gatom_to_atom,
-    lvar_to_binding, map_free_atom, open_subst, subst_bound_atom_at_depth,
-    subst_free_atom_at_depth, BVar, GAtom, GBinding, GFact, GTerm,
+    lvar_to_binding, map_free_atom, normalise_msg_sort, open_subst,
+    subst_bound_atom_at_depth, subst_free_atom_at_depth, BVar, GAtom, GBinding,
+    GFact, GTerm,
 };
 
-/// Logical connectives (HS `data Connective = And | Or | Imp | Iff`,
-/// Formula.hs:104).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Conn {
-    And,
-    Or,
-    Imp,
-    Iff,
-}
-
-/// Quantifiers (HS `data Quantifier = All | Ex`, Formula.hs:108).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Quant {
-    All,
-    Ex,
-}
+// The connective/quantifier enums (HS Formula.hs:104,108) are shared with the
+// ProtoFormula data-type port in `tamarin_theory::formula`.
+pub(crate) use tamarin_theory::formula::{Connective as Conn, Quantifier as Quant};
 
 /// A `SyntacticLNFormula` in locally-nameless form.
 ///
@@ -72,6 +60,11 @@ impl Fm {
 
 /// Rank a `SortHint` to mirror HS `LSort` Ord.  A bare (`Untagged`) message
 /// variable is `LSortMsg`.
+///
+/// NOT interchangeable with `guarded::sort_hint_tag`/`cmp_varspec`: those
+/// rank `Untagged` LAST (99) so unresolved hints stay distinct, whereas here
+/// `Untagged` ranks AS `Msg` — `frees` must dedup a bare `x` against `x:msg`
+/// (HS compares real `LSort`s, where both are already `LSortMsg`).
 pub(crate) fn sort_rank(s: p::SortHint) -> u8 {
     use p::{SortHint::*, SuffixSort};
     match s {
@@ -84,26 +77,13 @@ pub(crate) fn sort_rank(s: p::SortHint) -> u8 {
 }
 
 /// HS `LVar` Ord: `compare idx <> compare sort <> compare name`.
+/// Compares via [`sort_rank`], so `Untagged` == `Msg` (see its doc for why
+/// this deliberately differs from `guarded::cmp_varspec`).
 fn cmp_lvar(a: &p::VarSpec, b: &p::VarSpec) -> std::cmp::Ordering {
     a.idx
         .cmp(&b.idx)
         .then(sort_rank(a.sort).cmp(&sort_rank(b.sort)))
         .then(a.name.cmp(&b.name))
-}
-
-/// Normalise a `SortHint` to the concrete base sort HS's parser assigns a
-/// *non-temporal* occurrence (`Untagged`/`Suffix(Msg)` → `Msg`, other
-/// `Suffix(X)` → `X`).  Mirrors `guarded_types::normalise_msg_sort`.
-fn normalise_msg_sort(s: p::SortHint) -> p::SortHint {
-    use p::{SortHint as S, SuffixSort as SS};
-    match s {
-        S::Untagged | S::Suffix(SS::Msg) => S::Msg,
-        S::Suffix(SS::Pub) => S::Pub,
-        S::Suffix(SS::Fresh) => S::Fresh,
-        S::Suffix(SS::Node) => S::Node,
-        S::Suffix(SS::Nat) => S::Nat,
-        other => other,
-    }
 }
 
 // =============================================================================
