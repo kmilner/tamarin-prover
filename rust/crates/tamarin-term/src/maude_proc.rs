@@ -124,16 +124,6 @@ struct MaudeProcessInner {
     /// every search step — so the same subterm gets reduced repeatedly
     /// during a single proof.  Caching cuts those repeat round-trips.
     reduce_cache: tamarin_utils::FastMap<LNTerm, LNTerm>,
-    /// Memo for `match_eqs_const_subject` EMPTY-result queries, read and
-    /// written on every call to that matcher.  The matcher is reached only
-    /// from tests; the cache stays wired for them and for potential reuse.
-    /// AC-heavy patterns re-issue many identical all-empty matches across
-    /// fixpoint passes, so caching the empty answer skips the repeat
-    /// round-trips.  Caching the empty answer is safe — no witness LVars to
-    /// renumber.  Non-empty results are NOT cached (witnesses need
-    /// fresh-renaming per use, same reason `unifiable_cache` only stores
-    /// booleans).
-    match_empty_cache: tamarin_utils::FastMap<(Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>), ()>,
     /// Memo for the RAW REPLY BYTES of the witness-producing Maude commands
     /// (`unify in MSG`, `variant unify in MSG`, `get variants in MSG`, and the
     /// three `match in MSG` matchers), keyed by the *exact command
@@ -405,7 +395,6 @@ impl MaudeHandle {
             sig: Arc::clone(&sig),
             unifiable_cache: tamarin_utils::FastMap::default(),
             reduce_cache: tamarin_utils::FastMap::default(),
-            match_empty_cache: tamarin_utils::FastMap::default(),
             reply_cache: tamarin_utils::FastMap::default(),
         };
         // Banner / initial prompt.
@@ -906,8 +895,8 @@ impl MaudeHandle {
             .collect();
         // HS-faithful `flattenUnif (subst, substs) = map (composeVFresh _ subst) substs`
         // (Unification.hs:147).  For the AC path RS sends ONLY the AC residual
-        // equations to Maude (line 761) and composes each arm with the non-AC
-        // factored substitution `factored_m` (line 924), mirroring HS
+        // equations to Maude and composes each arm with the non-AC factored
+        // substitution `factored_m`, mirroring HS
         // flattenUnif's `(subst, substs)`.  `composeVFresh factored_m arm` also
         // RENAMES the witnesses (the arm's range vars) via HS's
         // `freshToFreeAvoidingFast` uniform shift seeded by
@@ -1086,18 +1075,6 @@ impl MaudeHandle {
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
         }
-        // Empty-result cache.  Profiling showed 100 % of calls on
-        // AC-heavy lemmas (e.g. csf17/keylessssl::injectivity) return
-        // empty, with many repeats across fixpoint passes.  Cache the
-        // empty answer to skip the round-trip.
-        let cache_key: (Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>) = (
-            eqs.iter().map(|e| (e.lhs.clone(), e.rhs.clone())).collect(),
-            pattern_vars.iter().cloned().collect(),
-        );
-        if self.inner.lock().unwrap().match_empty_cache.contains_key(&cache_key) {
-            _tally_callsite("match_eqs_const_subject::CACHE_HIT");
-            return Ok(Vec::new());
-        }
         // Skolemize subject-side free vars not in `pattern_vars`:
         // walk each rhs LNTerm and replace such LVars with a public
         // `Name`-constant tagged with a deterministic synthetic
@@ -1153,10 +1130,6 @@ impl MaudeHandle {
         let msubsts = maude_parse::parse_match_reply(&reply)?;
         if msubsts.is_empty() {
             _tally_callsite("match_eqs_const_subject::EMPTY");
-            // Re-acquire lock to insert into cache.  Safe — we already
-            // dropped `inner` above; only one thread holds the handle
-            // mutex anyway (it's wrapped in `Mutex<MaudeProcessInner>`).
-            self.inner.lock().unwrap().match_empty_cache.insert(cache_key, ());
         }
         else { _tally_callsite("match_eqs_const_subject::NONEMPTY"); }
         let mut out = Vec::with_capacity(msubsts.len());

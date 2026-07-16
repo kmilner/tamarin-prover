@@ -21,9 +21,11 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 use tamarin_parser::{parse_theory, wf};
+
+mod common;
+use common::run_tamarin;
 
 fn main() {
     let args = env::args().skip(1);
@@ -122,46 +124,4 @@ fn main() {
         for l in fail_lines { println!("  {}", l); }
         std::process::exit(1);
     }
-}
-
-fn run_tamarin(bin: &str, path: &std::path::Path, flags: &[String]) -> Option<BTreeSet<String>> {
-    let mut cmd = Command::new(bin);
-    for f in flags { cmd.arg(f); }
-    cmd.arg(path);
-    let out = cmd.output().ok()?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    Some(extract_topics(&combined))
-}
-
-/// A wellformedness topic header is a line followed by a line of `=`
-/// characters whose length equals (or exceeds) the topic name.
-fn extract_topics(s: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let mut prev: Option<&str> = None;
-    for line in s.lines() {
-        if !line.is_empty() && line.chars().all(|c| c == '=') {
-            if let Some(p) = prev {
-                let p = p.trim();
-                if !p.is_empty() {
-                    // Filter banner lines that aren't actual topics.
-                    if !p.starts_with("analyzed:")
-                        && !p.starts_with("summary of summaries")
-                        && !p.contains("Tamarin version")
-                        && !p.contains("Maude version")
-                        && !p.starts_with("theory ")
-                        && !p.starts_with("Generated from:")
-                        && !p.starts_with("Compiled at")
-                    {
-                        out.insert(p.to_string());
-                    }
-                }
-            }
-        }
-        prev = Some(line);
-    }
-    out
 }

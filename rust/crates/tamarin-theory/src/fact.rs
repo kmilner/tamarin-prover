@@ -199,6 +199,36 @@ impl<T> Fact<T> {
             max_var: u64::MAX,
         }
     }
+    /// Borrowing map — the HS `Functor Fact` instance (Fact.hs:171-172) for
+    /// producers holding a `&Fact`.  Clones `tag`/`annotations` and stores both
+    /// fingerprints as `u64::MAX`, exactly like [`Fact::new`]/[`Fact::map`]; the
+    /// same recompute guidance applies if a hot LNFact producer routes here.
+    pub fn map_ref<U>(&self, f: impl FnMut(&T) -> U) -> Fact<U> {
+        Fact {
+            tag: self.tag.clone(),
+            annotations: self.annotations.clone(),
+            terms: self.terms.iter().map(f).collect(),
+            bloom: u64::MAX,
+            max_var: u64::MAX,
+        }
+    }
+    /// Fallible borrowing map — the HS `Traversable Fact` instance
+    /// (Fact.hs:177-179) specialised to `Result`; short-circuits on the first
+    /// `Err`.  Same `tag`/`annotations` clone and `u64::MAX` fingerprints as
+    /// [`Fact::map_ref`].
+    pub fn try_map_ref<U, E>(
+        &self,
+        f: impl FnMut(&T) -> Result<U, E>,
+    ) -> Result<Fact<U>, E> {
+        let terms: Result<Vec<U>, E> = self.terms.iter().map(f).collect();
+        Ok(Fact {
+            tag: self.tag.clone(),
+            annotations: self.annotations.clone(),
+            terms: terms?,
+            bloom: u64::MAX,
+            max_var: u64::MAX,
+        })
+    }
 }
 
 impl<T: HasFrees> Fact<T> {
@@ -276,8 +306,9 @@ pub fn show_fact_tag(t: &FactTag) -> String {
 pub fn fact_tag_arity(t: &FactTag) -> usize {
     match t {
         FactTag::Proto(_, _, n) => *n,
-        FactTag::Fresh | FactTag::Out | FactTag::In => 1,
-        FactTag::Ku | FactTag::Kd | FactTag::Ded | FactTag::Term => 1,
+        // Every built-in tag carries exactly one term.
+        FactTag::Fresh | FactTag::Out | FactTag::In
+        | FactTag::Ku | FactTag::Kd | FactTag::Ded | FactTag::Term => 1,
     }
 }
 

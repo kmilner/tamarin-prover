@@ -23,8 +23,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use tamarin_parser::wf::{
+    after_public_names_topics, insert_wf_before, WF_AFTER_CHECK_GUARDED,
+    WF_AFTER_CHECK_TERMS, WF_AFTER_FACT_LHS, WF_AFTER_VARIANTS, WF_TOPIC_ORDER,
+};
 use tamarin_term::maude_proc::{MaudeHandle, MaudePool};
 use tamarin_theory::elaborate::elaborate;
+use tamarin_theory::macro_expand::macro_expanded_clone;
 
 use crate::cli::{lemma_matches, Args, Subcommand};
 
@@ -228,9 +233,7 @@ fn run_variants(args: &Args) -> Result<i32, RunError> {
     // HS emits the maude tool/version banner on STDERR (via `ensureMaude`),
     // not stdout — the rule dump alone goes to stdout.  Mirror that.
     if let Some(v) = crate::cli::detect_maude_version_pub() {
-        eprintln!("maude tool: '{}'", maude_path);
-        eprintln!(" checking version: {}. OK.", v);
-        eprintln!(" checking installation: OK.");
+        print_maude_banner(&maude_path, Some(&v));
     }
     // HS `Main.Mode.Intruder.run` (Intruder.hs:48-53) generates BOTH the DH
     // and the bilinear-pairing variants and emits `dhS ++ bpS`:
@@ -469,11 +472,7 @@ fn effective_config(
     };
     let cut = if args.prove_mode {
         match &args.stop_on_trace {
-            Some(crate::cli::StopOnTrace::Dfs) => CutStrategy::Dfs,
-            Some(crate::cli::StopOnTrace::SeqDfs) => CutStrategy::SeqDfs,
-            Some(crate::cli::StopOnTrace::Bfs) => CutStrategy::Bfs,
-            Some(crate::cli::StopOnTrace::Sorry) => CutStrategy::AfterSorry,
-            Some(crate::cli::StopOnTrace::None) => CutStrategy::Nothing,
+            Some(s) => stop_on_trace_cut(s),
             None => block_cut.unwrap_or(CutStrategy::Dfs),
         }
     } else {
@@ -482,80 +481,27 @@ fn effective_config(
     Ok((cut, args.auto_sources || block_auto_sources))
 }
 
-/// Map the CLI `--stop-on-trace` value (if given) to its `CutStrategy` —
-/// the interactive server merges this with each theory's own
-/// `configuration:` block at load time (`ProofState::new`).
-fn cli_cut(args: &Args) -> Option<tamarin_theory::constraint::solver::context::CutStrategy> {
+/// Map a CLI `--stop-on-trace` value to its `CutStrategy`.  Shared by
+/// `effective_config` (batch prove-mode) and `cli_cut` (interactive), so the
+/// two cannot drift.
+fn stop_on_trace_cut(
+    s: &crate::cli::StopOnTrace,
+) -> tamarin_theory::constraint::solver::context::CutStrategy {
     use tamarin_theory::constraint::solver::context::CutStrategy;
-    args.stop_on_trace.as_ref().map(|s| match s {
+    match s {
         crate::cli::StopOnTrace::Dfs => CutStrategy::Dfs,
         crate::cli::StopOnTrace::SeqDfs => CutStrategy::SeqDfs,
         crate::cli::StopOnTrace::Bfs => CutStrategy::Bfs,
         crate::cli::StopOnTrace::Sorry => CutStrategy::AfterSorry,
         crate::cli::StopOnTrace::None => CutStrategy::Nothing,
-    })
-}
-
-/// Clone the parser theory and expand its macros in place, mirroring HS
-/// `thyProtoRules`'s `applyMacroInRule (theoryMacros thy)`.  Used for the
-/// WF re-checks that must see macro-expanded rules.
-fn macro_expanded_clone(parsed: &tamarin_parser::ast::Theory) -> tamarin_parser::ast::Theory {
-    let mut t = parsed.clone();
-    tamarin_theory::macro_expand::expand_theory_macros(&mut t);
-    t
-}
-
-/// Canonical HS wellformedness check-order (Wellformedness.hs check list).
-/// Each ordered-splice call site below passes a SUFFIX of this list as its
-/// `later_topics`: since `insert_report_before` only tests membership, a
-/// suffix contains exactly the topics that sort AFTER the check being
-/// inserted.  One source of truth avoids four in-sync literal lists that
-/// would silently mis-order a single report on a typo.
-const WF_TOPIC_ORDER: &[&str] = &[
-    "Reserved names",
-    "Special facts",
-    "Fr facts must only use a fresh- or a msg-variable",
-    "Fact arity issues",
-    "Fact multiplicity issues",
-    "Fact capitalization issues",
-    "Facts occur in the left-hand-side but not in any right-hand-side ",
-    "Unbound variables",
-    "Formula terms",
-    " Formula guardedness",
-    "Lemma annotations",
-    "Multiplication restriction of rules",
-    "Nat Sorts",
-    "Subterm Convergence Warning",
-    "Message Derivation Checks",
-    "Derivation Checks",
-];
-
-// First `WF_TOPIC_ORDER` index whose topic sorts after each splicing check.
-const WF_AFTER_VARIANTS: usize = 0; // ruleVariantsReport → before factReports
-const WF_AFTER_FACT_LHS: usize = 8; // "Formula terms"
-const WF_AFTER_CHECK_TERMS: usize = 9; // " Formula guardedness"
-const WF_AFTER_CHECK_GUARDED: usize = 10; // "Lemma annotations"
-
-/// Splice `new` WF errors into `wf_report` just before the first existing
-/// entry whose topic is in `later_topics` (the HS check-order position), or
-/// at the end if none match.  Extracted from the four ordered-splice call
-/// sites (checkTerms / checkGuarded / SAPIC lhs-rhs / ruleVariants); each
-/// passes its own `later_topics` slice.  No-op when `new` is empty.
-fn insert_report_before(
-    wf_report: &mut Vec<tamarin_parser::wf::WfError>,
-    new: Vec<tamarin_parser::wf::WfError>,
-    later_topics: &[&str],
-) {
-    if new.is_empty() {
-        return;
     }
-    let insert_before = wf_report
-        .iter()
-        .position(|e| later_topics.contains(&e.topic.as_str()))
-        .unwrap_or(wf_report.len());
-    let tail = wf_report.split_off(insert_before);
-    wf_report.extend(new);
-    wf_report.extend(tail);
+}
+
+/// Map the CLI `--stop-on-trace` value (if given) to its `CutStrategy` —
+/// the interactive server merges this with each theory's own
+/// `configuration:` block at load time (`ProofState::new`).
+fn cli_cut(args: &Args) -> Option<tamarin_theory::constraint::solver::context::CutStrategy> {
+    args.stop_on_trace.as_ref().map(stop_on_trace_cut)
 }
 
 /// HS shows the maude tool's basename when the user didn't pass
@@ -816,7 +762,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         {
             let term_errors = tamarin_theory::check_terms::check_terms_wf(
                 &parsed_for_wf, &maude_sig);
-            insert_report_before(&mut wf_report, term_errors,
+            insert_wf_before(&mut wf_report, term_errors,
                 &WF_TOPIC_ORDER[WF_AFTER_CHECK_TERMS..]);
         }
 
@@ -847,7 +793,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             // matches HS: Formula guardedness (8c) before Lemma
             // annotations (9).  Find the first index of a topic that
             // comes after position 8 in HS's check order.
-            insert_report_before(&mut wf_report, guard_errors,
+            insert_wf_before(&mut wf_report, guard_errors,
                 &WF_TOPIC_ORDER[WF_AFTER_CHECK_GUARDED..]);
         }
 
@@ -944,7 +890,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             let lhs_rhs = tamarin_parser::wf::fact_lhs_occur_no_rhs(&post_thy);
             // Insert at the factReports position (after fact_usage, before
             // formulaReports), matching HS check order.
-            insert_report_before(&mut wf_report, lhs_rhs,
+            insert_wf_before(&mut wf_report, lhs_rhs,
                 &WF_TOPIC_ORDER[WF_AFTER_FACT_LHS..]);
 
             // HS `publicNamesReport` (Wellformedness.hs:463-484) also runs on
@@ -965,12 +911,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             wf_report.retain(|e| e.topic != caps_topic);
             let public_names =
                 tamarin_theory::elaborate::sapic_public_names_report(&elaborated);
-            let after_public_names: Vec<&str> = std::iter::once(
-                    "Variable with mismatching sorts or capitalization")
-                .chain(WF_TOPIC_ORDER.iter().copied()
-                    .filter(|t| *t != "Unbound variables"))
-                .collect();
-            insert_report_before(&mut wf_report, public_names, &after_public_names);
+            insert_wf_before(&mut wf_report, public_names, &after_public_names_topics());
         }
 
         // Spawn a single Maude handle for this file.  Used by:
@@ -1153,7 +1094,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 
             // HS position 6: ruleVariantsReport comes BEFORE factReports
             // (position 7).  Insert before factReports items.
-            insert_report_before(&mut wf_report, variants_errors,
+            insert_wf_before(&mut wf_report, variants_errors,
                 &WF_TOPIC_ORDER[WF_AFTER_VARIANTS..]);
 
             // HS closeProtoRule (Rule.hs:97-98): `ClosedProtoRule ruE <$>
@@ -1694,7 +1635,7 @@ fn print_overall_summary(file_results: &[FileResult], prove_mode: bool) {
             // blank `Pretty.text ""` renders as `"  "`.  So this separator
             // appears between the warning block and the per-lemma summary
             // lines ONLY when there are summary lines to follow; emitting it
-            // unconditionally added a spurious trailing `"  "` line.
+            // unconditionally would add a spurious trailing `"  "` line.
             if !fr.results.is_empty() {
                 println!("  ");
             }

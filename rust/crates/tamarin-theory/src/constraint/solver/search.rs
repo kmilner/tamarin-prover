@@ -84,6 +84,16 @@ fn node_status_of(r: &MethodResult) -> NodeStatus {
     }
 }
 
+/// True for a leaf parked at the ID-DFS depth limit: a `Sorry: depth
+/// limit` method with `Sorry` status.  These are the frontier stubs
+/// `re_expand_depth_limited` re-runs `expand` on at the next (deeper)
+/// iteration — the Rust analog of Haskell's unforced `cutOnSolvedDFS`
+/// thunks — so `expand` also keeps their `sys` alive for that re-run.
+fn is_depth_limited(node: &ProofNode) -> bool {
+    matches!(&node.method, ProofMethod::Sorry(Some(msg)) if msg == "depth limit")
+        && matches!(node.status, NodeStatus::Sorry)
+}
+
 /// HS `ProofStatus` (Proof.hs:397-408) — the aggregate status of a WHOLE
 /// proof tree, used to decide the lemma verdict.  Unlike the per-node
 /// [`NodeStatus`], this folds over every step (HS `getProofStatus =
@@ -191,8 +201,7 @@ fn keep_sys() -> bool {
 /// variable, nondeterministically changing unifier-arm survival.
 #[inline]
 fn disable_parallel_expand() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_PARALLEL_EXPAND").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_DISABLE_PARALLEL_EXPAND")
 }
 
 /// Per-lemma wall-clock cap on `run_proof_search`. This is a Rust-only,
@@ -657,12 +666,8 @@ fn re_expand_depth_limited(
     deadline: &std::time::Instant,
     depth: usize,
 ) {
-    // Was this node previously stalled at the depth limit?
-    let was_depth_limited = matches!(
-        &node.method,
-        ProofMethod::Sorry(Some(msg)) if msg == "depth limit"
-    ) && matches!(node.status, NodeStatus::Sorry);
-    if was_depth_limited {
+    // Was this node stalled at the depth limit on the previous iteration?
+    if is_depth_limited(node) {
         // Re-expand from scratch at this depth.  The deeper `MAX_DEPTH`
         // now lets the recursion go further before stalling again.
         node.method = ProofMethod::Sorry(None);
@@ -771,10 +776,7 @@ fn expand(
     // peak; this drain reduces peak RSS to ~14 MB (~ same as small
     // lemmas — most of HS's residue is the closed branches we can
     // now free).
-    let keep_for_redoexpand = matches!(
-        &node.method,
-        ProofMethod::Sorry(Some(msg)) if msg == "depth limit"
-    ) && matches!(node.status, NodeStatus::Sorry);
+    let keep_for_redoexpand = is_depth_limited(node);
     if !keep_for_redoexpand && !keep_sys() {
         node.sys = crate::constraint::system::System::default();
     }

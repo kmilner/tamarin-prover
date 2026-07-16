@@ -693,7 +693,8 @@ impl<'a> Parser<'a> {
         if !self.try_kw("end") {
             return Err(self.item_position_error());
         }
-        // Allow trailing whitespace / comments / arbitrary text? Haskell stops here.
+        // Parsing stops at `end`; any trailing text is left unconsumed (callers
+        // ignore it), as Haskell's parser does.
         Ok(Theory {
             is_diff: self.is_diff,
             name,
@@ -713,11 +714,8 @@ impl<'a> Parser<'a> {
             let save = self.save();
             if self.lx.eat_str("#") {
                 // peek directive name
-                let mut buf = String::new();
                 let mut probe = self.lx.clone();
-                while let Some(c) = probe.peek() {
-                    if c.is_ascii_alphabetic() { buf.push(c); probe.bump(); } else { break; }
-                }
+                let buf = probe.ascii_alpha_run();
                 let directive = buf.as_str();
                 if directive == "endif" || directive == "else" {
                     self.restore(save);
@@ -793,10 +791,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         if !self.lx.eat_str("#") { self.restore(save); return Ok(None); }
         // Read directive name.
-        let mut name = String::new();
-        while let Some(c) = self.lx.peek() {
-            if c.is_ascii_alphabetic() { name.push(c); self.lx.bump(); } else { break; }
-        }
+        let name = self.lx.ascii_alpha_run();
         match name.as_str() {
             "ifdef" => {
                 self.skip_ws();
@@ -957,10 +952,7 @@ impl<'a> Parser<'a> {
             if self.lx.is_eof() { return BranchEnd::Eof; }
             if self.lx.peek() == Some('#') {
                 self.lx.bump();
-                let mut name = String::new();
-                while let Some(c) = self.lx.peek() {
-                    if c.is_ascii_alphabetic() { name.push(c); self.lx.bump(); } else { break; }
-                }
+                let name = self.lx.ascii_alpha_run();
                 match name.as_str() {
                     "ifdef" => { depth += 1; }
                     "endif" => {
@@ -1161,11 +1153,7 @@ impl<'a> Parser<'a> {
                         if self.lx.peek() == Some('#') {
                             let mut probe = self.lx.clone();
                             probe.bump();
-                            let mut name = String::new();
-                            while let Some(c) = probe.peek() {
-                                if c.is_ascii_alphabetic() { name.push(c); probe.bump(); }
-                                else { break; }
-                            }
+                            let name = probe.ascii_alpha_run();
                             if matches!(name.as_str(),
                                 "ifdef" | "endif" | "else" | "define" | "include")
                             { break; }

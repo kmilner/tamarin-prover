@@ -230,34 +230,6 @@ fn var_occurences(range_terms: &[LNTerm]) -> BTreeMap<LVar, BTreeSet<Occurence>>
     out
 }
 
-/// Apply a var→term renaming across a term, rebuilding `App` nodes via
-/// the smart constructor `f_app`.  HS's `mapRangeVFresh (applyVTerm
-/// renaming)` uses `applyVTerm`, which dispatches through `fAppAC` /
-/// `fAppC` and therefore **re-sorts AC/C operand lists** by the renamed
-/// `Ord (Term a)`.  This matters: a renaming that reorders two operands
-/// of an AC node (e.g. `mult(x3, x4)` with `x3→x.4, x4→x.3`) must be
-/// re-sorted to `mult(x.3, x.4)`, exactly as HS does — using the raw
-/// `Term::App` constructor would leave the operands out of canonical
-/// order and diverge from HS's printed variants.
-fn apply_renaming(t: &LNTerm, rename: &BTreeMap<LVar, LVar>) -> LNTerm {
-    use crate::term::f_app;
-    match t {
-        Term::Lit(Lit::Var(v)) => match rename.get(v) {
-            Some(nv) => var_term(nv.clone()),
-            None => t.clone(),
-        },
-        Term::Lit(_) => t.clone(),
-        Term::App(sym, args) => {
-            let renamed: Vec<LNTerm> =
-                args.iter().map(|a| apply_renaming(a, rename)).collect();
-            // `f_app` dispatches: AC → flatten+sort; C → sort; NoEq/List
-            // → straight-through, mirroring HS's smart constructors that
-            // `applyVTerm` routes through.
-            f_app(sym.clone(), renamed)
-        }
-    }
-}
-
 /// `canonizeSubst` — canonical representative modulo renaming.
 /// Faithful port of HS `canonizeSubst` (Subsumption.hs:67-77).
 pub fn canonize_subst(subst: &LNSubstVFresh) -> LNSubstVFresh {
@@ -280,18 +252,29 @@ pub fn canonize_subst(subst: &LNSubstVFresh) -> LNSubstVFresh {
     vrange.sort_by_key(|v| occs.get(v).cloned());
 
     // `renaming = zipWith (\lv i -> (lv, x.i)) vrangeSorted [1..]`,
-    // preserving each var's sort.
-    let mut rename: BTreeMap<LVar, LVar> = BTreeMap::new();
+    // preserving each var's sort.  The values are `var_term`s so this is the
+    // `LNTerm` var→term map `applyVTerm` consumes directly.
+    let mut renaming: BTreeMap<LVar, LNTerm> = BTreeMap::new();
     for (i, v) in vrange.iter().enumerate() {
-        rename.insert(v.clone(), LVar::new("x", v.sort, (i + 1) as u64));
+        renaming.insert(v.clone(), var_term(LVar::new("x", v.sort, (i + 1) as u64)));
     }
 
-    // `mapRangeVFresh (applyVTerm renaming) subst`.
+    // `mapRangeVFresh (applyVTerm renaming) subst`.  `apply_vterm_map` is the
+    // `applyVTerm` HS canonizeSubst uses (Subsumption.hs:67-77): it dispatches
+    // the `f_app_ac` / `f_app_c` / `f_app_no_eq` / `f_app_list` smart
+    // constructors, so it **re-sorts AC/C operand lists** by the renamed `Ord
+    // (Term a)`.  This matters: a renaming that reorders two operands of an AC
+    // node (e.g. `mult(x3, x4)` with `x3→x.4, x4→x.3`) is re-sorted to
+    // `mult(x.3, x.4)`, exactly as HS does — a raw `Term::App` would leave the
+    // operands out of canonical order and diverge from HS's printed variants.
+    // On a subtree containing no renamed var, `apply_vterm_map`'s COW no-change
+    // path returns the original, value-identical subtree (range terms are
+    // already AC-canonical, so re-normalising it is the identity).
     LNSubstVFresh::from_list(
         subst
             .to_list()
             .into_iter()
-            .map(|(domv, t)| (domv, apply_renaming(&t, &rename)))
+            .map(|(domv, t)| (domv, crate::subst::apply_vterm_map(&renaming, t)))
             .collect::<Vec<_>>(),
     )
 }

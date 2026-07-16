@@ -399,9 +399,7 @@ fn map_fact_name(f: &LNFact, prefix: &str) -> LNFact {
         FactTag::Proto(m, s, i) => FactTag::Proto(*m, tamarin_term::intern::intern_str(&format!("{prefix}{s}")), *i),
         other => other.clone(),
     };
-    let mut nf = tamarin_theory::fact::Fact::new(tag, f.terms.clone());
-    nf = nf.with_annotations(f.annotations.clone());
-    nf
+    tamarin_theory::fact::Fact::new(tag, f.terms.clone()).with_annotations(f.annotations.clone())
 }
 
 /// `proto_fact` is fixed to `Linear`; the state fact needs an explicit

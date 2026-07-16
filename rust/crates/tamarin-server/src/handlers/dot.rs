@@ -92,6 +92,13 @@ use tamarin_theory::rule::{
 };
 use tamarin_term::lterm::{LNTerm, LVar};
 use tamarin_term::pretty::pretty_lnterm;
+// `fix_multi_line_label` is HS `fixMultiLineLabel` (Text/Dot.hs:355-363),
+// applied to every record FIELD by the `mkField` smart constructor
+// (Text/Dot.hs:378-381): a multi-line label has each line's leading spaces
+// replaced 1:1 by `&nbsp;` and is re-joined with `unlines` — which appends a
+// TRAILING newline (→ a trailing `\l` after `showAttr`).  Single-line labels
+// pass through untouched.
+use tamarin_utils::dot::fix_multi_line_label;
 
 use crate::graph::abbreviation::{
     apply_abbreviations_fact, compute_abbreviations, AbbreviationOptions,
@@ -283,7 +290,7 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
     // then the cluster edges last (`dotClustersEdges`).
     emit_edges_merged(&mut g, &repr.edges, &node_map, &ds_nodes);
     emit_edges_merged(&mut g, &cluster_edges, &node_map, &ds_nodes);
-    // 4c. Legend (if any abbreviations were chosen).
+    // 4d. Legend (if any abbreviations were chosen).
     if !abbrevs.is_empty() {
         g.legend(&abbrevs);
     }
@@ -382,7 +389,6 @@ fn emit_edges_merged(
         g.less_edge(la, ds_nodes);
     }
 }
-
 
 fn abbreviate_rule(
     ru: &RuleACInst,
@@ -965,28 +971,6 @@ fn scale_indent(s: String) -> String {
         out.push(' ');
     }
     out.push_str(&rest);
-    out
-}
-
-/// HS `fixMultiLineLabel` (Text/Dot.hs:355-363), applied to every record
-/// FIELD by the `mkField` smart constructor (Text/Dot.hs:378-381): a
-/// multi-line label has each line's leading spaces replaced 1:1 by
-/// `&nbsp;` and is re-joined with `unlines` — which appends a TRAILING
-/// newline (→ a trailing `\l` after `showAttr`).  Single-line labels pass
-/// through untouched.
-fn fix_multi_line_label(lbl: &str) -> String {
-    if !lbl.contains('\n') {
-        return lbl.to_string();
-    }
-    let mut out = String::with_capacity(lbl.len() + 8);
-    for line in lbl.split('\n') {
-        let leading = line.chars().take_while(|c| c.is_whitespace()).count();
-        for _ in 0..leading {
-            out.push_str("&nbsp;");
-        }
-        out.extend(line.chars().skip(leading));
-        out.push('\n');
-    }
     out
 }
 

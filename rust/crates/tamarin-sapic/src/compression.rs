@@ -231,15 +231,11 @@ fn compress_one(
     // fact's prem/concs rules (NOT `getProducedFacts msr`).
     let persistent = is_persistent_fact(fact);
     if persistent {
-        // Compute `new_facts` from the merge WITHOUT consuming `msr` order; the
-        // returned msr is the ORIGINAL, unchanged.
-        let (prem_rules, msr2): (Vec<ERule>, Vec<ERule>) = msr
-            .iter()
-            .cloned()
-            .partition(|r| r.premises.iter().any(|f| same_name(fact, f)));
-        let (concs_rules, _msr3): (Vec<ERule>, Vec<ERule>) = msr2
-            .into_iter()
-            .partition(|r| r.conclusions.iter().any(|f| same_name(fact, f)));
+        // Compute `new_facts` from the merge, but return the ORIGINAL `msr`
+        // unchanged — so partition a CLONE with the same prem/concs helpers the
+        // non-persistent path below uses.
+        let (prem_rules, msr2) = get_prem_rules(fact, msr.clone());
+        let (concs_rules, _msr3) = get_concs_rules(fact, msr2);
         let new_rules = merge_rules(comp_events, &concs_rules, &prem_rules);
         let new_facts = get_produced_facts(&new_rules);
         return (msr, new_facts);
@@ -348,13 +344,10 @@ fn cmp_info(a: &ProtoRuleEInfo, b: &ProtoRuleEInfo) -> std::cmp::Ordering {
     // formulas live in `AnnotatedRule.restr`, lifted separately), so comparing by
     // length is a faithful proxy — `SyntacticLNFormula` has no `Ord` and the
     // non-empty case never arises here.
-    cmp_name(&a.name, &b.name)
+    a.name
+        .cmp(&b.name)
         .then_with(|| cmp_attrs(&a.attributes, &b.attributes))
         .then_with(|| a.restrictions.len().cmp(&b.restrictions.len()))
-}
-
-fn cmp_name(a: &ProtoRuleName, b: &ProtoRuleName) -> std::cmp::Ordering {
-    a.cmp(b)
 }
 
 /// `Ord RuleAttributes` = `(ruleColor, ruleProcess, ignoreDerivChecks,

@@ -623,23 +623,19 @@ pub struct GoalStatus {
 // --- Cached debug env flags for the goal insertion hot path -------
 // `add_goal`/`add_goal_with_loop_flag` insert goals per KU-decomposition /
 // conjoinSystem.  These diagnostic env vars are constant for the
-// process, so cache each behind a `OnceLock<bool>` (mirroring
-// `reduction::bounds_max_verify_enabled`) instead of an env-lock +
-// `String` alloc per insertion.
+// process, so each accessor caches its presence via `env_gate!` instead
+// of an env-lock + `String` alloc per insertion.
 #[inline]
 fn dbg_insert_goal() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DBG_INSERT_GOAL").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_DBG_INSERT_GOAL")
 }
 #[inline]
 fn dbg_insert_goal_include_precompute() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DBG_INSERT_GOAL_INCLUDE_PRECOMPUTE").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_DBG_INSERT_GOAL_INCLUDE_PRECOMPUTE")
 }
 #[inline]
 fn trace_goal_insert() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_TRACE_GOAL_INSERT").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_TRACE_GOAL_INSERT")
 }
 
 impl System {
@@ -1079,6 +1075,19 @@ impl System {
     /// (System.hs:917): `M.lookup v sNodes`.
     pub fn node_rule_safe(&self, v: &NodeId) -> Option<&RuleACInst> {
         self.nodes.iter().find(|(id, _)| id == v).map(|(_, r)| r)
+    }
+
+    /// Read-only `NodeId → &RuleACInst` index for `.get()` lookups,
+    /// replacing a per-lookup linear `nodes.iter().find`.  `or_insert`
+    /// keeps the FIRST rule for a given id, matching `find`'s /
+    /// `node_rule_safe`'s first-match semantics; `nodes` is unique-keyed,
+    /// so the map returns the identical rule the linear scan found.
+    pub fn node_rule_map(&self) -> tamarin_utils::FastMap<&NodeId, &RuleACInst> {
+        let mut m = tamarin_utils::FastMap::default();
+        for (n, r) in self.nodes.iter() {
+            m.entry(n).or_insert(r);
+        }
+        m
     }
 
     /// All `In`- and protocol-premise terms in the system, as

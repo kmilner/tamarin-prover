@@ -25,8 +25,8 @@
 //! invokes `dhIntruderRules False`/`bpIntruderRules False` against
 //! Maude and pretty-prints the result.  See [`crate::intruder_rules`]
 //! for the Rust port of `dhIntruderRules`, which IS still used as a
-//! regenerator (the function that PRODUCES the cache file) but is no
-//! longer the production runtime path.
+//! regenerator (the function that PRODUCES the cache file) but is not
+//! the production runtime path.
 
 use tamarin_parser as p;
 use tamarin_term::maude_sig::MaudeSig;
@@ -441,8 +441,7 @@ mod tests {
         // (mirroring the `maude_handle`/`dh_maude_handle` gating in
         // intruder_rules.rs).
         let maude_path = std::env::var("MAUDE_PATH").ok().or_else(|| {
-            for c in [
-                      "/usr/local/bin/maude", "maude"] {
+            for c in ["/usr/local/bin/maude", "maude"] {
                 if std::path::Path::new(c).exists() { return Some(c.to_string()); }
             }
             None

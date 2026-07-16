@@ -258,6 +258,15 @@ pub fn expand_theory_macros(thy: &mut p::Theory) {
     expand_items(&macros, &mut thy.items);
 }
 
+/// Clone a parser theory and expand its macros, mirroring HS `thyProtoRules`'s
+/// `applyMacroInRule (theoryMacros thy)`.  Used for the WF re-checks (batch and
+/// web load paths) that must see macro-expanded rules.
+pub fn macro_expanded_clone(parsed: &p::Theory) -> p::Theory {
+    let mut t = parsed.clone();
+    expand_theory_macros(&mut t);
+    t
+}
+
 /// Apply macros to a slice of theory items.  Recurses into `IfDef`
 /// branch items so that macro call-sites inside an `#ifdef`/`#ifndef`
 /// block are expanded too: the parser keeps the live branch wrapped in

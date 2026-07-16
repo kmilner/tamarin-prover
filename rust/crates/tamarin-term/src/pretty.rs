@@ -195,7 +195,7 @@ pub fn pp_name(n: &Name, out: &mut String) {
     }
 }
 
-fn ac_op_symbol(op: AcSym) -> &'static str {
+pub fn ac_op_symbol(op: AcSym) -> &'static str {
     // Haskell `ppACOp` (Term.hs:283-286).
     //   Mult => "*"; Xor => "⊕"; Union => "++"; NatPlus => "%+"
     // We use the unicode char for Xor since the rest of the UI

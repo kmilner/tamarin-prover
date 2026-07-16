@@ -213,10 +213,7 @@ fn map_fact_terms(
     loc: &Option<SapicTerm>,
     fa: tamarin_theory::sapic::SapicLNFact,
 ) -> tamarin_theory::sapic::SapicLNFact {
-    let terms = fa.terms.iter().map(|t| subst(loc, t)).collect();
-    let mut nf = tamarin_theory::fact::Fact::new(fa.tag.clone(), terms);
-    nf = nf.with_annotations(fa.annotations.clone());
-    nf
+    fa.map(|t| subst(loc, &t))
 }
 
 /// `subst` (Report.hs:91-98): rewrite `report(a)` to `rep(subst loc a, loc)`

@@ -166,7 +166,7 @@ fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &FunSig) -> bool {
                         // contains one / DH_neutral, nested mult, or invalidMult → reducible
                         if args.iter().any(|a| is_nullary(a, ONE_SYM_STRING)) { return false; }
                         if args.iter().any(|a| is_nullary(a, DH_NEUTRAL_SYM_STRING)) { return false; }
-                        if args.iter().any(is_product) { return false; }
+                        if args.iter().any(crate::term::is_product) { return false; }
                         if invalid_mult(args) { return false; }
                         return args.iter().all(|a| go_nf(a, msig, irreducible));
                     }
@@ -205,10 +205,6 @@ fn is_nullary(t: &LNTerm, name: &[u8]) -> bool {
     if let Term::App(FunSym::NoEq(s), args) = t {
         s.name == name && args.is_empty()
     } else { false }
-}
-
-fn is_product(t: &LNTerm) -> bool {
-    matches!(t, Term::App(FunSym::Ac(AcSym::Mult), _))
 }
 
 fn is_xor(t: &LNTerm) -> bool {

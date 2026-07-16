@@ -270,6 +270,13 @@ pub fn is_pair<A>(t: &Term<A>) -> bool {
     }
 }
 
+/// `True` iff the term is a DH product `_*_`. Port of HS `isProduct`
+/// (Term.hs:179, `viewTerm2 -> FMult _`): top symbol is the AC
+/// multiplication operator.
+pub fn is_product<A>(t: &Term<A>) -> bool {
+    matches!(t, Term::App(FunSym::Ac(AcSym::Mult), _))
+}
+
 /// `True` iff the term is a well-formed inverse `inv(_)`. Port of HS `isInverse`
 /// (Term.hs:174, `viewTerm2 -> FInv _`): the unary `inv` operator applied to one
 /// argument.

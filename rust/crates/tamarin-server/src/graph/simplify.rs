@@ -396,12 +396,15 @@ pub fn transitive_reduction(sys: RenderSystem, total_red: bool) -> RenderSystem 
         old_lesses.push((e.src.0.clone(), e.tgt.0.clone()));
     }
     old_lesses.extend(unsolved_chain_pairs(&sys));
-    let nodes: BTreeSet<NodeId> = old_lesses.iter()
-        .flat_map(|(a, b)| [a.clone(), b.clone()])
-        .collect();
-    // If there's a cycle in the combined graph we bail (matches Haskell).
-    if has_cycle(&old_lesses, &nodes) { return sys; }
-    let kept: BTreeSet<(NodeId, NodeId)> = trans_red(&old_lesses);
+    // If there's a cycle in the combined graph we bail, matching Haskell's
+    // `Dag.cyclic` guard (Simplification.hs:61-74).
+    if tamarin_utils::dag::cyclic(&old_lesses) { return sys; }
+    // `Dag.transRed` of the (now acyclic) combined relation.  The transitive
+    // reduction of a DAG is unique and `kept` is only consulted via
+    // `contains`, so collecting the `Relation` into a set is the faithful
+    // shape here.
+    let kept: BTreeSet<(NodeId, NodeId)> =
+        tamarin_utils::dag::trans_red(&old_lesses).into_iter().collect();
     let mut sys = sys;
     sys.content_mut().less_atoms.retain(|la| {
         let p = (la.smaller.clone(), la.larger.clone());
@@ -413,65 +416,6 @@ pub fn transitive_reduction(sys: RenderSystem, total_red: bool) -> RenderSystem 
         }
     });
     sys
-}
-
-/// Detect whether the directed graph implied by `edges` has a cycle.
-fn has_cycle(edges: &[(NodeId, NodeId)], nodes: &BTreeSet<NodeId>) -> bool {
-    let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-    for (a, b) in edges {
-        adj.entry(a.clone()).or_default().push(b.clone());
-    }
-    // DFS cycle detection per starting node.
-    let mut color: BTreeMap<NodeId, u8> = BTreeMap::new();
-    for n in nodes {
-        if color.get(n).copied().unwrap_or(0) == 0
-            && dfs_has_cycle(n, &adj, &mut color) { return true; }
-    }
-    false
-}
-
-fn dfs_has_cycle(
-    n: &NodeId,
-    adj: &BTreeMap<NodeId, Vec<NodeId>>,
-    color: &mut BTreeMap<NodeId, u8>,
-) -> bool {
-    color.insert(n.clone(), 1); // gray
-    if let Some(nbrs) = adj.get(n) {
-        for nb in nbrs {
-            let c = color.get(nb).copied().unwrap_or(0);
-            if c == 1 { return true; }
-            if c == 0 && dfs_has_cycle(nb, adj, color) { return true; }
-        }
-    }
-    color.insert(n.clone(), 2); // black
-    false
-}
-
-/// Transitive reduction: a pair `(x,y)` is in `transRed R` if it's in
-/// `R` and there is no intermediate `z` such that `x R+ z` and `z R+ y`.
-fn trans_red(edges: &[(NodeId, NodeId)]) -> BTreeSet<(NodeId, NodeId)> {
-    let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-    for (a, b) in edges {
-        adj.entry(a.clone()).or_default().push(b.clone());
-    }
-    // For each direct edge (x,y), check if there's another vertex z such
-    // that x reaches z and z reaches y *non-trivially* (z != x, z != y,
-    // and not via the direct (x,y) edge alone).
-    let mut kept: BTreeSet<(NodeId, NodeId)> = BTreeSet::new();
-    for (x, y) in edges {
-        if x == y { continue; }
-        let mut redundant = false;
-        if let Some(nbrs) = adj.get(x) {
-            for z in nbrs {
-                if z == y { continue; }
-                if reachable(&adj, z, y) { redundant = true; break; }
-            }
-        }
-        if !redundant {
-            kept.insert((x.clone(), y.clone()));
-        }
-    }
-    kept
 }
 
 #[cfg(test)]

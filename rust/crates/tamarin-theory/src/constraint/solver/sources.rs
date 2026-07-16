@@ -527,7 +527,7 @@ fn initial_source_cases_impl(
     // Same HS-faithful filter — safety only — for normalize_and_keep;
     // reuse the list computed above (identical filter over `ctx.restrictions`).
     let safety_only = safety_restrictions;
-    let normalize_and_keep = |sys: System, _case_name: &str| -> Option<System> {
+    let normalize_and_keep = |sys: System| -> Option<System> {
         let mut r = Reduction::new(ctx, sys);
         r.sys.insert_lemmas(safety_only.clone());
         r.subst_system();
@@ -563,23 +563,16 @@ fn initial_source_cases_impl(
         // apart from the now-HS-aligned node numbering.
         Some(s)
     };
-    let result: Vec<(String, System)> = match outcome {
-        GoalCases::Linear => normalize_and_keep(red.sys, "only")
+    match outcome {
+        GoalCases::Linear => normalize_and_keep(red.sys)
             .map(|s| vec![("only".into(), s)]).unwrap_or_default(),
-        GoalCases::LinearNamed(name) => {
-            let n2 = name.clone();
-            normalize_and_keep(red.sys, &n2)
-                .map(|s| vec![(name, s)]).unwrap_or_default()
-        }
+        GoalCases::LinearNamed(name) => normalize_and_keep(red.sys)
+            .map(|s| vec![(name, s)]).unwrap_or_default(),
         GoalCases::Cases(systems) => systems.into_iter()
-            .filter_map(|(name, s)| {
-                let n2 = name.clone();
-                normalize_and_keep(s, &n2).map(|s| (name, s))
-            })
+            .filter_map(|(name, s)| normalize_and_keep(s).map(|s| (name, s)))
             .collect(),
         GoalCases::Contradictory => Vec::new(),
-    };
-    result
+    }
 }
 
 /// Build the structural unique-source map. For every conclusion fact
@@ -804,9 +797,9 @@ pub fn precompute_full_sources(
     //     if enableBP msig then return $ fAppC EMap $ nMsgVars (2::Int) else []
     // C-headed; sortednub puts this LAST (after every NoEq + Ac term).
     // Without this, BP-theory targets (Chen_Kudla, TAK1, Joux, RYY,
-    // Scott) miss the `KU(em(t.1,t.2))` source.  HS emitted 9 KU
-    // sources for Chen_Kudla; pre-fix RS emitted 8 — exactly the
-    // `em` source was missing.
+    // Scott) miss the `KU(em(t.1,t.2))` source: HS emits 9 KU sources
+    // for Chen_Kudla, and dropping this branch would leave RS with 8 —
+    // exactly the `em` source missing.
     if msig.enable_bp {
         let args: Vec<tamarin_term::lterm::LNTerm> = (1..=2u64)
             .map(|i| tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(
@@ -1196,11 +1189,10 @@ pub fn refine_with_source_asms(
     }
 
     // Step 2 (Haskell `saturateSources`): re-saturate with the
-    // assumption-augmented cases.  This is the critical step our
-    // earlier port skipped — it propagates the typing constraints
-    // through the recursive premise expansion, pruning cases whose
-    // continuation introduces premises that violate the [sources]
-    // typing.
+    // assumption-augmented cases.  This step is critical — it
+    // propagates the typing constraints through the recursive premise
+    // expansion, pruning cases whose continuation introduces premises
+    // that violate the [sources] typing.
     // Haskell uses `paramSaturationLimit=5` for `saturateSources`. Our
     // multi-branch port grows the case set with each iteration (each
     // iter forks at every source-pick).  Capping iterations bounds
@@ -1798,12 +1790,11 @@ fn run_solve_all_safe_goals_disj_with_progress(
     // "changes" detection (Sources.hs:362-384; `not (null names)` from
     // solveAllSafeGoals returning caseNames, 213-215).
     let mut any_step_taken: bool = false;
-    // outer_cap / branch_cap are hardcoded to MAX (the HS-faithful
-    // unbounded default), so the two guards below are inert on the
-    // production path — the real bounds are chains_left (HS chainsLeft=10)
-    // and the outer saturation limit (paramSaturationLimit=5).  The caps
-    // only bite under the probe wrappers, which pass small branch_cap
-    // values; keep them so those probes stay bounded.
+    // The sole caller passes outer_cap / branch_cap = MAX (the HS-faithful
+    // unbounded default), so on the current path the two guards below never
+    // fire — the real bounds are chains_left (HS chainsLeft=10) and the outer
+    // saturation limit (paramSaturationLimit=5).  The caps stay as parameters
+    // so a bounded caller can still cap exploration.
     let mut total_steps: usize = 0;
     let total_step_cap: usize = branch_cap.saturating_mul(50).max(2000);
 
@@ -3582,14 +3573,12 @@ fn freshen_system_some_inst(
     out
 }
 
-/// Project a `VarSpec` to an `LVar` for `someInst` import tracking.
-/// Returns None if SortHint is `Untagged` (cannot determine LSort).
 /// Shared `SortHint`/`SuffixSort` -> `LSort` mapping.  `Untagged` yields
-/// `None`; every other hint maps to its concrete sort.  `vspec_to_lvar`
-/// propagates the `None` (skipping the var), `varspec_sort_to_lsort`
-/// resolves it to `LSort::Msg` — the sole difference between the two
-/// callers of this match.
-fn sort_hint_to_lsort_opt(s: &tamarin_parser::ast::SortHint) -> Option<tamarin_term::lterm::LSort> {
+/// `None`; every other hint maps to its concrete sort.  Each of the three
+/// callers applies its own `Untagged` policy: `vspec_to_lvar` propagates the
+/// `None` (skipping the var), while `varspec_sort_to_lsort` and
+/// `parser_sort_to_lsort` (rename_precise) resolve it to `LSort::Msg`.
+pub(crate) fn sort_hint_to_lsort_opt(s: &tamarin_parser::ast::SortHint) -> Option<tamarin_term::lterm::LSort> {
     use tamarin_parser::ast::{SortHint, SuffixSort};
     use tamarin_term::lterm::LSort;
     Some(match s {
@@ -3607,6 +3596,8 @@ fn sort_hint_to_lsort_opt(s: &tamarin_parser::ast::SortHint) -> Option<tamarin_t
     })
 }
 
+/// Project a `VarSpec` to an `LVar` for `someInst` import tracking; returns
+/// `None` when the `SortHint` is `Untagged` (no determinable `LSort`).
 fn vspec_to_lvar(v: &tamarin_parser::ast::VarSpec) -> Option<tamarin_term::lterm::LVar> {
     let sort = sort_hint_to_lsort_opt(&v.sort)?;
     Some(tamarin_term::lterm::LVar {
@@ -5845,14 +5836,13 @@ fn write_rule_to_key_excl_new_vars(
 /// Render a `Guarded` formula into the redundant-case dedup key buffer,
 /// applying the free-var alpha-`rename` INLINE.
 ///
-/// PERF/FAITHFULNESS: this is a direct structural serializer.  The previous
-/// implementation cloned the whole formula via `subst_guarded` (to apply
-/// the rename) and then `format!("{:?}", _)`-ed it through the derived
-/// `Debug` machinery — that path was ~19% of UM3 self+children time
-/// (GTerm clone churn + the slow generic `Debug` formatter builders +
-/// an intermediate `String` allocation per formula).  We instead walk the
+/// PERF/FAITHFULNESS: this is a direct structural serializer — it walks the
 /// formula once, renaming free LVar leaves in place and writing a compact
-/// structural fingerprint, with NO clone and NO `Debug` dispatch.
+/// structural fingerprint, with NO formula clone and NO `Debug` dispatch.
+/// Cloning the formula via `subst_guarded` to apply the rename and then
+/// `format!("{:?}", _)`-ing it through the derived `Debug` machinery would be
+/// far slower (GTerm clone churn, the generic `Debug` formatter builders, and
+/// an intermediate `String` per formula).
 ///
 /// The key BYTES are an arbitrary internal fingerprint:
 /// `compute_compare_systems_key` keys never reach `--prove` output and are
@@ -5883,8 +5873,7 @@ fn write_gfree_var(
     let sort = varspec_sort_to_lsort(&v.sort);
     let lv = tamarin_term::lterm::LVar { name: tamarin_term::intern::intern_str(v.name.as_str()), sort, idx: v.idx };
     let rv = rename.get(&lv).unwrap_or(&lv);
-    // Encode the renamed identity (name + idx + sort) — matches what the
-    // old subst_guarded+Debug path encoded for a Free leaf.
+    // Encode the renamed identity (name + idx + sort) of a Free leaf.
     out.push('F');
     out.push_str(rv.name);
     out.push('#');
@@ -6257,38 +6246,30 @@ fn compute_compare_systems_key(
         out.push(';');
     }
     out.push(']');
-    // FORMULAS.
+    // FORMULAS / SOLVED FORMULAS / LEMMAS: identical shape — render each
+    // guarded formula into the shared scratch buffer as a sorted section.
+    let push_guarded_section =
+        |out: &mut String,
+         items: &[std::sync::Arc<crate::guarded::Guarded>],
+         scratch: &mut String,
+         ranges: &mut Vec<(usize, usize)>| {
+            scratch.clear();
+            ranges.clear();
+            for g in items {
+                let start = scratch.len();
+                write_guarded_to_key(g, &rename, scratch);
+                ranges.push((start, scratch.len() - start));
+            }
+            push_sorted_ranges(out, scratch, ranges, ';');
+        };
     out.push_str(";FORMS:[");
-    scratch.clear();
-    ranges.clear();
-    for g in formulas {
-        let start = scratch.len();
-        write_guarded_to_key(g, &rename, &mut scratch);
-        ranges.push((start, scratch.len() - start));
-    }
-    push_sorted_ranges(&mut out, &scratch, &mut ranges, ';');
+    push_guarded_section(&mut out, formulas, &mut scratch, &mut ranges);
     out.push(']');
-    // SOLVED FORMULAS.
     out.push_str(";SOLV_FORMS:[");
-    scratch.clear();
-    ranges.clear();
-    for g in solved_formulas {
-        let start = scratch.len();
-        write_guarded_to_key(g, &rename, &mut scratch);
-        ranges.push((start, scratch.len() - start));
-    }
-    push_sorted_ranges(&mut out, &scratch, &mut ranges, ';');
+    push_guarded_section(&mut out, solved_formulas, &mut scratch, &mut ranges);
     out.push(']');
-    // LEMMAS.
     out.push_str(";LEMMAS:[");
-    scratch.clear();
-    ranges.clear();
-    for g in lemmas {
-        let start = scratch.len();
-        write_guarded_to_key(g, &rename, &mut scratch);
-        ranges.push((start, scratch.len() - start));
-    }
-    push_sorted_ranges(&mut out, &scratch, &mut ranges, ';');
+    push_guarded_section(&mut out, lemmas, &mut scratch, &mut ranges);
     out.push(']');
     // GOALS (deterministic order, renamed-var keyed).
     // HS structural Ord on System includes `_sGoals :: Map Goal
@@ -6634,14 +6615,12 @@ where
     }
     // sortednubBy (\(_,x) (_,y) -> compare x y)  -- compare on the key only,
     // matching HS comparing on the normed system via compareSystemsUpToNewVars.
-    let deduped = sortednub_by(&|a: &(usize, String, T), b: &(usize, String, T)| {
+    let mut deduped = sortednub_by(&|a: &(usize, String, T), b: &(usize, String, T)| {
         a.1.cmp(&b.1)
     }, decorated);
     // sortOn fst : restore original-index order.
-    let mut deduped = deduped;
     deduped.sort_by_key(|a| a.0);
-    let out: Vec<T> = deduped.into_iter().map(|(_, _, c)| c).collect();
-    out
+    deduped.into_iter().map(|(_, _, c)| c).collect()
 }
 
 // SplitG is not a "safe" goal at saturate time while chains are open

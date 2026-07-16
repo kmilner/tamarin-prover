@@ -3,10 +3,13 @@
 //! Vertex-list-based DAG operations. A `Relation<T>` is `Vec<(T, T)>`.
 //!
 //! `dfs_loop_breakers` is the live loop-breaker selector used by the
-//! constraint-solver context (`useAutoLoopBreakersAC`). The remaining
-//! operations (`restrict`, `image`, `inverse`, `reachable_set`, `cyclic`,
-//! `toposort`, `trans_red`) are a faithful port of the rest of
-//! `Data.DAG.Simple` retained for completeness and have no live caller yet.
+//! constraint-solver context (`useAutoLoopBreakersAC`). `cyclic` and
+//! `trans_red` back the display-graph compression pass
+//! (`tamarin-server`'s `graph::simplify::transitive_reduction`); `trans_red`
+//! in turn drives `toposort` (and thus `inverse`) and `reachable_set`. The
+//! remaining operations (`restrict`, `image`) are a faithful port of the
+//! rest of `Data.DAG.Simple` retained for completeness and have no live
+//! caller yet.
 
 use std::collections::BTreeSet;
 
@@ -77,11 +80,12 @@ pub fn cyclic<T: Ord + Clone>(rel: &Relation<T>) -> bool {
 
     let mut visited = BTreeSet::new();
     for (src, _) in rel {
-        let mut parents = BTreeSet::new();
-        if !visited.contains(src)
-            && find_loop(rel, &mut parents, &mut visited, src.clone()) {
+        if !visited.contains(src) {
+            let mut parents = BTreeSet::new();
+            if find_loop(rel, &mut parents, &mut visited, src.clone()) {
                 return true;
             }
+        }
     }
     false
 }

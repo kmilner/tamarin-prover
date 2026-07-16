@@ -64,8 +64,7 @@ static STEP: AtomicU64 = AtomicU64::new(0);
 /// times per proof), so cache the read once per process behind a
 /// `OnceLock<bool>` — the disabled-path emit calls then stay free.
 pub fn enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_TRACE_STATE").is_ok())
+    tamarin_utils::env_gate!("TAM_TRACE_STATE")
 }
 
 /// Compact one-line summary of a `System`'s shape.  Mirrors the
@@ -190,8 +189,7 @@ fn next_step() -> u64 {
 
 /// Whether full goal/formula dumps are enabled (`TAM_TRACE_DUMP=1`).
 fn dump_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_TRACE_DUMP").is_ok())
+    tamarin_utils::env_gate!("TAM_TRACE_DUMP")
 }
 
 /// Dump system goals and formulas to stderr — useful when fingerprint

@@ -1,4 +1,4 @@
-//! Integration tests for the DOT-pipeline routes (Gap 1).
+//! Integration tests for the DOT-pipeline routes.
 //!
 //! Coverage:
 //!   - DOT output via the in-process `system_to_dot` against a

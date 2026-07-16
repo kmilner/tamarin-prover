@@ -11,10 +11,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use tamarin_term::function_symbols::{
-    diff_sym, exp_sym, nat_one_sym, pair_sym, AcSym, CSym, FunSym, EMAP_SYM_STRING,
+    diff_sym, exp_sym, nat_one_sym, pair_sym, CSym, FunSym, EMAP_SYM_STRING,
 };
 use tamarin_term::lterm::{LNTerm, LSort, LVar};
-use tamarin_term::pretty::pretty_lnterm;
+use tamarin_term::pretty::{ac_op_symbol, pretty_lnterm};
 use tamarin_term::term::{is_pair, Term};
 use tamarin_term::vterm::Lit;
 
@@ -458,16 +458,6 @@ fn split_pair<'a>(t: &'a LNTerm, out: &mut Vec<&'a LNTerm>) {
             split_pair(&ts[1], out);
         }
         _ => out.push(t),
-    }
-}
-
-/// HS `ppACOp` (Term.hs:283-286).
-fn ac_op_symbol(o: AcSym) -> &'static str {
-    match o {
-        AcSym::Mult => "*",
-        AcSym::Xor => "\u{2295}",
-        AcSym::Union => "++",
-        AcSym::NatPlus => "%+",
     }
 }
 

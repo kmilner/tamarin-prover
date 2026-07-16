@@ -184,20 +184,7 @@ pub fn html_mode() -> bool {
 /// HS `escapeHtmlEntities` (`Text/PrettyPrint/Html.hs:140-149`, copied there
 /// from blaze-html) — escape the five HTML metacharacters in the exact HS
 /// order/mapping so escaped column widths and output bytes match.
-pub fn escape_html_entities(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            x => out.push(x),
-        }
-    }
-    out
-}
+pub use tamarin_utils::pretty_html::escape_html_entities;
 
 /// The fill width of a text run `s`: its visible column count, or — under an
 /// active [`HtmlEntityWidthGuard`] or [`HtmlDocGuard`] — its HTML-entity-escaped
@@ -535,8 +522,8 @@ pub fn closed_tag(tag: &str, attrs: &[(&str, &str)]) -> Doc {
 /// HS `withTag "span"`/`highlight` emits (zero-width), exposed for the few
 /// String-based printers that wrap an already-rendered MULTI-LINE block (e.g.
 /// a `multiComment` around an expanded-formula block); injecting these at the
-/// block's start/end is the same mechanism, and it keeps the plain-mode bytes
-/// exactly equal to the pre-existing literal.
+/// block's start/end is the same mechanism, and it leaves the plain-mode bytes
+/// unchanged (both tags are the empty string in plain mode).
 pub fn hl_open(style: Hl) -> String {
     if html_mode() {
         format!("<span class=\"{}\">", hl_class(style))

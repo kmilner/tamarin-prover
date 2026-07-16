@@ -111,12 +111,7 @@ pub fn sort_of_name(n: &Name) -> LSort {
     if matches!(n.tag, NameTag::Pub) && n.id.as_str().starts_with(SKOLEM_MSG_PREFIX) {
         return LSort::Msg;
     }
-    match n.tag {
-        NameTag::Fresh => LSort::Fresh,
-        NameTag::Pub => LSort::Pub,
-        NameTag::Nat => LSort::Nat,
-        NameTag::Node => LSort::Node,
-    }
+    crate::lterm::sort_of_name(n)
 }
 
 // =============================================================================
@@ -134,8 +129,8 @@ pub fn lterm_to_mterm_global(t: &LNTerm, ctx: &mut ConvCtx) -> MTerm {
             // args sorted by MaudeLit order, matching HS `lTermToMTerm`
             // (Term/Maude/Types.hs:72) `go (FApp o as) = fApp o <$> ...`,
             // where `fApp (AC s) = fAppAC` (flatten+sort) and
-            // `fApp (C s) = fAppC` (sort) per Raw.hs:111-131.  Using the
-            // raw `Term::App` constructor here left AC/em args in the
+            // `fApp (C s) = fAppC` (sort) per Raw.hs:111-131.  The raw
+            // `Term::App` constructor would instead leave AC/em args in the
             // LNTerm-side order, which (because MaudeLit Ord keys on the
             // global encounter-order id) can differ from HS's MaudeLit
             // ordering and change the emitted Maude query string.
@@ -239,8 +234,8 @@ pub fn mterm_to_lnterm(
             // canonical `LVar`s, so `em`'s two args are ordered by the FULL
             // `LVar` order (idx-first), not by the transient Maude-side
             // ordering.  Routing only `FunSym::Ac` through the smart
-            // constructor (and building `FunSym::C(EMap)` directly) left
-            // `em` args in Maude's back-conversion order, producing
+            // constructor (and building `FunSym::C(EMap)` directly) would
+            // leave `em` args in Maude's back-conversion order, producing
             // `em(XB.10, x.9)` where HS prints the sorted `em(x.9, XB.10)`.
             crate::term::f_app(sym.clone(), new_args)
         }

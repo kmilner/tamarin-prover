@@ -274,7 +274,7 @@ pub fn cmp_term(a: &GTerm, b: &GTerm) -> std::cmp::Ordering {
 /// name then arity — privacy/constructability never disambiguate two
 /// distinct symbols sharing a name+arity).  AC ops carry no name; their
 /// `ACSym` order is `Union < Mult < Xor < NatPlus` (FunctionSymbols.hs:93),
-/// encoded in the second field as an index so AC terms sort among
+/// encoded in the third (`arity`) field as an index so AC terms sort among
 /// themselves by ACSym and after every NoEq term.
 fn funsym_key(t: &GTerm) -> (u8, &[u8], usize) {
     use GTerm::*;

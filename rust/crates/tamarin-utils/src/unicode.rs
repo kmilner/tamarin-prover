@@ -1,10 +1,8 @@
 //! Port of `Text.Unicode` from `lib/utils/src/Text/Unicode.hs`.
 //!
-//! Intentionally retained: faithful HS port. Currently has no live caller —
-//! the two subscript call sites in `tamarin-theory` use their own digit-only
-//! helpers (`pretty_theory::goal_subscript` at both call sites), which
-//! cannot reuse this directly because those only ever receive digits whereas
-//! `subscript_char` also maps `+ - = ( )`.
+//! `pretty_theory::goal_subscript` routes its subscript rendering through
+//! [`subscript`]; since it only ever receives digits, the extra `+ - = ( )`
+//! mappings in [`subscript_char`] are inert on that path but faithful to HS.
 
 /// Convert a subscriptable character to its subscript codepoint.
 pub fn subscript_char(c: char) -> char {

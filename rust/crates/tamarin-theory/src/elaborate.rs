@@ -1414,9 +1414,7 @@ pub fn fact_to_lnfact(f: &p::Fact) -> Result<crate::fact::LNFact, ElabError> {
         .map(|t| term_to_lnterm(t).ok_or_else(||
             ElabError { message: format!("could not elaborate term in fact `{}`", f.name) }))
         .collect();
-    let mut fact = Fact::new(tag, terms?);
-    fact = fact.with_annotations(copy_fact_annotations(f));
-    Ok(fact)
+    Ok(Fact::new(tag, terms?).with_annotations(copy_fact_annotations(f)))
 }
 
 fn compute_new_vars(
@@ -1856,6 +1854,21 @@ pub fn rewrite_arity1_formula(
     crate::macro_expand::map_formula_terms(f, &|t| rewrite_arity1_term(t, arity1))
 }
 
+/// Right-fold a non-empty term list into a right-associative `pair(..)` chain:
+/// `[a, b, c]` → `pair(a, pair(b, c))`; `None` on an empty list.  Mirrors HS's
+/// `tupleterm`'s `chainr1 ... (curry fAppPair)` (Theory/Text/Parser/Term.hs:187)
+/// — the shared fold behind the arity-1 surplus-argument tuple and the `<..>`
+/// tuple syntax.
+fn right_nest_pair<V>(items: Vec<VTerm<Name, V>>) -> Option<VTerm<Name, V>> {
+    let mut iter = items.into_iter().rev();
+    let mut acc = iter.next()?;
+    let sym = tamarin_term::function_symbols::pair_sym();
+    for prev in iter {
+        acc = f_app_no_eq(sym.clone(), vec![prev, acc]);
+    }
+    Some(acc)
+}
+
 /// Shared conversion core for [`term_to_lnterm`] and [`term_to_sapic_term`].
 ///
 /// Every arm except the `Var` case is byte-identical between the LNTerm and
@@ -1952,16 +1965,9 @@ where
             let new_args: Option<Vec<_>> = args.iter().map(|a| term_to_vterm(a, mk_var)).collect();
             let mut new_args = new_args?;
             if unary_builtin && new_args.len() > 1 {
-                // Wrap args into a right-associative pair to make
-                // the call arity-1.
-                let mut iter = new_args.into_iter().rev();
-                let last = iter.next()?;
-                let mut acc = last;
-                let pair_sym = tamarin_term::function_symbols::pair_sym();
-                for prev in iter {
-                    acc = f_app_no_eq(pair_sym.clone(), vec![prev, acc]);
-                }
-                new_args = vec![acc];
+                // Wrap the surplus args into one right-associative pair so the
+                // call stays arity-1.
+                new_args = vec![right_nest_pair(new_args)?];
             }
             // HS-faithful: `em(a, b)` (bilinear-pairing builtin) must be
             // emitted as a C-symbol application, not NoEq.  Mirrors HS
@@ -1993,16 +1999,8 @@ where
         }
         p::Term::Pair(items) => {
             let new_items: Option<Vec<_>> = items.iter().map(|i| term_to_vterm(i, mk_var)).collect();
-            let new_items = new_items?;
-            // Right-associative pair: <a, b, c> = pair(a, pair(b, c))
-            let mut iter = new_items.into_iter().rev();
-            let last = iter.next()?;
-            let mut acc = last;
-            let sym = tamarin_term::function_symbols::pair_sym();
-            for prev in iter {
-                acc = f_app_no_eq(sym.clone(), vec![prev, acc]);
-            }
-            Some(acc)
+            // Right-associative pair: <a, b, c> = pair(a, pair(b, c)).
+            right_nest_pair(new_items?)
         }
         p::Term::AlgApp(name, a, b) => {
             // `f{a}b` desugars to `f(a, b)` semantically; users typically
@@ -2109,9 +2107,7 @@ pub fn fact_to_sapic_fact(f: &p::Fact) -> Result<crate::sapic::SapicLNFact, Elab
         .map(|t| term_to_sapic_term(t).ok_or_else(||
             ElabError { message: format!("could not elaborate term in fact `{}`", f.name) }))
         .collect();
-    let mut fact = Fact::new(tag, terms?);
-    fact = fact.with_annotations(copy_fact_annotations(f));
-    Ok(fact)
+    Ok(Fact::new(tag, terms?).with_annotations(copy_fact_annotations(f)))
 }
 
 // =============================================================================

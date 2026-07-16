@@ -5,8 +5,11 @@
 //! `Doc::render_with` to wrap highlight spans in `<span class="hl_...">` tags
 //! and post-processes the output to convert newlines and leading whitespace.
 //!
-//! NOTE: this faithful port currently has no consumer in the tree; the web
-//! UI's HTML rendering does not route through it. Retained as reserved API.
+//! NOTE: [`escape_html_entities`] is the canonical live escaper — the theory
+//! crate re-exports it (`tamarin_theory::pretty_hpj::escape_html_entities`) and
+//! the server aliases it (`root::html_escape`), so every web-pane escape routes
+//! here. The rest of the module (`with_tag`/`closed_tag`/`render_html_doc`/
+//! `postprocess`) remains a reserved faithful port with no consumer in the tree.
 
 use crate::pretty::{Doc, HighlightStyle};
 

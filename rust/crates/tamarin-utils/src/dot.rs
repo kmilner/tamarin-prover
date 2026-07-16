@@ -4,9 +4,10 @@
 //! is a `State` monad; in Rust we expose a `DotGraph` struct with mutating
 //! methods. `scope` and `cluster` take a closure for the nested graph.
 //!
-//! NOTE: this faithful port currently has no consumer in the tree; the
-//! live DOT path is `tamarin-server/src/handlers/dot.rs`. Retained as a
-//! reserved API for a future Rust DOT pipeline.
+//! NOTE: the builder API (`DotGraph`, records) has no consumer in the tree
+//! yet; retained as a reserved API for a future Rust DOT pipeline. The live
+//! DOT path — `tamarin-server/src/handlers/dot.rs` — uses
+//! `fix_multi_line_label` from this module directly.
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeId {
@@ -254,8 +255,11 @@ fn quote_dot_id(s: &str) -> String {
     out
 }
 
-/// Replace leading whitespace on each line of a multi-line label with
-/// `&nbsp;` (non-breaking space) HTML entities, terminating with a newline.
+/// HS `fixMultiLineLabel` (Text/Dot.hs:355-363): replace each line's leading
+/// whitespace 1:1 with `&nbsp;` (non-breaking space) HTML entities and re-join
+/// with `unlines`, which appends a trailing newline (matched here by iterating
+/// `lines()` and pushing `'\n'` after every line). Single-line labels (no
+/// `\n`) pass through untouched.
 pub fn fix_multi_line_label(s: &str) -> String {
     if !s.contains('\n') { return s.to_string(); }
     let mut out = String::new();

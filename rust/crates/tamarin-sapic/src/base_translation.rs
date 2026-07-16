@@ -56,10 +56,7 @@ pub fn to_ln_term(t: &SapicTerm) -> LNTerm {
 
 /// `toLNFact` over a SAPIC fact (drop type tags from every term).
 pub fn to_ln_fact(f: &tamarin_theory::sapic::SapicLNFact) -> tamarin_theory::fact::LNFact {
-    let terms = f.terms.iter().map(to_ln_term).collect();
-    let mut nf = tamarin_theory::fact::Fact::new(f.tag.clone(), terms);
-    nf = nf.with_annotations(f.annotations.clone());
-    nf
+    f.map_ref(to_ln_term)
 }
 
 /// Apply a SAPIC substitution to a SAPIC term. Shared by `inline` and
@@ -76,10 +73,7 @@ pub(crate) fn subst_fact(
     subst: &tamarin_term::subst::Subst<tamarin_term::lterm::Name, SapicLVar>,
     f: &tamarin_theory::sapic::SapicLNFact,
 ) -> tamarin_theory::sapic::SapicLNFact {
-    let terms = f.terms.iter().map(|t| subst_term(subst, t)).collect();
-    let mut nf = tamarin_theory::fact::Fact::new(f.tag.clone(), terms);
-    nf = nf.with_annotations(f.annotations.clone());
-    nf
+    f.map_ref(|t| subst_term(subst, t))
 }
 
 /// `Data.List.union xs ys = xs ++ filter (`notElem` xs) (nub ys)`: keep `xs` in

@@ -173,11 +173,12 @@ pub struct Reduction<'ctx> {
     /// per returned case, the producing branch's final fresh-counter
     /// position (parallel to the `Cases` vec).  HS's `runReduction
     /// (solveGoal >> simplifySystem)` continues each DisjT branch's
-    /// simplify with THAT branch's counter; RS's per-case continuation
-    /// (exec_proof_method's per-case `simplify_system_with_fanout`)
-    /// previously reseeded at `bounds_max(case_sys)`, silently rewinding
-    /// past the branch's transient draws (task #16).  Populated by the
-    /// goal solvers alongside `Cases`; empty means "no counters recorded"
+    /// simplify with THAT branch's counter; seeding RS's per-case
+    /// continuation (exec_proof_method's per-case
+    /// `simplify_system_with_fanout`) from `bounds_max(case_sys)` alone
+    /// would silently rewind past the branch's transient draws (task #16),
+    /// so the goal solvers record each branch's final counter here.
+    /// Populated alongside `Cases`; empty means "no counters recorded"
     /// (callers fall back to bounds_max seeding).
     pub last_case_counters: Vec<u64>,
     /// σ-as-`VarSubst` cache for the Atom mark=true dedup: `(subst_stamp,
@@ -626,11 +627,11 @@ impl<'ctx> Reduction<'ctx> {
     /// dedup bugs.  Certifies skip-CORRECTNESS (necessary, not a completeness
     /// proof).
     fn verify_subst_skip_is_noop(&mut self) {
-        // Force the cached-bloom fact skip OFF for this verification re-run
-        // : otherwise a wrong bloom skip reproduces in
-        // both the live pass and this re-run, so `self.sys == snapshot` would
-        // hold and mask the bug.  With the full descent forced, this oracle
-        // independently certifies BOTH the stamp machinery and the bloom.
+        // Force the cached-bloom fact skip OFF for this verification re-run:
+        // otherwise a wrong bloom skip reproduces in both the live pass and
+        // this re-run, so `self.sys == snapshot` would hold and mask the bug.
+        // With the full descent forced, this oracle independently certifies
+        // BOTH the stamp machinery and the bloom.
         let _fp_off = FpSkipDisableGuard::new();
         let snapshot = self.sys.clone();
         let mut iter = 0u32;
@@ -1747,15 +1748,15 @@ impl<'ctx> Reduction<'ctx> {
     ///
     /// Adds `substs` as a new disjunction to the eq-store, allocates a
     /// fresh `SplitId`, and inserts a `Goal::Split(id)` so the search
-    /// (or simplify) layer enumerates the variant choice lazily.
-    /// Returns without effect when `substs` is `None` or empty.
-    /// Add a SplitG for variant constraints and check if the
-    /// resulting eq_store is contradictory.  Returns `true` if the
-    /// eq_store is false (caller should mzero — drop the branch).
-    /// Mirrors HS `solveRuleConstraints`' final `noContradictoryEqStore`
-    /// (Reduction.hs:703-704, called at Reduction.hs:773).  HS's mzero here
-    /// kills rule branches whose variants conflict with the live
-    /// eq_store — so `exploitPrems`/`solveGoal` never fires for them.
+    /// (or simplify) layer enumerates the variant choice lazily. A `None`
+    /// or empty `substs` is a no-op returning `false`.
+    ///
+    /// Returns `true` when the resulting eq_store is false (the caller
+    /// should mzero — drop the branch). Mirrors HS `solveRuleConstraints`'
+    /// final `noContradictoryEqStore` (Reduction.hs:703-704, called at
+    /// Reduction.hs:773). HS's mzero here kills rule branches whose variants
+    /// conflict with the live eq_store — so `exploitPrems`/`solveGoal`
+    /// never fires for them.
     pub fn solve_rule_constraints(
         &mut self,
         substs: Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>,
@@ -1998,9 +1999,12 @@ impl<'ctx> Reduction<'ctx> {
                             // allocation sequences can be diffed when a `#vk.N`
                             // index diverges.  `cnt`/`bm` expose the maude
                             // fresh-counter and bounds_max at allocation — this
-                            // path (`ku_decomp_subterms`) derives the index from
-                            // `max(bm, outer.idx)+1` and does NOT advance the
-                            // counter, unlike HS `freshLVar`.
+                            // path (`ku_decomp_subterms`) derives the index
+                            // arithmetically from `max(bm, outer.idx)+1` rather
+                            // than by an HS-`freshLVar`-style counter draw, then
+                            // advances the counter past it via the `ensure_above`
+                            // above (so `cnt` here already reflects the
+                            // post-advance value).
                             if tamarin_utils::env_gate!("TAM_RS_TRACE_VK_CREATE") {
                                 let path = crate::constraint::solver::trace::case_path_string();
                                 eprintln!("[RS_VK_CREATE] path={} site=ku_decomp_subterms vk.{} cnt={} bm={}",
@@ -3854,19 +3858,9 @@ fn illegal_coerce(p_rule: &RuleACInst, fa_conc: &crate::fact::LNFact) -> bool {
     if !is_coerce_rule_inst(p_rule) { return false; }
     if fa_conc.terms.len() != 1 { return false; }
     let t = &fa_conc.terms[0];
-    is_pair(t) || tamarin_term::term::is_inverse(t) || is_product(t)
-}
-
-fn is_pair(t: &tamarin_term::lterm::LNTerm) -> bool {
-    use tamarin_term::function_symbols::FunSym;
-    if let tamarin_term::term::Term::App(FunSym::NoEq(s), args) = t {
-        return s.name == b"pair" && args.len() == 2;
-    }
-    false
-}
-fn is_product(t: &tamarin_term::lterm::LNTerm) -> bool {
-    use tamarin_term::function_symbols::{FunSym, AcSym};
-    matches!(t, tamarin_term::term::Term::App(FunSym::Ac(AcSym::Mult), _))
+    tamarin_term::term::is_pair(t)
+        || tamarin_term::term::is_inverse(t)
+        || tamarin_term::term::is_product(t)
 }
 
 /// SplitG-aware premise-solving rule enumeration: returns the
@@ -4148,9 +4142,7 @@ fn bounds_max_dump_fields(sys: &System) {
 
 #[inline]
 fn bounds_max_verify_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_VERIFY_BOUNDS_CACHE").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_VERIFY_BOUNDS_CACHE")
 }
 
 /// Opt-in verifier for the verified-identity `subst_system` skip: when
@@ -4158,18 +4150,14 @@ fn bounds_max_verify_enabled() -> bool {
 /// it was not a total no-op.
 #[inline]
 fn verify_subst_skip_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_VERIFY_SUBST_SKIP").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_VERIFY_SUBST_SKIP")
 }
 
 /// Opt-in skip-effectiveness counters (`TAM_RS_SUBST_SKIP_STATS=1`).  Gated so
 /// there is ZERO hot-path cost (one `OnceLock` bool load) when disabled.
 #[inline]
 fn subst_skip_stats_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_SUBST_SKIP_STATS").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_SUBST_SKIP_STATS")
 }
 pub(crate) static SUBST_SYSTEM_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -4207,18 +4195,14 @@ impl Drop for FpSkipDisableGuard {
 /// oracle that fires at the skip site regardless of what the bloom said.
 #[inline]
 fn verify_fp_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_VERIFY_FP").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_VERIFY_FP")
 }
 
 /// Opt-in descent-skip counters for the cached-bloom fact skip
 /// (`TAM_RS_FP_STATS=1`).  Zero hot-path cost when unset.
 #[inline]
 fn fp_stats_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_FP_STATS").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_FP_STATS")
 }
 /// Total fact descents reached in the two skippable sections (node + goal).
 pub(crate) static FP_FACT_DESCENTS: std::sync::atomic::AtomicU64 =
@@ -4252,9 +4236,7 @@ fn verify_fact_unchanged(
 
 #[inline]
 fn bounds_max_disable_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_BOUNDS_CACHE").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_DISABLE_BOUNDS_CACHE")
 }
 
 /// HS `avoid` (LTerm.hs:656-657): `avoid = maybe 0 (succ . snd) . boundsVarIdx`
@@ -4614,12 +4596,7 @@ fn fanout_arm_systems(outcome: SolveOutcome, base: System) -> Vec<System> {
                 let mut s = base.clone();
                 // The arm store carries fresh Maude witnesses (and lost
                 // `base`'s taken-out store), so `base`'s copied max-var
-                // cache is stale in BOTH directions — invalidate.  (Was a
-                // latent stale-LOW window: Joux hit it under
-                // TAM_RS_VERIFY_BOUNDS_CACHE even before the conditional
-                // subst_system invalidation landed, masked in output only
-                // because `new_inheriting` takes `max(avoid, inherit_next)`
-                // and the forked counter already covered the witnesses.)
+                // cache is stale in BOTH directions — invalidate.
                 s.invalidate_max_var_idx_cache();
                 s.set_eq_store(std::sync::Arc::new(arm_eq));
                 s
@@ -5066,7 +5043,7 @@ pub fn chain_direct_case_name(fa_conc: &crate::fact::LNFact) -> Option<String> {
             } else {
                 format!("{}_{}", v.idx, v.name)
             };
-            format!("Var_{}_{}", sort_suffix(v.sort), body)
+            format!("Var_{}_{}", tamarin_term::lterm::sort_suffix(v.sort), body)
         }
         Term::Lit(Lit::Con(name)) => {
             // Haskell `showLitName` (LTerm.hs:862-863):
@@ -5094,17 +5071,6 @@ pub fn chain_direct_case_name(fa_conc: &crate::fact::LNFact) -> Option<String> {
             }
         }
     })
-}
-
-fn sort_suffix(s: tamarin_term::lterm::LSort) -> &'static str {
-    use tamarin_term::lterm::LSort;
-    match s {
-        LSort::Msg => "msg",
-        LSort::Fresh => "fresh",
-        LSort::Pub => "pub",
-        LSort::Node => "node",
-        LSort::Nat => "nat",
-    }
 }
 
 /// Emit the per-premise exploitPrem traces that HS would emit for a
@@ -5991,21 +5957,10 @@ impl<'ctx> Reduction<'ctx> {
                                     // `&mut sub` uses.  The map makes the
                                     // per-edge src/tgt resolution O(1) instead
                                     // of two linear `nodes.iter().find` scans
-                                    // (O(arms*edges*nodes) → O(arms*(nodes+edges)));
-                                    // `or_insert` keeps the FIRST rule for a
-                                    // given id, matching `find`'s first-match.
+                                    // (O(arms*edges*nodes) → O(arms*(nodes+edges))).
                                     let (chain_eqs, tag_mismatch_edge): (Vec<_>, bool) = {
                                         let mut tag_mismatch_edge = false;
-                                        let node_rule_map: tamarin_utils::FastMap<
-                                            &crate::constraint::constraints::NodeId,
-                                            &crate::rule::RuleACInst,
-                                        > = {
-                                            let mut m = tamarin_utils::FastMap::default();
-                                            for (n, r) in sub.sys.nodes.iter() {
-                                                m.entry(n).or_insert(r);
-                                            }
-                                            m
-                                        };
+                                        let node_rule_map = sub.sys.node_rule_map();
                                         let chain_eqs: Vec<_> = sub.sys.edges
                                             .iter()
                                             .filter_map(|e| {

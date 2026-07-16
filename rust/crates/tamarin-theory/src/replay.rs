@@ -1169,15 +1169,15 @@ fn canonicalise_term_text(s: &str) -> String {
     if collapsed.ends_with(' ') { collapsed.pop(); }
     // Pass 2: drop a space that immediately follows `<`/`(` (opening
     // delimiter) or immediately precedes `>`/`)` (closing delimiter).
-    let bytes: Vec<char> = collapsed.chars().collect();
-    let mut out = String::with_capacity(bytes.len());
+    let chars: Vec<char> = collapsed.chars().collect();
+    let mut out = String::with_capacity(chars.len());
     let mut prev: Option<char> = None;
-    for (idx, &c) in bytes.iter().enumerate() {
+    for (idx, &c) in chars.iter().enumerate() {
         if c == ' ' {
             if matches!(prev, Some('<') | Some('(')) {
                 continue; // space right after an opening delimiter
             }
-            if matches!(bytes.get(idx + 1), Some('>') | Some(')')) {
+            if matches!(chars.get(idx + 1), Some('>') | Some(')')) {
                 continue; // space right before a closing delimiter
             }
         }

@@ -421,8 +421,8 @@ fn non_injective_fact_instances_pairs(
     if inj_tags.is_empty() { return out; }
 
     // Resolve node-id → rule via a once-built map instead of a linear
-    // `nodes.iter().find` per lookup (see `node_rule_map`).
-    let node_rule_map = node_rule_map(sys);
+    // `nodes.iter().find` per lookup (see `System::node_rule_map`).
+    let node_rule_map = sys.node_rule_map();
     let lookup_node = |id: &NodeId| -> Option<&crate::rule::RuleACInst> {
         node_rule_map.get(id).copied()
     };
@@ -604,10 +604,10 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         // rebuilding the relation per atom.
         let ab_adj = red.sys.build_always_before_adj();
         // Node-id → rule map built ONCE and threaded into every per-atom
-        // evaluation, replacing the per-call linear `sys.nodes` scans inside
-        // `partial_atom_valuation_with`.  `sys.nodes` is unique-keyed, so the
-        // map returns the identical rule the linear scan found.
-        let node_rule_map = node_rule_map(&red.sys);
+        // `partial_atom_valuation_with` call, which resolves node ids by map
+        // lookup.  `sys.nodes` is unique-keyed, so a lookup returns the same
+        // rule a linear scan would find.
+        let node_rule_map = red.sys.node_rule_map();
         let val = |a: &tamarin_parser::ast::Atom|
             partial_atom_valuation_with(&red.sys, &maude, &ab_adj, &node_rule_map, a);
         for fm in formulas.into_iter() {
@@ -690,23 +690,6 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     changed
 }
 
-/// Build the read-only `NodeId → &RuleACInst` index the uniqueness /
-/// atom-valuation passes use for `.get()` lookups, replacing a per-lookup
-/// linear `sys.nodes.iter().find`.  `or_insert` keeps the FIRST rule for a
-/// given id, matching `find`'s first-match semantics; `sys.nodes` is
-/// unique-keyed, so the map returns the identical rule the linear scan
-/// found.
-fn node_rule_map(
-    sys: &crate::constraint::system::System,
-) -> tamarin_utils::FastMap<
-    &crate::constraint::constraints::NodeId, &crate::rule::RuleACInst> {
-    let mut m = tamarin_utils::FastMap::default();
-    for (n, r) in sys.nodes.iter() {
-        m.entry(n).or_insert(r);
-    }
-    m
-}
-
 /// Partial atom valuation. Mirrors Haskell's `partialAtomValuation`
 /// from `Theory.Constraint.Solver.Simplify`. Returns:
 ///   - `Some(true)`  if the atom is True in every model of the system
@@ -741,7 +724,7 @@ fn partial_atom_valuation_with(
     // instances do not AC-unify.  Mirrors Haskell's helper of the same
     // name in `Theory.Constraint.Solver.Simplify`.  Node-id → rule resolution
     // uses the `node_rule` map built ONCE by the caller (sys.nodes is a
-    // unique-keyed map, so this is identical to the previous linear scan).
+    // unique-keyed map, so a lookup returns the same rule a linear scan would).
     let non_unifiable_nodes = |i: &crate::constraint::constraints::NodeId,
                                j: &crate::constraint::constraints::NodeId| -> bool {
         let ri = node_rule.get(i).copied();
@@ -5202,7 +5185,7 @@ mod tests {
             crate::constraint::constraints::Reason::Formula,
         ));
         let ab_adj = sys.build_always_before_adj();
-        let node_rule_map = node_rule_map(&sys);
+        let node_rule_map = sys.node_rule_map();
         let result = partial_atom_valuation_with(
             &sys, &h, &ab_adj, &node_rule_map, &Atom::Last(mkvar("n", 0)));
         assert_eq!(result, None,

@@ -16,11 +16,8 @@ use std::process::Command;
 
 use tamarin_parser::{ast, parse_theory};
 
-fn corpus_root() -> std::path::PathBuf {
-    std::env::var("CORPUS_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples")
-    })
-}
+mod common;
+use common::{collect_spthy, corpus_root};
 
 #[derive(Debug, Default, Clone)]
 struct Counts {
@@ -49,13 +46,7 @@ fn main() {
         }
     }
 
-    let mut files: Vec<PathBuf> = walkdir::WalkDir::new(&root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("spthy"))
-        .map(|e| e.path().to_path_buf())
-        .collect();
-    files.sort();
+    let mut files = collect_spthy(&root);
 
     if let Some(f) = &filter {
         files.retain(|p| p.to_string_lossy().contains(f));

@@ -13,6 +13,8 @@ use tamarin_term::lterm::LVar;
 use crate::predicate::Predicate;
 use crate::restriction::ProtoRestriction;
 use crate::rule::{ProtoRuleAC, ProtoRuleE};
+use crate::sapic::PlainProcess;
+use crate::signature::SignaturePure;
 
 /// Restriction over the surface formula, used in `OpenTheory`. After
 /// elaboration this becomes [`crate::restriction::Restriction`] which
@@ -82,8 +84,6 @@ impl OpenProtoRule {
         }
     }
 }
-use crate::sapic::PlainProcess;
-use crate::signature::SignaturePure;
 
 /// Lightweight placeholder for `Theory.Sapic.ProcessDef`, populated
 /// by the SAPIC translation pass. We carry just enough to round-trip

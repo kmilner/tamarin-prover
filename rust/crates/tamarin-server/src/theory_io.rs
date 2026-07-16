@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tamarin_parser::parse_theory;
-use tamarin_parser::wf::WfError;
+use tamarin_parser::wf::{
+    after_public_names_topics, insert_wf_before, WfError, WF_AFTER_CHECK_GUARDED,
+    WF_AFTER_CHECK_TERMS, WF_AFTER_FACT_LHS, WF_TOPIC_ORDER,
+};
 use tamarin_term::maude_proc::MaudeHandle;
 use tamarin_theory::elaborate::elaborate;
 
@@ -103,11 +106,7 @@ pub fn load_from_source(
     // `check_theory` BEFORE the SAPIC `translate` pass, run.rs:517-528).  HS
     // `thyProtoRules` applies `applyMacroInRule` to every rule before the
     // checks, so clone + macro-expand first.
-    let parsed_for_wf = {
-        let mut tmp = parser_theory.clone();
-        tamarin_theory::macro_expand::expand_theory_macros(&mut tmp);
-        tmp
-    };
+    let parsed_for_wf = tamarin_theory::macro_expand::macro_expanded_clone(&parser_theory);
     let mut wf_report = tamarin_parser::wf::check_theory(&parsed_for_wf);
     // Strip the STATIC "Message Derivation Checks" entry — the dynamic,
     // Maude-backed check in the maude block below replaces it (run.rs:527-528).
@@ -142,12 +141,8 @@ pub fn load_from_source(
     {
         let term_errors = tamarin_theory::check_terms::check_terms_wf(
             &parsed_for_wf, &maude_sig);
-        insert_wf_before(&mut wf_report, term_errors, &[
-            " Formula guardedness",
-            "Lemma annotations", "Multiplication restriction of rules",
-            "Nat Sorts", "Subterm Convergence Warning",
-            "Message Derivation Checks", "Derivation Checks",
-        ]);
+        insert_wf_before(&mut wf_report, term_errors,
+            &WF_TOPIC_ORDER[WF_AFTER_CHECK_TERMS..]);
     }
 
     // Formula guardedness (run.rs:638-656): each lemma/restriction formula that
@@ -155,11 +150,8 @@ pub fn load_from_source(
     // parser theory (HS `formulaReports`), before the SAPIC pass below.
     {
         let guard_errors = tamarin_theory::elaborate::check_guarded_wf(&parser_theory);
-        insert_wf_before(&mut wf_report, guard_errors, &[
-            "Lemma annotations", "Multiplication restriction of rules",
-            "Nat Sorts", "Subterm Convergence Warning",
-            "Message Derivation Checks", "Derivation Checks",
-        ]);
+        insert_wf_before(&mut wf_report, guard_errors,
+            &WF_TOPIC_ORDER[WF_AFTER_CHECK_GUARDED..]);
     }
 
     // SAPIC `process:` translation — mirror `run.rs`'s CLI-side pass
@@ -224,20 +216,12 @@ pub fn load_from_source(
     // by an `in(c,m)` with no producing `out`) are surfaced.  No-op for
     // non-SAPIC theories (pre- and post-translation rule sets are equal).
     if typed.is_sapic {
-        let post_thy = {
-            let mut tmp = parser_theory.clone();
-            tamarin_theory::macro_expand::expand_theory_macros(&mut tmp);
-            tmp
-        };
+        let post_thy = tamarin_theory::macro_expand::macro_expanded_clone(&parser_theory);
         let topic = "Facts occur in the left-hand-side but not in any right-hand-side ";
         wf_report.retain(|e| e.topic != topic);
         let lhs_rhs = tamarin_parser::wf::fact_lhs_occur_no_rhs(&post_thy);
-        insert_wf_before(&mut wf_report, lhs_rhs, &[
-            "Formula terms", " Formula guardedness",
-            "Lemma annotations", "Multiplication restriction of rules",
-            "Nat Sorts", "Subterm Convergence Warning",
-            "Message Derivation Checks", "Derivation Checks",
-        ]);
+        insert_wf_before(&mut wf_report, lhs_rhs,
+            &WF_TOPIC_ORDER[WF_AFTER_FACT_LHS..]);
         // HS `publicNamesReport` runs on the TRANSLATED rules — the
         // parser-level report cannot see the source process a generated
         // rule carries as its `process=` attribute (run.rs:950-973, e.g.
@@ -250,18 +234,7 @@ pub fn load_from_source(
         wf_report.retain(|e| e.topic != caps_topic);
         let public_names =
             tamarin_theory::elaborate::sapic_public_names_report(&typed);
-        insert_wf_before(&mut wf_report, public_names, &[
-            "Variable with mismatching sorts or capitalization",
-            "Reserved names", "Special facts",
-            "Fr facts must only use a fresh- or a msg-variable",
-            "Fact arity issues", "Fact multiplicity issues",
-            "Fact capitalization issues",
-            "Facts occur in the left-hand-side but not in any right-hand-side ",
-            "Formula terms", " Formula guardedness",
-            "Lemma annotations", "Multiplication restriction of rules",
-            "Nat Sorts", "Subterm Convergence Warning",
-            "Message Derivation Checks", "Derivation Checks",
-        ]);
+        insert_wf_before(&mut wf_report, public_names, &after_public_names_topics());
     }
 
     if let Ok(maude) = MaudeHandle::start(maude_path, typed.signature.maude_sig.clone()) {
@@ -333,24 +306,6 @@ pub fn load_from_source(
     })
 }
 
-/// Splice `errors` into `report` immediately before the first entry whose
-/// `topic` is one of `anchors` (or at the end if none match), preserving the
-/// relative order of both the existing tail and the inserted errors.  Shared
-/// by the Formula-terms, Formula-guardedness, and SAPIC lhs/rhs passes, which
-/// differ only in their anchor topic list and the source of `errors`.
-fn insert_wf_before(report: &mut Vec<WfError>, errors: Vec<WfError>, anchors: &[&str]) {
-    if errors.is_empty() {
-        return;
-    }
-    let insert_before = report
-        .iter()
-        .position(|e| anchors.contains(&e.topic.as_str()))
-        .unwrap_or(report.len());
-    let tail = report.split_off(insert_before);
-    report.extend(errors);
-    report.extend(tail);
-}
-
 /// Build the HS `makeWfErrorsHtml` banner (`src/Web/Handler.hs:463-469`): wrap
 /// the wellformedness report in a `<div class="wf-warning">`, prefixed by the
 /// literal `WARNING: ...<br /><br />` line and followed by the report body
@@ -381,19 +336,15 @@ fn make_wf_errors_html(report: &[WfError]) -> String {
         .strip_prefix(PREFIX)
         .and_then(|b| b.strip_suffix("*/"))
         .unwrap_or(&block);
-    // Mirror HS `postprocessHtmlDoc = unlines . map (addBreak . indent) . lines`
-    // over the HTML-escaped body: each line's leading spaces become `&nbsp;`,
-    // the rest is entity-escaped, and `<br/>` is appended; lines joined by `\n`
-    // with a trailing `\n` (unlines).
-    let mut rendered = String::new();
-    for line in body.lines() {
-        let n_lead = line.len() - line.trim_start_matches(' ').len();
-        for _ in 0..n_lead {
-            rendered.push_str("&nbsp;");
-        }
-        rendered.push_str(&crate::handlers::root::html_escape(&line[n_lead..]));
-        rendered.push_str("<br/>\n");
-    }
+    // HS `renderHtmlDoc (htmlDoc …)` = `postprocessHtmlDoc . escape`: first
+    // entity-escape the body's `& < > " '`, then run HS `postprocessHtmlDoc =
+    // unlines . map (addBreak . indent) . lines` (Html.hs:157-162) — each
+    // line's leading spaces become `&nbsp;` runs, `<br/>` is appended, and
+    // lines rejoin with `\n` (trailing `\n`).  `html_escape` never touches
+    // spaces or newlines, so escaping the whole body first is byte-equivalent
+    // to escaping each line's non-leading remainder in the loop.
+    let rendered = tamarin_theory::pretty_hpj::postprocess_html(
+        &crate::handlers::root::html_escape(body));
     // HS `makeWfErrorsHtml`: <div> + literal WARNING line + rendered body + </div>.
     format!(
         "<div class=\"wf-warning\">\n\

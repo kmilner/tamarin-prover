@@ -97,17 +97,30 @@ pub fn unprefix_underscore(s: &str) -> String {
     else { s.to_string() }
 }
 
-/// Parse a wildcard-captured path (e.g. `proof/Alice/case_1/0`) into a
-/// `TheoryPath`.  Returns `None` on malformed input.
-pub fn parse(raw: &str) -> Option<TheoryPath> {
-    let decoded: Vec<String> = raw
+/// Decode a wildcard-captured URL path into its logical segments: strip
+/// leading slashes, split on `/`, drop empty segments, percent-decode,
+/// then reverse [`prefix_with_underscore`] per segment.
+///
+/// Mirrors Haskell's `prefixWithUnderscore` invariant: empty case names
+/// are encoded as `_` on the URL so adjacent slashes don't collapse, and
+/// segments starting with `_` get a leading extra `_`;
+/// [`unprefix_underscore`] reverses that here.  Trailing empty segments
+/// are dropped by the empty-segment filter, so a leading-only vs both-end
+/// trim of `/` is immaterial.
+pub fn decode_segments(raw: &str) -> Vec<String> {
+    raw
         .trim_start_matches('/')
         .split('/')
         .filter(|s| !s.is_empty())
         .map(|s| percent_decode_str(s).decode_utf8_lossy().to_string())
         .map(|s| unprefix_underscore(&s))
-        .collect();
-    parse_segs(&decoded)
+        .collect()
+}
+
+/// Parse a wildcard-captured path (e.g. `proof/Alice/case_1/0`) into a
+/// `TheoryPath`.  Returns `None` on malformed input.
+pub fn parse(raw: &str) -> Option<TheoryPath> {
+    parse_segs(&decode_segments(raw))
 }
 
 fn parse_segs(segs: &[String]) -> Option<TheoryPath> {

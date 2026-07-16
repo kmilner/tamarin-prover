@@ -703,21 +703,10 @@ fn term_for_each_free(t: &crate::guarded::GTerm, f: &mut dyn FnMut(&LVar)) {
     }
 }
 
+/// Thin wrapper over the shared `sort_hint_to_lsort_opt` mapping (`sources`),
+/// resolving `Untagged` to `LSort::Msg`.
 fn parser_sort_to_lsort(s: tamarin_parser::ast::SortHint) -> tamarin_term::lterm::LSort {
-    use tamarin_parser::ast::{SortHint, SuffixSort};
-    use tamarin_term::lterm::LSort;
-    match s {
-        SortHint::Msg | SortHint::Untagged => LSort::Msg,
-        SortHint::Pub => LSort::Pub,
-        SortHint::Fresh => LSort::Fresh,
-        SortHint::Node => LSort::Node,
-        SortHint::Nat => LSort::Nat,
-        SortHint::Suffix(SuffixSort::Msg) => LSort::Msg,
-        SortHint::Suffix(SuffixSort::Pub) => LSort::Pub,
-        SortHint::Suffix(SuffixSort::Fresh) => LSort::Fresh,
-        SortHint::Suffix(SuffixSort::Node) => LSort::Node,
-        SortHint::Suffix(SuffixSort::Nat) => LSort::Nat,
-    }
+    super::sources::sort_hint_to_lsort_opt(&s).unwrap_or(tamarin_term::lterm::LSort::Msg)
 }
 
 #[cfg(test)]

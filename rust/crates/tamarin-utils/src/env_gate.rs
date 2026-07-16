@@ -5,8 +5,10 @@
 //! switches that are set once at process start and never change during a run,
 //! so reading them exactly once and caching the boolean is behaviour-
 //! preserving — it only removes the repeated per-hit syscall/allocation from
-//! hot solver paths.  Mirrors the hand-rolled `OnceLock<bool>` gates already
-//! used in `trace.rs` (`flag()` / `op_label_enabled()`).
+//! hot solver paths.  Presence-only (`is_ok`) gates route through this macro;
+//! flags that test a VALUE (e.g. `equation_store`'s
+//! `aes_dbg_filter_substantive` `== "substantive"` match) keep hand-rolled
+//! `OnceLock` caches, since the macro deliberately has no value hook.
 //!
 //! The macro is `#[macro_export]`, so it lives at the crate root
 //! (`tamarin_utils::env_gate!`) regardless of this module; the module merely

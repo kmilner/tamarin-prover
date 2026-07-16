@@ -539,11 +539,10 @@ async fn test_source_returns_plain_text() {
     let ct = content_type(&res);
     assert!(ct.starts_with("text/plain"), "got CT={}", ct);
     let body = res.text().await.expect("read");
-    // Rust source is currently a minimal pretty-print: at least the
-    // theory header should appear.  Haskell prints full pretty source.
-    // The MATCHING CRITERION is presence of theory name + lemma
-    // name (both ports include those).  TODO: tighten to full
-    // prettyClosedTheory port (see theory.rs source_ comment).
+    // The source route renders the full `prettyClosedTheory` (see
+    // theory.rs `render_theory_source`).  This test keeps a loose
+    // structural check — the theory name must appear — since exact
+    // byte parity with Haskell is covered by the web-parity gate.
     assert!(
         body.contains("RevealingSignatures"),
         "source should contain the theory name; got {}",

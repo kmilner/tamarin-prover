@@ -117,21 +117,7 @@ pub fn check_message_derivation(
         let macro_src = if theory_macros.is_empty() {
             raw_rule
         } else {
-            let mut r = raw_rule.clone();
-            for f in &mut r.premises {
-                *f = crate::macro_expand::apply_macros_fact(&theory_macros, f);
-            }
-            for f in &mut r.actions {
-                *f = crate::macro_expand::apply_macros_fact(&theory_macros, f);
-            }
-            for f in &mut r.conclusions {
-                *f = crate::macro_expand::apply_macros_fact(&theory_macros, f);
-            }
-            for b in &mut r.let_block {
-                b.value = crate::macro_expand::apply_macros_term(&theory_macros, &b.value);
-                b.var = crate::macro_expand::apply_macros_term(&theory_macros, &b.var);
-            }
-            macro_expanded = r;
+            macro_expanded = apply_theory_macros_to_rule(raw_rule, &theory_macros);
             &macro_expanded
         };
         let expanded = crate::elaborate::apply_let_block(macro_src);
@@ -201,6 +187,28 @@ pub fn check_message_derivation(
         );
     }
     format_deriv_report(&per_rule)
+}
+
+/// Expand theory-level `macros:` into a rule's premise / action / conclusion
+/// facts and its `let { }` block — the parts the deriv check inspects.  Mirror
+/// of HS `applyMacroInProtoRule (theoryMacros thy)`
+/// (MessageDerivationChecks.hs:39).
+fn apply_theory_macros_to_rule(rule: &p::Rule, macros: &[p::Macro]) -> p::Rule {
+    let mut r = rule.clone();
+    for f in &mut r.premises {
+        *f = crate::macro_expand::apply_macros_fact(macros, f);
+    }
+    for f in &mut r.actions {
+        *f = crate::macro_expand::apply_macros_fact(macros, f);
+    }
+    for f in &mut r.conclusions {
+        *f = crate::macro_expand::apply_macros_fact(macros, f);
+    }
+    for b in &mut r.let_block {
+        b.value = crate::macro_expand::apply_macros_term(macros, &b.value);
+        b.var = crate::macro_expand::apply_macros_term(macros, &b.var);
+    }
+    r
 }
 
 /// Iterate over Rule items in declaration order.  Skips IntrRule

@@ -10,9 +10,11 @@
 //! - Heuristic / tactic configuration.
 //! - Whether to use induction, whether diff mode is on, etc.
 //!
-//! For the Rust port we expose a minimal subset: just the `MaudeHandle`
-//! and the rules. As more solver components land we'll grow the
-//! context to match.
+//! The Rust port carries all of these, split across two structs: the
+//! per-lemma / post-construction-mutable fields owned directly by
+//! [`ProofContext`], and the immutable-after-build bundle
+//! ([`ProofContextShared`]) held behind an `Arc` so a Maude-swap clone is
+//! a refcount bump rather than a deep copy.
 
 use tamarin_term::maude_proc::{MaudeHandle, MaudePool};
 

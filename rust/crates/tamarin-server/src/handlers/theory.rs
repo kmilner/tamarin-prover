@@ -1421,20 +1421,9 @@ pub async fn proof_step(
         return json_resp::alert(format!("theory index {} not found", idx));
     };
     // Parse the path: `<lemma>/<case>/.../<method>` or
-    // `<lemma>/<case>/.../<method>/<arg>`.
-    //
-    // Mirror Haskell's `prefixWithUnderscore` invariant: empty case
-    // names are encoded as `_` on the URL so adjacent slashes don't
-    // collapse, and segments starting with `_` get a leading extra
-    // `_`.  Reverse here.
-    let segs: Vec<String> = raw_path
-        .trim_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| percent_encoding::percent_decode_str(s)
-            .decode_utf8_lossy().to_string())
-        .map(|s| path_parse::unprefix_underscore(&s))
-        .collect();
+    // `<lemma>/<case>/.../<method>/<arg>`.  The shared decoder reverses
+    // the Haskell `prefixWithUnderscore` invariant per segment.
+    let segs: Vec<String> = path_parse::decode_segments(&raw_path);
     if segs.is_empty() {
         return json_resp::alert("missing lemma name");
     }
@@ -1446,14 +1435,9 @@ pub async fn proof_step(
     if n < 2 {
         return json_resp::alert("missing proof method");
     }
-    let (method_segs_start, case_path_end) =
-        if n >= 3 && segs[n - 2] == "solve" {
-            (n - 2, n - 2)
-        } else {
-            (n - 1, n - 1)
-        };
-    let case_path: Vec<String> = segs[1..case_path_end].to_vec();
-    let method_segs = &segs[method_segs_start..];
+    let method_start = if n >= 3 && segs[n - 2] == "solve" { n - 2 } else { n - 1 };
+    let case_path: Vec<String> = segs[1..method_start].to_vec();
+    let method_segs = &segs[method_start..];
     let ps = match state.store.ensure_proof_state(idx, &state.cfg) {
         Ok(p) => p,
         Err(e) => return json_resp::alert(format!("proof state init failed: {}", e)),

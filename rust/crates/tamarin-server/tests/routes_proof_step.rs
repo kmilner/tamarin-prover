@@ -1,4 +1,4 @@
-//! Integration tests for the live proof-tree mutation route (Gap 2).
+//! Integration tests for the live proof-tree mutation route.
 //!
 //! Coverage:
 //!   - `/proof-step/<lemma>/simplify` applies a Simplify method at

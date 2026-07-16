@@ -17,6 +17,9 @@ use std::path::PathBuf;
 use tamarin_parser::{parse_theory, Message};
 use walkdir::WalkDir;
 
+mod common;
+use common::corpus_root;
+
 /// A representative message string for failure-category bucketing.  The
 /// `ParseError` holds a parsec-style message list, so join the message
 /// strings for classification purposes.
@@ -31,12 +34,6 @@ fn error_key_source(e: &tamarin_parser::ParseError) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn corpus_root() -> std::path::PathBuf {
-    std::env::var("CORPUS_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples")
-    })
 }
 
 fn main() {

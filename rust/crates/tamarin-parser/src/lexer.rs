@@ -76,6 +76,18 @@ impl<'a> Lexer<'a> {
         } else { false }
     }
 
+    /// Consume a maximal run of ASCII-alphabetic characters and return it
+    /// (empty when the next char is not ASCII-alphabetic). Does NOT skip
+    /// leading whitespace — used to read `#directive` names and formal-comment
+    /// headers, where the run starts exactly at the cursor.
+    pub fn ascii_alpha_run(&mut self) -> String {
+        let mut s = String::new();
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphabetic() { s.push(c); self.bump(); } else { break; }
+        }
+        s
+    }
+
     // ---------- Whitespace and comments ----------
 
     /// Skip Whitespace, line comments `//...`, and nested block comments `/* ... */`.
@@ -400,10 +412,7 @@ impl<'a> Lexer<'a> {
     pub fn formal_comment(&mut self) -> Option<(String, String)> {
         self.skip_ws();
         let save = self.pos;
-        let mut header = String::new();
-        while let Some(c) = self.peek() {
-            if c.is_ascii_alphabetic() { header.push(c); self.bump(); } else { break; }
-        }
+        let header = self.ascii_alpha_run();
         if header.is_empty() { self.pos = save; return None; }
         if !self.eat_str("{*") { self.pos = save; return None; }
         let mut body = String::new();

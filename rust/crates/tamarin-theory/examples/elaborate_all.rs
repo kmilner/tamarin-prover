@@ -12,21 +12,13 @@ use std::path::PathBuf;
 use tamarin_parser::parse_theory;
 use tamarin_theory::elaborate::{elaborate, elaborate_with_diagnostics};
 
-fn corpus_root() -> std::path::PathBuf {
-    std::env::var("CORPUS_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples")
-    })
-}
+mod common;
+use common::{collect_spthy, corpus_root};
 
 fn main() {
     let root = env::args().nth(1).map(PathBuf::from).unwrap_or_else(corpus_root);
 
-    let mut files: Vec<PathBuf> = walkdir::WalkDir::new(&root)
-        .into_iter().filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("spthy"))
-        .map(|e| e.path().to_path_buf())
-        .collect();
-    files.sort();
+    let files = collect_spthy(&root);
 
     let verbose = env::var("VERBOSE").is_ok();
     let mut total = 0;

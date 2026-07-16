@@ -1720,17 +1720,14 @@ fn render_variant_substs_block(
     s
 }
 
+/// Render a `LVar` the way HS `instance Show LVar` (LTerm.hs:525-532) does:
+/// sort prefix (`~`/`$`/`#`/`%`/empty), then the root name, then `.idx` when
+/// `idx /= 0`.  Delegates to [`tamarin_term::pretty::pp_lvar`], the HS-faithful
+/// mirror, so the empty-name branch matches HS exactly.
 fn render_lvar(v: &tamarin_term::lterm::LVar) -> String {
-    use tamarin_term::lterm::LSort;
-    let pre = match v.sort {
-        LSort::Pub => "$",
-        LSort::Fresh => "~",
-        LSort::Node => "#",
-        LSort::Nat => "%",
-        LSort::Msg => "",
-    };
-    if v.idx == 0 { format!("{}{}", pre, v.name) }
-    else { format!("{}{}.{}", pre, v.name, v.idx) }
+    let mut s = String::new();
+    tamarin_term::pretty::pp_lvar(v, &mut s);
+    s
 }
 
 /// Render a timepoint / node id from a (root-name, idx) pair the way HS's
@@ -2756,12 +2753,7 @@ fn render_node_prem(p: &crate::constraint::constraints::NodePrem) -> String {
 /// Unicode-subscript digits for a non-negative integer.  Mirrors HS
 /// `subscript` used by `prettyGoal (PremiseG …)` in Constraints.hs:273.
 fn goal_subscript(n: usize) -> String {
-    n.to_string().chars().map(|c| match c {
-        '0' => '\u{2080}', '1' => '\u{2081}', '2' => '\u{2082}',
-        '3' => '\u{2083}', '4' => '\u{2084}', '5' => '\u{2085}',
-        '6' => '\u{2086}', '7' => '\u{2087}', '8' => '\u{2088}',
-        '9' => '\u{2089}', _ => c,
-    }).collect()
+    tamarin_utils::unicode::subscript(&n.to_string())
 }
 
 fn pp_contradiction(c: &crate::constraint::solver::contradictions::Contradiction) -> String {

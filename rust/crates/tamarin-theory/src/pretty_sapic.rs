@@ -37,7 +37,7 @@
 //! later phases); the printers here are only used for SAPIC-generated output,
 //! so they never affect non-process theories.
 
-use tamarin_term::function_symbols::{AcSym, CSym, FunSym};
+use tamarin_term::function_symbols::{CSym, FunSym};
 use tamarin_term::function_symbols::{diff_sym, exp_sym, nat_one_sym, pair_sym, EMAP_SYM_STRING};
 use tamarin_term::vterm::{Lit, VTerm};
 
@@ -73,15 +73,6 @@ fn show_sapic_lvar(v: &SapicLVar) -> String {
         s.push_str(t);
     }
     s
-}
-
-fn ac_op_symbol(op: AcSym) -> &'static str {
-    match op {
-        AcSym::Mult => "*",
-        AcSym::Xor => "\u{2295}",
-        AcSym::Union => "++",
-        AcSym::NatPlus => "%+",
-    }
 }
 
 /// `render (prettySapicTerm t)` over a `SapicTerm` — HS `prettyTerm (text .
@@ -123,7 +114,7 @@ fn sapic_term_to_doc(
         VTerm::App(FunSym::Ac(o), ts) => {
             // HS `FApp (AC o) ts -> ppTerms (ppACOp o) 1 "(" ")" ts`.
             let refs: Vec<&SapicTerm> = ts.iter().collect();
-            ac_op_doc(ac_op_symbol(*o), &refs, match_vars)
+            ac_op_doc(tamarin_term::pretty::ac_op_symbol(*o), &refs, match_vars)
         }
         VTerm::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == exp_sym() => {
             // HS `... | s == expSym -> ppTerm t1 <> "^" <> ppTerm t2` (flat).

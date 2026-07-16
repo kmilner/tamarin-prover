@@ -404,7 +404,7 @@ pub struct ProverSession {
     /// same key (every normal lemma shares the all-sources key), letting
     /// the expensive `saturate_sources_with_simp` pass run once per theory
     /// instead of once per lemma.  `Mutex` keeps the session `&self`.
-    // keyed source cache (Mutex); path->CachedSources
+    // keyed source cache (Mutex); source-key->CachedSources
     // lookup, never iterated; std kept (byte-inert) — order never reaches output.
     #[allow(clippy::disallowed_types)]
     source_cache: std::sync::Mutex<

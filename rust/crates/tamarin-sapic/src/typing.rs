@@ -199,10 +199,7 @@ fn rename_fact(
     subst: &BTreeMap<LVar, LVar>,
     f: &tamarin_theory::sapic::SapicLNFact,
 ) -> tamarin_theory::sapic::SapicLNFact {
-    let terms = f.terms.iter().map(|t| rename_term(subst, t)).collect();
-    let mut nf = tamarin_theory::fact::Fact::new(f.tag.clone(), terms);
-    nf = nf.with_annotations(f.annotations.clone());
-    nf
+    f.map_ref(|t| rename_term(subst, t))
 }
 
 fn rename_action(subst: &BTreeMap<LVar, LVar>, a: &SapicAction<SapicLVar>) -> SapicAction<SapicLVar> {
@@ -669,10 +666,7 @@ fn type_event_fact(
     env: &mut TypingEnvironment,
     f: &tamarin_theory::sapic::SapicLNFact,
 ) -> Result<tamarin_theory::sapic::SapicLNFact, String> {
-    let terms: Result<Vec<_>, _> = f.terms.iter().map(|t| type_term(env, t)).collect();
-    let mut nf = tamarin_theory::fact::Fact::new(f.tag.clone(), terms?);
-    nf = nf.with_annotations(f.annotations.clone());
-    Ok(nf)
+    f.try_map_ref(|t| type_term(env, t))
 }
 
 // =============================================================================

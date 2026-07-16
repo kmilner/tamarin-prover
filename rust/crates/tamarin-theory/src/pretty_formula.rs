@@ -2383,7 +2383,7 @@ fn pp_gterm(t: &crate::guarded::GTerm, scope: &[Vec<Bind>], out: &mut String) {
             // children and join under one paren-pair to match HS — without
             // this `('1'++x)++z` stayed nested instead of HS `('1'++x++z)`,
             // and `x++z = y` lost HS's outer `(x++z)` parens.  Mirror of the
-            // parser-AST `pp_term` AC handling (this fn, ~l.1108).
+            // parser-AST `pp_term` AC handling above.
             let is_exp = matches!(op, p::BinOp::Exp);
             if is_exp {
                 pp_gterm(l, scope, out);

@@ -1257,7 +1257,7 @@ fn intr_mk_empty(_: LNFact) -> Vec<LNFact> { Vec::new() }
 /// TheoryLoader.hs:776-791) parses the CACHED file via
 /// `mkDhIntruderVariants` — see [`crate::intruder_variants::mk_dh_intruder_variants`].
 ///
-/// The Rust port now also takes the cached-file path in production
+/// In production the Rust port likewise takes the cached-file path
 /// (see `constraint::solver::context::ProofContext::new_with_restrictions`,
 /// the `intruder_variants::mk_dh_intruder_variants` call); this
 /// function is retained as the regenerator and is exercised by the
@@ -1896,15 +1896,20 @@ mod tests {
     // Pin both ends of the predicate: a positive (two rules differing only
     // in variable names) and a negative (structurally different).
     // =========================================================================
-    fn maude_handle() -> Option<tamarin_term::maude_proc::MaudeHandle> {
-        let path = std::env::var("MAUDE_PATH").ok().or_else(|| {
+    /// Locate the Maude binary (`MAUDE_PATH` env override, else the common
+    /// install paths).  `None` skips the Maude-backed tests below.
+    fn maude_bin_path() -> Option<String> {
+        std::env::var("MAUDE_PATH").ok().or_else(|| {
             for c in ["/usr/local/bin/maude", "maude"] {
                 if std::path::Path::new(c).exists() { return Some(c.to_string()); }
             }
             None
-        })?;
+        })
+    }
+
+    fn maude_handle() -> Option<tamarin_term::maude_proc::MaudeHandle> {
         tamarin_term::maude_proc::MaudeHandle::start(
-            &path, tamarin_term::maude_sig::pair_maude_sig()).ok()
+            &maude_bin_path()?, tamarin_term::maude_sig::pair_maude_sig()).ok()
     }
 
     /// Build a rule `[ KU(a) ] --[ KU(pair(a, a)) ]-> [ KU(pair(a, a)) ]`
@@ -2088,25 +2093,13 @@ mod tests {
     // =========================================================================
 
     fn dh_maude_handle() -> Option<tamarin_term::maude_proc::MaudeHandle> {
-        let path = std::env::var("MAUDE_PATH").ok().or_else(|| {
-            for c in ["/usr/local/bin/maude", "maude"] {
-                if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-            }
-            None
-        })?;
         tamarin_term::maude_proc::MaudeHandle::start(
-            &path, tamarin_term::maude_sig::dh_maude_sig()).ok()
+            &maude_bin_path()?, tamarin_term::maude_sig::dh_maude_sig()).ok()
     }
 
     fn bp_maude_handle() -> Option<tamarin_term::maude_proc::MaudeHandle> {
-        let path = std::env::var("MAUDE_PATH").ok().or_else(|| {
-            for c in ["/usr/local/bin/maude", "maude"] {
-                if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-            }
-            None
-        })?;
         tamarin_term::maude_proc::MaudeHandle::start(
-            &path, tamarin_term::maude_sig::bp_maude_sig()).ok()
+            &maude_bin_path()?, tamarin_term::maude_sig::bp_maude_sig()).ok()
     }
 
     /// `bp_intruder_rules(false)` yields exactly 75 bilinear-pairing

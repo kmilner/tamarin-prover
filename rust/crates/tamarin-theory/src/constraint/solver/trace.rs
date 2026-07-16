@@ -24,6 +24,7 @@
 
 use std::sync::OnceLock;
 use std::cell::RefCell;
+use tamarin_term::lterm::sort_prefix;
 
 thread_local! {
     /// Stack of case-names from proof tree root to current node.
@@ -57,8 +58,7 @@ thread_local! {
 /// flag IS set the label behaves exactly as before; when it is unset the
 /// label is never observed, so skipping the clones changes nothing.
 pub fn op_label_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_DBG_APPLY_EQ_STORE")
 }
 
 /// Set the current operation label.  Callers wrap their apply_eq_store
@@ -167,8 +167,7 @@ pub fn case_path_set(path: &[String]) {
 /// with the equivalent insertion trace in the private instrumented HS build
 /// for finding insertion divergences.
 pub fn form_flag() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_FORM").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_TRACE_FORM")
 }
 
 /// `repr` is a thunk so the (recursive, allocating) `guarded_repr` dump is
@@ -252,8 +251,7 @@ fn term_repr(t: &crate::guarded::GTerm) -> String {
 }
 
 fn flag() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_EXEC").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_TRACE_EXEC")
 }
 
 /// Public view of the cached `TAM_RS_TRACE_EXEC` gate (`flag()`), so
@@ -306,13 +304,9 @@ fn check_and_mark_emitted(label: &str) -> bool {
     use std::sync::Mutex;
     static EMITTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let set = EMITTED.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut g = set.lock().unwrap();
-    if g.contains(label) {
-        true
-    } else {
-        g.insert(label.to_string());
-        false
-    }
+    // `insert` returns true when the label is newly added (first emission)
+    // and false when it was already present — negate to get "already seen".
+    !set.lock().unwrap().insert(label.to_string())
 }
 
 /// Emit a `[EXEC] <label>` line to stderr when `TAM_RS_TRACE_EXEC=1`.
@@ -332,24 +326,8 @@ pub fn trace_exec(label: &str) {
     eprintln!("[EXEC] {}", label);
 }
 
-/// Convenience: format a `LSort`-tagged short variable identifier
-/// matching Haskell's `Show LVar` (e.g., `~name`, `$name`, `#name`,
-/// `name` for Msg).  Use for the term-head field of `solveGoal` so
-/// the canonical form matches the Haskell side.
-pub fn sort_prefix(s: tamarin_term::lterm::LSort) -> &'static str {
-    use tamarin_term::lterm::LSort;
-    match s {
-        LSort::Msg   => "",
-        LSort::Fresh => "~",
-        LSort::Pub   => "$",
-        LSort::Node  => "#",
-        LSort::Nat   => "%",
-    }
-}
-
 fn state_flag() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_STATE").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_TRACE_STATE")
 }
 
 /// Emit a `[STATE]` line summarising the system state in a form designed
@@ -474,8 +452,7 @@ pub fn trace_state(sys: &crate::constraint::system::System) {
 }
 
 fn state_nodes_flag() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_STATE_NODES").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_TRACE_STATE_NODES")
 }
 
 /// Like `canonical_fact` but KEEPS the LVar idx so diffs reveal node
@@ -530,18 +507,15 @@ fn canonical_lnterm_with_idx(t: &tamarin_term::lterm::LNTerm) -> String {
 }
 
 fn state_forms_flag() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_STATE_FORMS").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_TRACE_STATE_FORMS")
 }
 
 fn state_full_flag() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_STATE_FULL").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_TRACE_STATE_FULL")
 }
 
 fn state_eqs_flag() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_STATE_EQS").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_TRACE_STATE_EQS")
 }
 
 /// Canonical dump of `sys.eq_store.subst`: sorted list of canonical

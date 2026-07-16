@@ -156,11 +156,9 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     // `node_after_last` (both via direct `.map()` walks). `contradictions`
     // holds `sys` immutable for its whole body with no early return, so the
     // relation is invariant across all four; build it ONCE and thread it
-    // down. Never worse than before: `has_forbidden_chain` (line below,
-    // unconditional) already built it on every call. This is a distinct
-    // relation from the substituted `all_less` used for the cyclic check
-    // above (that one applies the eq-store subst; this one does not), so it
-    // is built separately.
+    // down. This is a distinct relation from the substituted `all_less`
+    // used for the cyclic check above (that one applies the eq-store subst;
+    // this one does not), so it is built separately.
     let ab_adj = sys.build_always_before_adj();
 
     // 2. SubtermCyclic — `isContradictory subtermStore`.
@@ -1326,20 +1324,6 @@ fn bp_over_complicated(scalar: &tamarin_term::lterm::LNTerm,
     ni_factors_subset(scalar, ke) && never_contains_fresh_priv(point)
 }
 
-/// Build the read-only `NodeId → &RuleACInst` index the contradiction
-/// checks use for `.get()` lookups, replacing a per-lookup linear
-/// `sys.nodes.iter().find` (O(edges*nodes)).  `or_insert` keeps the FIRST
-/// rule for a given id, matching `find`'s / `node_rule_safe`'s first-match
-/// semantics; `sys.nodes` is unique-keyed, so the map returns the identical
-/// rule the linear scan found.
-fn node_rule_map(sys: &System) -> tamarin_utils::FastMap<&NodeId, &crate::rule::RuleACInst> {
-    let mut m = tamarin_utils::FastMap::default();
-    for (n, r) in sys.nodes.iter() {
-        m.entry(n).or_insert(r);
-    }
-    m
-}
-
 /// Direct port of Haskell's `nonInjectiveFactInstances`
 /// (`Theory.Constraint.Solver.Contradictions`).
 ///
@@ -1383,7 +1367,7 @@ fn non_injective_fact_instances(
     };
     // Resolve node-id → rule via a once-built map instead of a linear
     // `nodes.iter().find` per `i`/`j`.
-    let node_rule_map = node_rule_map(sys);
+    let node_rule_map = sys.node_rule_map();
     let lookup_node = |id: &NodeId| -> Option<&crate::rule::RuleACInst> {
         node_rule_map.get(id).copied()
     };
@@ -1558,7 +1542,7 @@ fn has_fresh_fact_sort_violation(sys: &System) -> bool {
 fn has_incompatible_edge_facts(sys: &System) -> bool {
     // One node-id → rule map (instead of two linear `nodes.iter().find`
     // scans per edge → O(edges*nodes)).
-    let node_rule_map = node_rule_map(sys);
+    let node_rule_map = sys.node_rule_map();
     for e in &sys.edges {
         let src_rule = node_rule_map.get(&e.src.0).copied();
         let tgt_rule = node_rule_map.get(&e.tgt.0).copied();

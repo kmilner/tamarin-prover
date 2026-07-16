@@ -116,12 +116,14 @@ pub fn hsv_to_hex(c: Hsv) -> String { rgb_to_hex(hsv_to_rgb(c)) }
 
 // -- Palette generation -------------------------------------------------------
 //
-// Intentionally retained: faithful `Color.hs` port. This palette layer
-// (`ColorParams`/`*color_group*`/`gen_color_groups`) plus the `hex_to_rgb`,
-// `hsv_to_hex`, `hsv_to_gray` and `rgb_to_gray` helpers above currently have no
-// Rust caller — the dot-color path uses a fixed-hex approximation and is slated
-// to migrate onto this byte-faithful palette later. (`rgb_to_hsv`/`hsv_to_rgb`/
-// `rgb_to_hex`/`Rgb`/`Hsv` above ARE live in `tamarin-sapic`/`tamarin-server`.)
+// Faithful `Color.hs` port. `light_color_groups` — with its helpers
+// `light_color_group_style`, `gen_color_groups` and `ColorParams` — is live in
+// `tamarin-server`'s dot renderer, which colours rule groups through this
+// palette; `hex_to_rgb` is live in `tamarin-theory::elaborate`; and
+// `rgb_to_hsv`/`hsv_to_rgb`/`rgb_to_hex`/`Rgb`/`Hsv` above are live in
+// `tamarin-sapic`/`tamarin-server`. The remaining `Color.hs` helpers
+// (`color_groups`/`color_group_style`, `hsv_to_hex`, `hsv_to_gray`,
+// `rgb_to_gray`) have no caller and are retained for completeness of the port.
 
 #[derive(Debug, Clone, Copy)]
 pub struct ColorParams {

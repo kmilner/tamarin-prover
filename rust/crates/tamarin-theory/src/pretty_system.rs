@@ -16,8 +16,8 @@
 //!   solved constraints: ...
 //!
 //! NOTE: the `subterms` and `equations` section bodies are faithful
-//! ports of Haskell's `prettySubtermStore` (SubtermStore.hs:567-579) and
-//! `prettyEqStore` (EquationStore.hs:566-586) — same `Contradictory` /
+//! ports of Haskell's `prettySubtermStore` (SubtermStore.hs:569-581) and
+//! `prettyEqStore` (EquationStore.hs:876-896) — same `Contradictory` /
 //! `CONTRADICTORY` headers, numbered keyword sections and `∃`-quantified
 //! disjuncts — built on the `pretty_hpj` HughesPJ Doc engine.  The whole
 //! pane is ONE Doc (`vsep $ map combine_ …`, System.hs:1675-1686) rendered
@@ -28,6 +28,8 @@
 //! and do not affect proof results or golden `--prove` output.
 
 use tamarin_term::pretty::{pp_lvar, pretty_lnterm};
+// HS `flushRight n str` (Extension.Prelude): left-pad `str` with spaces to width n.
+use tamarin_utils::prelude_ext::flush_right;
 
 use crate::pretty_hpj::{fsep, punctuate, Doc};
 use crate::constraint::constraints::{Goal, NodeId};
@@ -192,17 +194,6 @@ fn blank_text() -> Doc {
     Doc::TextBeside(std::rc::Rc::from(""), 0, std::rc::Rc::new(Doc::Empty))
 }
 
-// HS `flushRight n str` (Extension.Prelude): left-pad with spaces to width n.
-fn flush_right(n: usize, s: &str) -> String {
-    let pad = n.saturating_sub(s.chars().count());
-    let mut out = String::with_capacity(pad + s.len());
-    for _ in 0..pad {
-        out.push(' ');
-    }
-    out.push_str(s);
-    out
-}
-
 // HS `combine (header, d) = fsep [keyword_ header <> colon, nest 2 d]`
 // (SubtermStore.hs:576 / EquationStore.hs:574) — the section header is a
 // `keyword_` span, the colon is plain.  `keyword_` is the identity in plain mode.
@@ -210,7 +201,7 @@ fn combine(header: &str, d: Doc) -> Doc {
     fsep(vec![crate::pretty_hpj::keyword_(header).beside(Doc::char(':')), d.nest(2)])
 }
 
-// Faithful port of Haskell `prettySubtermStore` (SubtermStore.hs:567-579).
+// Faithful port of Haskell `prettySubtermStore` (SubtermStore.hs:569-581).
 // Emits an optional `Contradictory: yes` header, then (when the store is
 // non-empty) three numbered keyword-headed sections `Negative Subterms` /
 // `Subterms` / `Solved Subterms`, each item rendered as
@@ -276,7 +267,7 @@ fn pretty_subterm_store(sys: &System) -> Doc {
     vcat_doc(sections)
 }
 
-// Faithful port of Haskell `prettyEqStore` (EquationStore.hs:837-858).
+// Faithful port of Haskell `prettyEqStore` (EquationStore.hs:876-896).
 // Emits a leading `CONTRADICTORY` line when `eqsIsFalse`, then a `subst:`
 // section (`prettySubst (text.show) (text.show)`, i.e. `t <~ {vars}`
 // lines) and a `conj:` section whose disjuncts are `N.` followed by

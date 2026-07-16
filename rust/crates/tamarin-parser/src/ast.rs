@@ -1,4 +1,11 @@
-//! Surface-syntax AST for `.spthy` files.
+//! Surface-syntax AST for `.spthy` files: the loose tree [`crate::parser`]
+//! produces and [`crate::wf`] (plus, downstream, `tamarin-theory`'s
+//! elaboration) consumes.
+//!
+//! Nodes mirror Tamarin's concrete syntax rather than any single Haskell type —
+//! the HS parser builds straight into the semantic `Theory`, so this is a
+//! syntax-level staging form that a later elaboration pass lowers. [`Theory`] is
+//! the root; every other type hangs off its [`TheoryItem`] stream.
 
 // =============================================================================
 // Top-level theory

@@ -14,27 +14,17 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 use tamarin_parser::{parse_theory, wf};
 
-fn corpus_root() -> std::path::PathBuf {
-    std::env::var("CORPUS_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples")
-    })
-}
+mod common;
+use common::{collect_spthy, corpus_root, run_tamarin};
 
 fn main() {
     let root = env::args().nth(1).map(PathBuf::from).unwrap_or_else(corpus_root);
     let limit: Option<usize> = env::var("WF_LIMIT").ok().and_then(|s| s.parse().ok());
 
-    let mut files: Vec<PathBuf> = walkdir::WalkDir::new(&root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("spthy"))
-        .map(|e| e.path().to_path_buf())
-        .collect();
-    files.sort();
+    let mut files = collect_spthy(&root);
     if let Some(n) = limit { files.truncate(n); }
 
     let mut scanned = 0usize;
@@ -48,7 +38,7 @@ fn main() {
         scanned += 1;
 
         // Skip files Tamarin can't even handle.
-        let tamarin_topics = match run_tamarin_topics(path) {
+        let tamarin_topics = match run_tamarin("tamarin-prover", path, &[]) {
             Some(s) => s,
             None => continue,
         };
@@ -96,39 +86,4 @@ fn main() {
             println!("  {:5}  {}", n, t);
         }
     }
-}
-
-fn run_tamarin_topics(path: &std::path::Path) -> Option<BTreeSet<String>> {
-    let out = Command::new("tamarin-prover").arg(path).output().ok()?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    Some(extract_topics(&combined))
-}
-
-fn extract_topics(s: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let mut prev: Option<&str> = None;
-    for line in s.lines() {
-        if !line.is_empty() && line.chars().all(|c| c == '=') {
-            if let Some(p) = prev {
-                let p = p.trim();
-                if !p.is_empty()
-                    && !p.starts_with("analyzed:")
-                    && !p.starts_with("summary of summaries")
-                    && !p.contains("Tamarin version")
-                    && !p.contains("Maude version")
-                    && !p.starts_with("theory ")
-                    && !p.starts_with("Generated from:")
-                    && !p.starts_with("Compiled at")
-                {
-                    out.insert(p.to_string());
-                }
-            }
-        }
-        prev = Some(line);
-    }
-    out
 }

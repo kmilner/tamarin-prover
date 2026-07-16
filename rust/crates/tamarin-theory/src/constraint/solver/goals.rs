@@ -1,4 +1,4 @@
-//! Skeleton port of `Theory.Constraint.Solver.Goals`.
+//! Port of `Theory.Constraint.Solver.Goals`.
 //!
 //! `openGoals` enumerates the list of goals from a `System` that
 //! still need to be solved, with `Usefulness` annotations driving
@@ -12,6 +12,7 @@
 use crate::constraint::constraints::Goal;
 use crate::constraint::solver::annotated_goals::{AnnotatedGoal, Usefulness};
 use crate::constraint::system::System;
+use tamarin_term::lterm::{contains_private, is_msg_var};
 
 
 /// The goal ranking selected by a theory / lemma `heuristic:` directive.
@@ -1685,24 +1686,27 @@ fn is_mid_receiver(a: &AnnotatedGoal) -> bool { is_proto_named(a, false, "MID_Re
 /// HS `isMID_Sender` (ProofMethod.hs:957): PremiseG ProtoFact "MID_Sender".
 fn is_mid_sender(a: &AnnotatedGoal) -> bool { is_proto_named(a, false, "MID_Sender") }
 
-/// HS `isKnowsLastNameGoal` (ProofMethod.hs:262): KU goal of a fresh name
-/// var whose name has the `L_` prefix.
-fn is_knows_last_name_goal(a: &AnnotatedGoal) -> bool {
+/// KU goal of a fresh-name var whose name has the given `prefix`.  Shared
+/// by the HS `isKnows{First,Last,Immediate}NameGoal` / `isKnowsHandleGoal`
+/// family, each a thin wrapper fixing its own prefix.
+fn is_knows_fresh_name_goal(a: &AnnotatedGoal, prefix: &str) -> bool {
     use tamarin_term::lterm::LSort;
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
     matches!(msg_premise(&a.goal),
-        Some(Term::Lit(Lit::Var(v))) if v.sort == LSort::Fresh && v.name.starts_with("L_"))
+        Some(Term::Lit(Lit::Var(v))) if v.sort == LSort::Fresh && v.name.starts_with(prefix))
+}
+
+/// HS `isKnowsLastNameGoal` (ProofMethod.hs:262): KU goal of a fresh name
+/// var whose name has the `L_` prefix.
+fn is_knows_last_name_goal(a: &AnnotatedGoal) -> bool {
+    is_knows_fresh_name_goal(a, "L_")
 }
 
 /// HS `isKnowsHandleGoal` (ProofMethod.hs:1143, sapicPKCS11): KU goal of a
 /// fresh name var whose name has the `h` prefix.
 fn is_knows_handle_goal(a: &AnnotatedGoal) -> bool {
-    use tamarin_term::lterm::LSort;
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    matches!(msg_premise(&a.goal),
-        Some(Term::Lit(Lit::Var(v))) if v.sort == LSort::Fresh && v.name.starts_with("h"))
+    is_knows_fresh_name_goal(a, "h")
 }
 
 /// HS `isNotInsertAction` (ProofMethod.hs:973): NOT an ActionG ProtoFact "Insert".
@@ -1844,38 +1848,19 @@ fn is_proto_fact_goal(a: &AnnotatedGoal) -> bool {
 /// `isKnowsFirstNameGoal` (ProofMethod.hs): KU goal of a fresh
 /// name var whose name has the `F_` prefix.
 fn is_knows_first_name_goal(a: &AnnotatedGoal) -> bool {
-    use tamarin_term::lterm::LSort;
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    match msg_premise(&a.goal) {
-        Some(Term::Lit(Lit::Var(v))) =>
-            v.sort == LSort::Fresh && v.name.starts_with("F_"),
-        _ => false,
-    }
+    is_knows_fresh_name_goal(a, "F_")
 }
 
 /// `isKnowsImmediateNameGoal` (ProofMethod.hs): KU goal of a
 /// fresh name var whose name has the `I_` prefix.
 fn is_knows_immediate_name_goal(a: &AnnotatedGoal) -> bool {
-    use tamarin_term::lterm::LSort;
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    match msg_premise(&a.goal) {
-        Some(Term::Lit(Lit::Var(v))) =>
-            v.sort == LSort::Fresh && v.name.starts_with("I_"),
-        _ => false,
-    }
+    is_knows_fresh_name_goal(a, "I_")
 }
 
 /// `isNotKnowsLastNameGoal` (ProofMethod.hs): True unless the
 /// goal is a KU goal of a fresh name var with an `L_` prefix.
 fn is_not_knows_last_name_goal(a: &AnnotatedGoal) -> bool {
-    use tamarin_term::lterm::LSort;
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    !matches!(msg_premise(&a.goal),
-        Some(Term::Lit(Lit::Var(v)))
-            if v.sort == LSort::Fresh && v.name.starts_with("L_"))
+    !is_knows_last_name_goal(a)
 }
 
 /// `isNonSolveLastGoal` — PremiseG/ActionG NOT tagged SolveLast.
@@ -2125,14 +2110,6 @@ fn is_open_in_sys(
         }
         _ => true,
     }
-}
-
-/// `isMsgVar`: the term is a Msg-sorted free variable.
-fn is_msg_var(t: &tamarin_term::lterm::LNTerm) -> bool {
-    use tamarin_term::lterm::LSort;
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    matches!(t, Term::Lit(Lit::Var(v)) if v.sort == LSort::Msg)
 }
 
 /// Extract args if the term is a multiset-union (`FUnion`) — Haskell's
@@ -2506,17 +2483,12 @@ fn check_term_lits<F: Fn(tamarin_term::lterm::LSort) -> bool>(
     fn walk<F: Fn(tamarin_term::lterm::LSort) -> bool>(
         t: &tamarin_term::lterm::LNTerm, p: &F,
     ) -> bool {
-        use tamarin_term::lterm::{LSort, NameTag};
+        use tamarin_term::lterm::sort_of_name;
         use tamarin_term::term::Term;
         use tamarin_term::vterm::Lit;
         match t {
             Term::Lit(Lit::Var(v)) => p(v.sort),
-            Term::Lit(Lit::Con(c)) => p(match c.tag {
-                NameTag::Pub => LSort::Pub,
-                NameTag::Fresh => LSort::Fresh,
-                NameTag::Node => LSort::Node,
-                NameTag::Nat => LSort::Nat,
-            }),
+            Term::Lit(Lit::Con(c)) => p(sort_of_name(c)),
             Term::App(_, args) => args.iter().all(|a| walk(a, p)),
         }
     }
@@ -2532,33 +2504,16 @@ fn probably_constructible(t: &tamarin_term::lterm::LNTerm) -> bool {
 
 /// True iff any literal in `t` has the given sort. The Haskell source
 /// folds `sortOfLit` over every leaf; we mirror that with a recursive
-/// walk over `Term` matching `LSort` against `Var.sort` for variables
-/// and `NameTag` for constants.
+/// walk over `Term`, comparing `target` against `Var.sort` for variables
+/// and `sort_of_name` for constants.
 fn lit_sort_contains(t: &tamarin_term::lterm::LNTerm, target: tamarin_term::lterm::LSort) -> bool {
-    use tamarin_term::lterm::{LSort, NameTag};
+    use tamarin_term::lterm::sort_of_name;
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
     match t {
         Term::Lit(Lit::Var(v)) => v.sort == target,
-        Term::Lit(Lit::Con(c)) => matches!((target, c.tag),
-            (LSort::Pub,   NameTag::Pub)
-            | (LSort::Fresh, NameTag::Fresh)
-            | (LSort::Node,  NameTag::Node)
-            | (LSort::Nat,   NameTag::Nat)),
+        Term::Lit(Lit::Con(c)) => sort_of_name(c) == target,
         Term::App(_, args) => args.iter().any(|a| lit_sort_contains(a, target)),
-    }
-}
-
-/// True iff any sub-term is a `Private` function-symbol application.
-fn contains_private(t: &tamarin_term::lterm::LNTerm) -> bool {
-    use tamarin_term::function_symbols::{Privacy, FunSym};
-    use tamarin_term::term::Term;
-    match t {
-        Term::Lit(_) => false,
-        Term::App(FunSym::NoEq(sym), args) => {
-            sym.privacy == Privacy::Private || args.iter().any(contains_private)
-        }
-        Term::App(_, args) => args.iter().any(contains_private),
     }
 }
 
@@ -2678,7 +2633,8 @@ pub fn dispatch_solve_goal(
     // flag: the `format!` + `fact_tag_haskell`/`fact_term_head` allocs fire
     // on every goal dispatch, and are dead work unless the trace is on.
     if crate::constraint::solver::trace::exec_enabled() {
-        use crate::constraint::solver::trace::{trace_exec, sort_prefix};
+        use crate::constraint::solver::trace::trace_exec;
+        use tamarin_term::lterm::sort_prefix;
         let label = match g {
             Goal::Action(_, fa)  => format!("solveGoal kind=Action fact={}({})",
                 fact_tag_haskell(fa), fact_term_head(fa, sort_prefix)),
@@ -2706,7 +2662,7 @@ pub fn dispatch_solve_goal(
 // the same EXEC-trace format.
 pub fn fact_tag_haskell_pub(fa: &crate::fact::LNFact) -> String { fact_tag_haskell(fa) }
 pub fn fact_term_head_pub(fa: &crate::fact::LNFact) -> String {
-    use crate::constraint::solver::trace::sort_prefix;
+    use tamarin_term::lterm::sort_prefix;
     fact_term_head(fa, sort_prefix)
 }
 

@@ -149,8 +149,9 @@ scripts/diff_aes_calls.sh <file> <lemma>      # apply_eq_store call counts per s
 See `crates/tamarin-term/src/maude_proc.rs` for the env-gated trace points.
 
 **Diagnostic env flags** (all off by default; solving behavior is never
-env-configurable — these only dump, count, or verify-and-panic). `TAM_HS_*`
-work on the instrumented Haskell build, the rest on the Rust binary:
+env-configurable — these only dump, count, verify-and-panic, or force a
+reference path whose output is byte-identical). `TAM_HS_*` work on the
+instrumented Haskell build, the rest on the Rust binary:
 
 | Variable | Effect |
 |---|---|
@@ -163,13 +164,21 @@ work on the instrumented Haskell build, the rest on the Rust binary:
 | `TAM_RS_VERIFY_BOUNDS_CACHE=1` | panic if the bounds_max cache diverges from a full recompute |
 | `TAM_RS_VERIFY_SUBST_SKIP=1` | panic if a marker-skipped `subst_system` pass was not a bit-identical no-op |
 | `TAM_RS_VERIFY_FP=1` | panic if a bloom-skipped fact descent would actually have changed the fact |
+| `TAM_RS_VERIFY_FACT_MAX=1` | panic if a Fact's cached `max_var` diverges from a full walk of its terms |
+| `TAM_RS_VERIFY_CANON_TABLES=1` | panic if a per-store incremental canon table diverges from a full rebuild |
+| `TAM_RS_NO_SIMP_NOOP_SKIP=1` | force the full Simplify pass (disable the no-op shortcut; A/B oracle) |
+| `TAM_RS_NO_SOURCE_CACHE=1` | disable the session source cache + presaturation pre-pass (per-lemma recompute) |
 | `TAM_RS_SUBST_SKIP_STATS=1` | `subst_system` call/skip counters to stderr |
 | `TAM_RS_FP_STATS=1` | fact-descent bloom-skip counters to stderr |
+| `TAM_RS_SIMP_NOOP_STATS=1` | Simplify no-op shortcut hit/miss counters to stderr |
+| `TAM_RS_CANON_TABLE_STATS=1` | canon-table cache hit/rebuild counters to stderr |
 
-The three `TAM_RS_VERIFY_*` hooks certify the solver's internal caches and
-skip optimisations: exporting them during a full corpus-gate run re-executes
-every skipped computation and panics on any divergence, turning the byte
-gate into a self-check of the optimisation machinery as well.
+The `TAM_RS_VERIFY_*` hooks certify the solver's internal caches and skip
+optimisations: exporting them during a full corpus-gate run re-executes every
+skipped computation and panics on any divergence, turning the byte gate into a
+self-check of the optimisation machinery as well. The `TAM_RS_NO_*` switches
+are the A/B complement — they force the pre-optimisation reference path, whose
+output must stay byte-identical.
 
 The list is not exhaustive — grep the sources for `TAM_DBG_` / `TAM_RS_` /
 `TAM_HS_` for the full set.

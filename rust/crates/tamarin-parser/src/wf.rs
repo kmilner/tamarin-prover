@@ -48,6 +48,78 @@ impl WfError {
 
 pub type WfReport = Vec<WfError>;
 
+// =============================================================================
+// Shared report ordering (batch `--prove` and web load pipelines)
+// =============================================================================
+
+/// Canonical HS wellformedness check-order (Wellformedness.hs check list).
+/// Each ordered-splice call site (in the batch `run.rs` and web `theory_io.rs`
+/// load pipelines) passes a SUFFIX of this list as its `anchors`: since
+/// [`insert_wf_before`] only tests membership, a suffix contains exactly the
+/// topics that sort AFTER the check being inserted.  One source of truth
+/// avoids several in-sync literal lists that would silently mis-order a single
+/// report on a typo.
+pub const WF_TOPIC_ORDER: &[&str] = &[
+    "Reserved names",
+    "Special facts",
+    "Fr facts must only use a fresh- or a msg-variable",
+    "Fact arity issues",
+    "Fact multiplicity issues",
+    "Fact capitalization issues",
+    "Facts occur in the left-hand-side but not in any right-hand-side ",
+    "Unbound variables",
+    "Formula terms",
+    " Formula guardedness",
+    "Lemma annotations",
+    "Multiplication restriction of rules",
+    "Nat Sorts",
+    "Subterm Convergence Warning",
+    "Message Derivation Checks",
+    "Derivation Checks",
+];
+
+// First `WF_TOPIC_ORDER` index whose topic sorts after each splicing check.
+pub const WF_AFTER_VARIANTS: usize = 0; // ruleVariantsReport → before factReports
+pub const WF_AFTER_FACT_LHS: usize = 8; // "Formula terms"
+pub const WF_AFTER_CHECK_TERMS: usize = 9; // " Formula guardedness"
+pub const WF_AFTER_CHECK_GUARDED: usize = 10; // "Lemma annotations"
+
+/// Splice `errors` into `report` immediately before the first existing entry
+/// whose `topic` is one of `anchors` (its HS check-order position), or at the
+/// end if none match, preserving the relative order of both the existing tail
+/// and the inserted errors.  Shared by the batch (`run.rs`) and web
+/// (`theory_io.rs`) ordered-splice call sites — checkTerms / checkGuarded /
+/// SAPIC lhs-rhs / ruleVariants — which differ only in their `anchors` slice
+/// and the source of `errors`.  No-op when `errors` is empty.
+pub fn insert_wf_before(report: &mut Vec<WfError>, errors: Vec<WfError>, anchors: &[&str]) {
+    if errors.is_empty() {
+        return;
+    }
+    let insert_before = report
+        .iter()
+        .position(|e| anchors.contains(&e.topic.as_str()))
+        .unwrap_or(report.len());
+    let tail = report.split_off(insert_before);
+    report.extend(errors);
+    report.extend(tail);
+}
+
+/// Anchor list for the SAPIC `publicNamesReport` splice (HS check index 4):
+/// the variable-sorts topic, then every [`WF_TOPIC_ORDER`] topic EXCEPT
+/// "Unbound variables" (HS `unboundReport` runs BEFORE `publicNames`, so its
+/// entries must not act as a boundary).  publicNames therefore splices before
+/// the first entry from a later check.
+pub fn after_public_names_topics() -> Vec<&'static str> {
+    std::iter::once("Variable with mismatching sorts or capitalization")
+        .chain(
+            WF_TOPIC_ORDER
+                .iter()
+                .copied()
+                .filter(|t| *t != "Unbound variables"),
+        )
+        .collect()
+}
+
 /// Run every wellformedness check against `thy`. Topics from the result
 /// can be compared directly against `tamarin-prover`'s output.
 pub fn check_theory(thy: &Theory) -> WfReport {

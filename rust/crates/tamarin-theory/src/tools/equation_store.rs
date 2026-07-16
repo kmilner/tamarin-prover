@@ -22,7 +22,7 @@
 //! operations (empty, false-detection, adding a disjunction,
 //! performing a split, listing splits) and the Maude-backed
 //! operations: `add_eqs`, `apply_eq_store`, and the full `simp`
-//! pipeline (`simp`, `simp_with_fresh_avoiding`,
+//! pipeline (`simp_with_fresh_avoiding`,
 //! `simp_disjunction_with_maude`).
 
 use std::collections::BTreeSet;
@@ -111,35 +111,23 @@ fn freshen_witness_range(
 // it, so an impure FOLD can be traced back to its CREATION site.
 // ============================================================================
 
+#[inline]
 pub(crate) fn impure_dbg_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TAM_RS_DBG_IMPURE_FOLD").is_ok())
+    tamarin_utils::env_gate!("TAM_RS_DBG_IMPURE_FOLD")
 }
 
 // --- Cached kill-switch / debug env flags for apply_eq_store -----------
 // `apply_eq_store` is one of the hottest solver methods (per proof step,
 // plus recursively from every simp pass).  These env vars are constant
-// for the process; cache each behind a `OnceLock<bool>` (mirroring
-// `impure_dbg_enabled`) so the steady-state cost is an atomic load, not
-// an env-lock + `String` alloc per call / per variant.  Semantics are
-// preserved exactly (`.is_ok()` opt-in, `.is_err()` opt-out, and the
-// `== "substantive"` value match).
-/// Declarative accessor for a process-constant opt-IN env flag, cached
-/// behind a `OnceLock<bool>` (see the note above).  Expands to the same
-/// `.is_ok()` accessor body used by hand; the cached shape is deliberate
-/// (not `env_gate!`).
-macro_rules! cached_env_flag {
-    ($(#[$m:meta])* $name:ident, $var:literal) => {
-        $(#[$m])*
-        #[inline]
-        fn $name() -> bool {
-            static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *V.get_or_init(|| std::env::var($var).is_ok())
-        }
-    };
+// for the process, so each accessor caches its presence via `env_gate!`
+// (`.is_ok()`) — the steady-state cost is an atomic load, not an env-lock
+// + `String` alloc per call / per variant.  The lone exception,
+// `aes_dbg_filter_substantive`, matches an exact value (`== "substantive"`)
+// and so keeps its hand-rolled `OnceLock<bool>`.
+#[inline]
+fn aes_dbg() -> bool {
+    tamarin_utils::env_gate!("TAM_RS_DBG_APPLY_EQ_STORE")
 }
-
-cached_env_flag!(aes_dbg, "TAM_RS_DBG_APPLY_EQ_STORE");
 /// `TAM_RS_DBG_APPLY_EQ_STORE_FILTER` selects the "substantive" filter by
 /// exact value, so cache the equality test (not a bare `.is_ok()`).
 #[inline]
@@ -148,21 +136,46 @@ fn aes_dbg_filter_substantive() -> bool {
     *V.get_or_init(|| std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
         .map(|s| s == "substantive").unwrap_or(false))
 }
-cached_env_flag!(aes_dbg_variant, "TAM_DBG_AES_VARIANT");
-cached_env_flag!(aes_dbg_detail, "TAM_RS_DBG_AES_DETAIL");
-cached_env_flag!(aes_dbg_raw_unifier, "TAM_DBG_RAW_UNIFIER");
-cached_env_flag!(aes_dbg_variants, "TAM_DBG_AES_VARIANTS");
-cached_env_flag!(aes_dbg_bad_disj, "TAM_DBG_BAD_DISJ");
-cached_env_flag!(aes_dbg_add_disj_full, "TAM_DBG_ADD_DISJ_FULL");
-cached_env_flag!(aes_dbg_add_disj, "TAM_DBG_ADD_DISJ");
-cached_env_flag!(
-    /// `TAM_TRACE_SET_FALSE` debug flag (opt-IN), read on the solve-path
-    /// `set_false`.  Cached so the steady-state cost is an atomic load.
-    aes_trace_set_false, "TAM_TRACE_SET_FALSE");
-cached_env_flag!(
-    /// `TAM_TRACE_SET_FALSE_FULL` debug flag (opt-IN), read on the solve-path
-    /// `set_false`.  Cached so the steady-state cost is an atomic load.
-    aes_trace_set_false_full, "TAM_TRACE_SET_FALSE_FULL");
+#[inline]
+fn aes_dbg_variant() -> bool {
+    tamarin_utils::env_gate!("TAM_DBG_AES_VARIANT")
+}
+#[inline]
+fn aes_dbg_detail() -> bool {
+    tamarin_utils::env_gate!("TAM_RS_DBG_AES_DETAIL")
+}
+#[inline]
+fn aes_dbg_raw_unifier() -> bool {
+    tamarin_utils::env_gate!("TAM_DBG_RAW_UNIFIER")
+}
+#[inline]
+fn aes_dbg_variants() -> bool {
+    tamarin_utils::env_gate!("TAM_DBG_AES_VARIANTS")
+}
+#[inline]
+fn aes_dbg_bad_disj() -> bool {
+    tamarin_utils::env_gate!("TAM_DBG_BAD_DISJ")
+}
+#[inline]
+fn aes_dbg_add_disj_full() -> bool {
+    tamarin_utils::env_gate!("TAM_DBG_ADD_DISJ_FULL")
+}
+#[inline]
+fn aes_dbg_add_disj() -> bool {
+    tamarin_utils::env_gate!("TAM_DBG_ADD_DISJ")
+}
+/// `TAM_TRACE_SET_FALSE` debug flag (opt-IN), read on the solve-path
+/// `set_false`.  Cached so the steady-state cost is an atomic load.
+#[inline]
+fn aes_trace_set_false() -> bool {
+    tamarin_utils::env_gate!("TAM_TRACE_SET_FALSE")
+}
+/// `TAM_TRACE_SET_FALSE_FULL` debug flag (opt-IN), read on the solve-path
+/// `set_false`.  Cached so the steady-state cost is an atomic load.
+#[inline]
+fn aes_trace_set_false_full() -> bool {
+    tamarin_utils::env_gate!("TAM_TRACE_SET_FALSE_FULL")
+}
 
 // debug-only keyed registry; never reaches prover output;
 // std kept (byte-inert) — iteration order never reaches output.

@@ -260,8 +260,8 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
                 (v.clone(), Term::Lit(Lit::Var(v_new)))
             })
             .collect();
-        // `from_list(to_list() ++ new_entries)` rebuilt the whole map from a
-        // Vec; the keys are disjoint (`vs_new` excludes `dom self`), so
+        // `from_list(to_list() ++ new_entries)` would rebuild the whole map from
+        // a Vec; the keys are disjoint (`vs_new` excludes `dom self`), so
         // cloning the map and inserting the new entries yields the identical
         // BTreeMap without the intermediate Vec + re-sort.
         let mut map = self.map.clone();
@@ -315,8 +315,9 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
             rename.insert(old.clone(), new);
         }
         let mut pairs: Vec<(LVar, VTerm<C, LVar>)> = Vec::with_capacity(self.len());
-        // Borrowing walk: every range term is rebuilt by the rename anyway,
-        // so cloning the entries first (`to_list`) was pure churn.
+        // Borrowing walk: the rename rebuilds every range term anyway, so read
+        // the entries in place (`iter`) rather than cloning them up front with
+        // `to_list`.
         for (v, t) in self.iter() {
             let renamed = rename_lvars_in_vterm(t, &rename);
             pairs.push((v.clone(), renamed));
@@ -491,8 +492,8 @@ fn rename_lvars_with_hint<C: Ord + Clone, F: FnMut(u64) -> u64>(
 /// Mirrors HS `Term.Substitution.freeToFreshRaw` (Substitution.hs:84-85):
 /// considers all variables in the range as fresh.  No structural change —
 /// just a type-level reinterpretation, so the owned map moves across
-/// wholesale (`SubstVFresh::from_list` does no trivial-drop; the
-/// `from_list(to_list)` round-trip rebuilt the identical map from clones).
+/// wholesale (`SubstVFresh::from_list` does no trivial-drop; a
+/// `from_list(to_list)` round-trip would rebuild the identical map from clones).
 pub fn free_to_fresh_raw<C: Ord + Clone>(s: crate::subst::Subst<C, LVar>)
     -> LSubstVFresh<C>
 {

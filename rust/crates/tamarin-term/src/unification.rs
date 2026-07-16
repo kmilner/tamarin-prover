@@ -316,7 +316,7 @@ where
     C: Ord + Clone,
     F: Fn(&C) -> LSort,
 {
-    if occurs_lvar(&v, &t) {
+    if crate::vterm::occurs_vterm(&v, &t) {
         return Err(UnifyError::NoUnifier);
     }
     if !sort_geq_lterm(sort_of_const, &v, &t) {
@@ -332,16 +332,6 @@ where
     }
     acc.insert(v, t);
     Ok(())
-}
-
-/// `occurs v t` for an `LTerm` — direct recursion (avoids the generic
-/// `HasFrees` machinery so we don't have to thread its trait bounds).
-fn occurs_lvar<C>(v: &LVar, t: &LTerm<C>) -> bool {
-    match t {
-        Term::Lit(Lit::Var(w)) => w == v,
-        Term::Lit(Lit::Con(_)) => false,
-        Term::App(_, args) => args.iter().any(|a| occurs_lvar(v, a)),
-    }
 }
 
 fn sort_geq_lterm<C, F: Fn(&C) -> LSort>(sort_of_const: &F, v: &LVar, t: &LTerm<C>) -> bool {
