@@ -1,4 +1,7 @@
+# NOTE: THIS HAS BEEN MOVED TO https://github.com/kmilner/tamarin-rs
+
 # tamarin-prover (Rust port)
+# NOTE: THIS HAS BEEN MOVED TO https://github.com/kmilner/tamarin-rs
 
 A Rust port of the [Tamarin Prover](https://tamarin-prover.github.io/) that
 reproduces the Haskell prover's output byte-for-byte — and is typically
@@ -27,6 +30,7 @@ utils → term → parser → theory → {sapic, server} → tamarin-prover
 binary; `accountability` sits alongside `sapic` in the translation layer.)
 
 ## Build
+# NOTE: THIS HAS BEEN MOVED TO https://github.com/kmilner/tamarin-rs
 
 ```
 cd rust
@@ -37,6 +41,7 @@ cargo test               # Rust unit + integration tests
 The release profile uses `lto = "fat"` and `codegen-units = 1`.
 
 ## Parity status
+# NOTE: THIS HAS BEEN MOVED TO https://github.com/kmilner/tamarin-rs
 
 The correctness criterion is byte-identical raw `--prove` output, ignoring
 the volatile header lines (Git revision, compile time, processing time).
@@ -75,6 +80,7 @@ term-abbreviation picks on a few AC-heavy theories); these never appear in
 proof scripts, proof structure, or verdicts.
 
 ## Performance
+# NOTE: THIS HAS BEEN MOVED TO https://github.com/kmilner/tamarin-rs
 
 Wall-clock time and peak memory for both provers on eight representative
 theories, proving all lemmas (`--derivcheck-timeout=30`) on x86_64 Linux,
@@ -157,6 +163,7 @@ dominated by source saturation also speed up at a single core because
 refined sources are computed once and shared across lemmas.
 
 ## Implemented
+# NOTE: THIS HAS BEEN MOVED TO https://github.com/kmilner/tamarin-rs
 
 - **Parser:** full `.spthy` grammar — `macros:`, `predicates:`, `equations:`,
   `restrictions:`, `tactics:`, `heuristic:`, `#define`/`#include`
@@ -197,6 +204,7 @@ refined sources are computed once and shared across lemmas.
   intruder-rule variants dump), `test` (install self-check).
 
 ## Not yet ported
+# NOTE: THIS HAS BEEN MOVED TO https://github.com/kmilner/tamarin-rs
 
 - **`diff(...)` / `--diff`** — observational-equivalence mode.
 - Parse-only CLI flags: `--saturation`, `--open-chains`,
@@ -207,6 +215,7 @@ Theories using these features are tracked in `scripts/file_flags.tsv` and
 re-enter the gate automatically once the feature lands.
 
 ## Repository layout
+# NOTE: THIS HAS BEEN MOVED TO https://github.com/kmilner/tamarin-rs
 
 ```
 crates/
@@ -225,6 +234,7 @@ tests/                    cross-crate integration fixtures
 ```
 
 ## Testing
+# NOTE: THIS HAS BEEN MOVED TO https://github.com/kmilner/tamarin-rs
 
 `cargo test` runs the Rust suites; parity against the Haskell prover is the
 real correctness gate — `scripts/corpus_file_diff.sh` for batch mode,
