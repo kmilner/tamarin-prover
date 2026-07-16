@@ -1446,8 +1446,22 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 (pl, lr)
             };
 
-            if session.is_some() {
+            if let Some(sess) = &session {
                 use rayon::prelude::*;
+                // Single-flight per-source-key saturation: compute each
+                // distinct refined-source key ONCE and seed the session cache
+                // before the lemma fan-out below, so its concurrent workers all
+                // hit the restore path rather than each recomputing the
+                // identical saturation (HS computes `_crcRefinedSources` once
+                // per `ClosedRuleCache`, RuleItem.hs:64-69).  The predicate mirrors
+                // `run_lemma`'s `is_target`; the session skips lemmas that would
+                // emit a bare sorry (they never saturate).
+                let cache_disabled =
+                    tamarin_utils::env_gate!("TAM_RS_NO_SOURCE_CACHE");
+                sess.presaturate_shared_sources(
+                    cache_disabled,
+                    |name| prove_anything && lemma_matches(lemma_filter, name),
+                );
                 let specs: Vec<&tamarin_theory::theory::Lemma<_>> =
                     elaborated.lemmas().collect();
                 let mut out: Vec<(usize, tamarin_theory::pretty_theory::ProvedLemma, LemmaResult)> =

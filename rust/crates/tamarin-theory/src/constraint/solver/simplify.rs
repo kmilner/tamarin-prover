@@ -1175,8 +1175,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // candidate (no matching action assignment) skips the O(|formulas|) canon
     // walk entirely.  Laziness is unobservable: the table contents depend only
     // on the un-mutated stores, not on when they are built.
-    let dedup_tables = ImpliedDedupTables::new(
-        &red.sys.formulas, &red.sys.solved_formulas);
+    let dedup_tables = ImpliedDedupTables::new(&red.sys);
     for (vars, guards, body) in &universals {
         // Mirrors Haskell's `impliedFormulas`'s `prepare` partition
         // (`System.hs:1124-1126`): Action and Eq atoms drive matching,
@@ -1307,58 +1306,71 @@ fn implied_apply_canon_cow(f: &crate::guarded::Guarded)
     }
 }
 
-/// Lazily-built dedup tables for `insert_implied_formulas_pass`: the canon key
-/// (via `implied_apply_canon_cow`) plus its `fx_hash_one` prefilter hash for
-/// every existing formula / solved formula.
+/// Lazily-built dedup tables for `insert_implied_formulas_pass`: for every
+/// existing formula / solved formula, its canon key (via
+/// `implied_apply_canon_cow`) plus its `fx_hash_one` prefilter hash.
 ///
 /// Lazy (`OnceCell`, forced by the first candidate reaching dedup) because the
 /// stores are pass-invariant — `red.sys.formulas`/`solved_formulas` are never
 /// mutated inside the per-universal loop — so the contents are independent of
 /// WHEN the table is built, and a pass producing zero candidates skips the
-/// O(|formulas|) canon walk entirely.  `Cow` so an already-canonical stored
-/// formula is borrowed (zero clone); dedup compares content either way.
+/// canon walk entirely.
 ///
-/// The u64 hash rides along entries that are materialised (at most) once per
-/// pass — it is a per-entry prefilter, not a per-merge index (contrast the
+/// The actual `CanonTable` lives on the `System` (keyed by the per-store
+/// `formulas_stamp` / `solved_formulas_stamp`): the first force here consults
+/// that cache via [`System::formulas_canon_table`] /
+/// [`System::solved_formulas_canon_table`], reusing the cached generation
+/// verbatim on a stamp hit and otherwise rebuilding it incrementally
+/// (pointer-keyed entry reuse).  So a formula canoned once per `System` lineage
+/// is not recanoned per simplifier iteration.
+///
+/// The u64 hash is a per-entry prefilter, not a per-merge index (contrast the
 /// refuted goal-merge fingerprint bucket index): hash inequality proves canon
 /// inequality (`Hash`/`PartialEq` derive consistency), so the deep AST
 /// equality walk only runs on hash agreement.  Hashes never reach output.
 struct ImpliedDedupTables<'a> {
-    formulas: &'a [std::sync::Arc<crate::guarded::Guarded>],
-    solved: &'a [std::sync::Arc<crate::guarded::Guarded>],
-    formulas_canon: std::cell::OnceCell<Vec<(std::borrow::Cow<'a, crate::guarded::Guarded>, u64)>>,
-    solved_canon: std::cell::OnceCell<Vec<(std::borrow::Cow<'a, crate::guarded::Guarded>, u64)>>,
+    sys: &'a crate::constraint::system::System,
+    formulas_canon: std::cell::OnceCell<std::sync::Arc<crate::constraint::system::CanonTable>>,
+    solved_canon: std::cell::OnceCell<std::sync::Arc<crate::constraint::system::CanonTable>>,
 }
 
 impl<'a> ImpliedDedupTables<'a> {
-    fn new(
-        formulas: &'a [std::sync::Arc<crate::guarded::Guarded>],
-        solved: &'a [std::sync::Arc<crate::guarded::Guarded>],
-    ) -> Self {
+    fn new(sys: &'a crate::constraint::system::System) -> Self {
         ImpliedDedupTables {
-            formulas,
-            solved,
+            sys,
             formulas_canon: std::cell::OnceCell::new(),
             solved_canon: std::cell::OnceCell::new(),
         }
     }
 
-    fn build(
-        store: &'a [std::sync::Arc<crate::guarded::Guarded>],
-    ) -> Vec<(std::borrow::Cow<'a, crate::guarded::Guarded>, u64)> {
-        store.iter().map(|f| {
-            let c = implied_apply_canon_cow(f.as_ref());
-            let h = tamarin_utils::fx_hash_one(c.as_ref());
-            (c, h)
-        }).collect()
+    /// Canon closure for a single stored `Arc<Guarded>`: the `implied_apply_canon_cow`
+    /// key plus its prefilter hash, with the canon materialised as an `Arc` that
+    /// REUSES the source `Arc` when the canonicalisation is a structural no-op
+    /// (`Cow::Borrowed`) — a refcount bump, no extra tree.
+    fn canon(src: &std::sync::Arc<crate::guarded::Guarded>)
+        -> (std::sync::Arc<crate::guarded::Guarded>, u64)
+    {
+        let c = implied_apply_canon_cow(src.as_ref());
+        let h = tamarin_utils::fx_hash_one(c.as_ref());
+        let arc = match c {
+            std::borrow::Cow::Borrowed(_) => std::sync::Arc::clone(src),
+            std::borrow::Cow::Owned(g) => std::sync::Arc::new(g),
+        };
+        (arc, h)
     }
 
-    fn formulas_canon(&self) -> &[(std::borrow::Cow<'a, crate::guarded::Guarded>, u64)] {
-        self.formulas_canon.get_or_init(|| Self::build(self.formulas))
+    fn formulas_canon(&self) -> &[(std::sync::Arc<crate::guarded::Guarded>,
+                                   std::sync::Arc<crate::guarded::Guarded>, u64)] {
+        &self.formulas_canon
+            .get_or_init(|| self.sys.formulas_canon_table(Self::canon))
+            .entries
     }
 
-    fn solved_canon(&self) -> &[(std::borrow::Cow<'a, crate::guarded::Guarded>, u64)] {
-        self.solved_canon.get_or_init(|| Self::build(self.solved))
+    fn solved_canon(&self) -> &[(std::sync::Arc<crate::guarded::Guarded>,
+                                 std::sync::Arc<crate::guarded::Guarded>, u64)] {
+        &self.solved_canon
+            .get_or_init(|| self.sys.solved_formulas_canon_table(Self::canon))
+            .entries
     }
 }
 
@@ -1533,9 +1545,9 @@ fn try_match_all_guards(
             // so evaluation order cannot change the combined boolean.
             let canon_hash = tamarin_utils::fx_hash_one(canon.as_ref());
             let already = dedup_tables.formulas_canon().iter()
-                    .any(|(fc, fh)| *fh == canon_hash && fc.as_ref() == canon.as_ref())
+                    .any(|(_, fc, fh)| *fh == canon_hash && fc.as_ref() == canon.as_ref())
                 || dedup_tables.solved_canon().iter()
-                    .any(|(fc, fh)| *fh == canon_hash && fc.as_ref() == canon.as_ref())
+                    .any(|(_, fc, fh)| *fh == canon_hash && fc.as_ref() == canon.as_ref())
                 || out_canon.iter()
                     .any(|(fc, fh)| *fh == canon_hash && fc == canon.as_ref());
             if !already {

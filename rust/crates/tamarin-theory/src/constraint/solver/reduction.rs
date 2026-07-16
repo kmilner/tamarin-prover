@@ -180,6 +180,14 @@ pub struct Reduction<'ctx> {
     /// goal solvers alongside `Cases`; empty means "no counters recorded"
     /// (callers fall back to bounds_max seeding).
     pub last_case_counters: Vec<u64>,
+    /// σ-as-`VarSubst` cache for the Atom mark=true dedup: `(subst_stamp,
+    /// var_subst_from_eq_store(σ))` at the time it was built.  σ is a pure
+    /// function of `sys.eq_store.subst`, and every subst mutation mints a
+    /// fresh `subst_stamp` (sealed axis: `set_eq_store`/`take_eq_store`/
+    /// `eq_store_mut` are the only doors), so a matching stamp proves the
+    /// cached value is bit-identical to a rebuild.  Sub-Reductions start
+    /// `None` and rebuild on first use (conservative miss only).
+    eq_vs_cache: Option<(u64, crate::guarded::VarSubst)>,
 }
 
 /// `ChangeIndicator` mirrors the `True`/`False` flag the Haskell
@@ -278,6 +286,7 @@ impl<'ctx> Reduction<'ctx> {
             pending_eq_arms: Vec::new(),
             pending_conjoin_arm_systems: Vec::new(),
             last_case_counters: Vec::new(),
+            eq_vs_cache: None,
         }
     }
 
@@ -312,6 +321,7 @@ impl<'ctx> Reduction<'ctx> {
             pending_eq_arms: Vec::new(),
             pending_conjoin_arm_systems: Vec::new(),
             last_case_counters: Vec::new(),
+            eq_vs_cache: None,
         }
     }
 
@@ -993,7 +1003,7 @@ impl<'ctx> Reduction<'ctx> {
             let bot = crate::guarded::gfalse();
             if !crate::guarded::stores_contains(&self.sys.formulas, &bot) {
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.content_mut_untracked().formulas.push(std::sync::Arc::new(bot));
+                self.sys.formulas_mut_untracked().push(std::sync::Arc::new(bot));
                 self.changed = ChangeIndicator::Changed;
             }
             // Also flip `eq_store.is_false` so the simplify-time filter
@@ -1472,7 +1482,7 @@ impl<'ctx> Reduction<'ctx> {
             // `dedup_preserve_order` calls below drop only formulas EQUAL
             // to kept ones, which cannot change the max free-var idx.
             // (Declared above the enclosing `if` for the `raised` return.)
-            for f in self.sys.content_mut_untracked().formulas.iter_mut() {
+            for f in self.sys.formulas_mut_untracked().iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
                     if new_f != **f {
                         *f = std::sync::Arc::new(new_f);
@@ -1481,7 +1491,7 @@ impl<'ctx> Reduction<'ctx> {
                     }
                 }
             }
-            for f in self.sys.content_mut_untracked().solved_formulas.iter_mut() {
+            for f in self.sys.solved_formulas_mut_untracked().iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
                     if new_f != **f {
                         *f = std::sync::Arc::new(new_f);
@@ -1528,8 +1538,8 @@ impl<'ctx> Reduction<'ctx> {
             // also differs).  This fix is a real HS-faithfulness gap that
             // happens to be load-bearing for many other lemmas via
             // formula-count parity.
-            dedup_preserve_order(&mut self.sys.content_mut_untracked().formulas);
-            dedup_preserve_order(&mut self.sys.content_mut_untracked().solved_formulas);
+            dedup_preserve_order(self.sys.formulas_mut_untracked());
+            dedup_preserve_order(self.sys.solved_formulas_mut_untracked());
             dedup_preserve_order(&mut self.sys.content_mut_untracked().lemmas);
         }
         // 5b. SubtermStore substitution — port of Haskell's
@@ -2320,7 +2330,15 @@ impl<'ctx> Reduction<'ctx> {
                 // witness LVars `~mw#N → ~mw#0`, then alpha-canon
                 // GGuarded bound vars).
                 if mark {
-                    let eq_vs = crate::guarded::var_subst_from_eq_store(&self.sys.eq_store);
+                    // σ rebuilt only when the subst axis moved since the
+                    // cached copy (see `eq_vs_cache`); a stamp hit is
+                    // bit-identical to `var_subst_from_eq_store` here.
+                    let stamp = self.sys.subst_stamp();
+                    if !matches!(&self.eq_vs_cache, Some((s, _)) if *s == stamp) {
+                        self.eq_vs_cache = Some((stamp,
+                            crate::guarded::var_subst_from_eq_store(&self.sys.eq_store)));
+                    }
+                    let eq_vs = &self.eq_vs_cache.as_ref().expect("just ensured").1;
                     // COW canon.  `normalize_bound_lvars` is an identity clone
                     // applied to BOTH sides of the `==`, so it never changes the
                     // dedup boolean — drop it (matching the `implied_apply_canon`
@@ -2347,9 +2365,9 @@ impl<'ctx> Reduction<'ctx> {
                             Some(g) => std::borrow::Cow::Owned(g),
                         }
                     }
-                    let canon = apply_canon(&g, &eq_vs);
+                    let canon = apply_canon(&g, eq_vs);
                     let already_solved = self.sys.solved_formulas.iter().any(|f|
-                        apply_canon(f, &eq_vs).as_ref() == canon.as_ref());
+                        apply_canon(f, eq_vs).as_ref() == canon.as_ref());
                     if !already_solved {
                         // Pure ADD (solved-formula push under
                         // !already_solved): bump.
@@ -3947,8 +3965,37 @@ fn bm_term(t: &tamarin_term::lterm::LNTerm, max: &mut u64) {
 
 #[inline(always)]
 fn bm_fact(fa: &crate::fact::LNFact, max: &mut u64) {
-    for t in &fa.terms {
-        bm_term(t, max);
+    // Per-fact cached max-var-idx fast-path: `Fact::fresh`/`fresh_annotated`
+    // compute the EXACT max free-var idx of `fa.terms` in the same
+    // `for_each_free` walk that builds the bloom (fact.rs `fact_fingerprints`),
+    // and the value survives every unchanged pass.  On a cache hit fold that
+    // single `u64` — a cached `0` (no frees, or a free var at idx 0) folds to
+    // the same no-op the per-term descent performs.  The `u64::MAX` sentinel
+    // (the no-`HasFrees` `Fact::new`/`map` constructors) falls back to the walk.
+    match fa.max_var_cached() {
+        Some(m) => {
+            if tamarin_utils::env_gate!("TAM_RS_VERIFY_FACT_MAX") {
+                // Opt-in independent oracle for the `Fact::max_var` cache
+                // (`TAM_RS_VERIFY_FACT_MAX=1`): recompute the fact's own max
+                // via the real per-term walk and panic on any mismatch with
+                // the cached value.
+                let mut walked = 0u64;
+                for t in &fa.terms { bm_term(t, &mut walked); }
+                if walked != m {
+                    panic!(
+                        "TAM_RS_VERIFY_FACT_MAX: cached max_var {} != walked max {} \
+                         — stale/wrong per-fact max cache",
+                        m, walked,
+                    );
+                }
+            }
+            if m > *max { *max = m; }
+        }
+        None => {
+            for t in &fa.terms {
+                bm_term(t, max);
+            }
+        }
     }
 }
 

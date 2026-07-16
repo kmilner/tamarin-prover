@@ -135,8 +135,9 @@ struct MaudeProcessInner {
     /// booleans).
     match_empty_cache: tamarin_utils::FastMap<(Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>), ()>,
     /// Memo for the RAW REPLY BYTES of the witness-producing Maude commands
-    /// (`unify in MSG`, `variant unify in MSG`, `get variants in MSG`), keyed
-    /// by the *exact command byte-string*.  Maude's reply to one of these
+    /// (`unify in MSG`, `variant unify in MSG`, `get variants in MSG`, and the
+    /// three `match in MSG` matchers), keyed by the *exact command
+    /// byte-string*.  Maude's reply to one of these
     /// commands is a deterministic, command-local function of the theory
     /// module — which is fixed for the life of this `MaudeProcessInner`
     /// (`sig` is immutable after `start()`; `with_swapped_maude` hands out a
@@ -158,8 +159,9 @@ struct MaudeProcessInner {
     /// `Arc<Mutex<MaudeProcessInner>>` drops at session end; it is NOT a
     /// process-global cache and does not accumulate across sessions.  The
     /// distinct-command population per session is small (a theory issues only a
-    /// handful of distinct `get variants` / `unify` queries; the win is from
-    /// heavy DUPLICATION of those few), so peak residency stays bounded even
+    /// handful of distinct `get variants` / `unify` queries, and fixpoint
+    /// passes re-issue the same `match` commands; the win is from heavy
+    /// DUPLICATION of those few), so peak residency stays bounded even
     /// though — like `reduce_cache` — no per-entry eviction is performed.
     reply_cache: tamarin_utils::FastMap<Vec<u8>, Vec<u8>>,
 }
@@ -1042,8 +1044,7 @@ impl MaudeHandle {
         // formatting the borrowed slice directly without a `Vec`+`Arc`
         // round-trip.
         let cmd = pp_match_cmd(&pats, &subjs);
-        let reply = inner.execute(&cmd)?;
-        inner.stats.match_count += 1;
+        let reply = inner.execute_memo(&cmd, |s| s.match_count += 1)?;
         drop(inner);
         _tally_callsite("match_eqs");
         let msubsts = maude_parse::parse_match_reply(&reply)?;
@@ -1146,8 +1147,7 @@ impl MaudeHandle {
         // (Term/Maude.hs matchCmd).  Sibling `match_eqs_skolemize_both`
         // uses the same order.
         let cmd = pp_match_cmd(&t1s, &t2s);
-        let reply = inner.execute(&cmd)?;
-        inner.stats.match_count += 1;
+        let reply = inner.execute_memo(&cmd, |s| s.match_count += 1)?;
         drop(inner);
         _tally_callsite("match_eqs_const_subject");
         let msubsts = maude_parse::parse_match_reply(&reply)?;
@@ -1275,8 +1275,7 @@ impl MaudeHandle {
         // flipped fields.  So all three matchers emit pattern-on-the-left,
         // which is what Maude requires (vars bind in the left operand).
         let cmd = pp_match_cmd(&pats, &subjs);
-        let reply = inner.execute(&cmd)?;
-        inner.stats.match_count += 1;
+        let reply = inner.execute_memo(&cmd, |s| s.match_count += 1)?;
         drop(inner);
         _tally_callsite("match_eqs_skolemize_both");
         let msubsts = maude_parse::parse_match_reply(&reply)?;

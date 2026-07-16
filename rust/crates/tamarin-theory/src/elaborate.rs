@@ -1164,6 +1164,8 @@ fn elaborate_items(
     Ok(())
 }
 
+/// Map a parser-AST lemma attribute to the elaborated form (the two enums
+/// are 1:1).  `pub` for `tamarin-accountability`'s lemma injection.
 pub fn elaborate_lemma_attr(a: &p::LemmaAttr) -> LemmaAttr {
     match a {
         p::LemmaAttr::Sources => LemmaAttr::Sources,

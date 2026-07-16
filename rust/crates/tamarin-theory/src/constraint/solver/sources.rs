@@ -2603,8 +2603,8 @@ fn freshen_system(
     let shift_g = |g: &crate::guarded::Guarded| {
         crate::guarded::map_lvars_in_guarded(g, shift_parser_var)
     };
-    out.content_mut_untracked().formulas = out.formulas.iter().map(|g| std::sync::Arc::new(shift_g(g))).collect();
-    out.content_mut_untracked().solved_formulas = out.solved_formulas.iter().map(|g| std::sync::Arc::new(shift_g(g))).collect();
+    *out.formulas_mut_untracked() = out.formulas.iter().map(|g| std::sync::Arc::new(shift_g(g))).collect();
+    *out.solved_formulas_mut_untracked() = out.solved_formulas.iter().map(|g| std::sync::Arc::new(shift_g(g))).collect();
     out.content_mut_untracked().lemmas = out.lemmas.iter().map(|g| std::sync::Arc::new(shift_g(g))).collect();
     // Eq-store: shift both domain LVars and range terms.  This whole
     // freshening is HS `rename` (Monotone), so range-term shifts preserve
@@ -3188,10 +3188,10 @@ fn freshen_system_keep_with_shift(
     // traverses ALL 13 fields — without this, post-freshen formulas/
     // lemmas reference pre-freshen var idxs and collide with live
     // post-shift node/edge idxs.
-    out.content_mut_untracked().formulas = std::mem::take(&mut out.content_mut_untracked().formulas).into_iter()
+    *out.formulas_mut_untracked() = std::mem::take(out.formulas_mut_untracked()).into_iter()
         .map(|g| std::sync::Arc::new(crate::guarded::map_lvars_in_guarded(&g, &shift_vs)))
         .collect();
-    out.content_mut_untracked().solved_formulas = std::mem::take(&mut out.content_mut_untracked().solved_formulas).into_iter()
+    *out.solved_formulas_mut_untracked() = std::mem::take(out.solved_formulas_mut_untracked()).into_iter()
         .map(|g| std::sync::Arc::new(crate::guarded::map_lvars_in_guarded(&g, &shift_vs)))
         .collect();
     out.content_mut_untracked().lemmas = std::mem::take(&mut out.content_mut_untracked().lemmas).into_iter()
@@ -3545,10 +3545,10 @@ fn freshen_system_some_inst(
     if let Some(la) = out.content_mut_untracked().last_atom.take() {
         out.content_mut_untracked().last_atom = Some(lookup(&la));
     }
-    out.content_mut_untracked().formulas = std::mem::take(&mut out.content_mut_untracked().formulas).into_iter()
+    *out.formulas_mut_untracked() = std::mem::take(out.formulas_mut_untracked()).into_iter()
         .map(|g| std::sync::Arc::new(crate::guarded::map_lvars_in_guarded(&g, &lookup_vs)))
         .collect();
-    out.content_mut_untracked().solved_formulas = std::mem::take(&mut out.content_mut_untracked().solved_formulas).into_iter()
+    *out.solved_formulas_mut_untracked() = std::mem::take(out.solved_formulas_mut_untracked()).into_iter()
         .map(|g| std::sync::Arc::new(crate::guarded::map_lvars_in_guarded(&g, &lookup_vs)))
         .collect();
     out.content_mut_untracked().lemmas = std::mem::take(&mut out.content_mut_untracked().lemmas).into_iter()

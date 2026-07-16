@@ -1433,69 +1433,75 @@ fn non_injective_fact_instances(
 /// exists.
 fn has_sort_conflated_lvars(sys: &System) -> bool {
     use tamarin_term::lterm::{HasFrees, LSort, LVar};
-    use std::cell::RefCell;
-    let seen: RefCell<BTreeMap<(String, u64), LSort>> = RefCell::new(BTreeMap::new());
-    let conflict: RefCell<bool> = RefCell::new(false);
-    let mut visit = |v: &LVar| {
-        if *conflict.borrow() { return; }
-        let mut s = seen.borrow_mut();
-        let key = (v.name.to_string(), v.idx);
-        match s.get(&key).copied() {
-            None => { s.insert(key, v.sort); }
-            Some(prev) if prev == v.sort => {}
-            Some(prev) => {
-                // Two distinct sorts at same (name, idx).  Pub/Fresh/
-                // Nat are disjoint; pairs that include Msg can be
-                // narrowed (Msg is the join), so don't flag those.
-                let disjoint = matches!((prev, v.sort),
-                    (LSort::Pub, LSort::Fresh) | (LSort::Fresh, LSort::Pub) |
-                    (LSort::Pub, LSort::Nat)   | (LSort::Nat, LSort::Pub) |
-                    (LSort::Fresh, LSort::Nat) | (LSort::Nat, LSort::Fresh));
-                if disjoint {
-                    *conflict.borrow_mut() = true;
+    // `LVar.name` is an interned `&'static str` (Copy), so the seen-map key
+    // is allocation-free; `&str` hashing/equality is by content, so equal
+    // names share one entry even across distinct interned pointers.  The
+    // first-seen sort wins for each `(name, idx)` key.
+    struct SortSeen {
+        seen: tamarin_utils::FastMap<(&'static str, u64), LSort>,
+        conflict: bool,
+    }
+    impl SortSeen {
+        fn visit(&mut self, v: &LVar) {
+            if self.conflict { return; }
+            match self.seen.get(&(v.name, v.idx)).copied() {
+                None => { self.seen.insert((v.name, v.idx), v.sort); }
+                Some(prev) if prev == v.sort => {}
+                Some(prev) => {
+                    // Two distinct sorts at same (name, idx).  Pub/Fresh/
+                    // Nat are disjoint; pairs that include Msg can be
+                    // narrowed (Msg is the join), so don't flag those.
+                    let disjoint = matches!((prev, v.sort),
+                        (LSort::Pub, LSort::Fresh) | (LSort::Fresh, LSort::Pub) |
+                        (LSort::Pub, LSort::Nat)   | (LSort::Nat, LSort::Pub) |
+                        (LSort::Fresh, LSort::Nat) | (LSort::Nat, LSort::Fresh));
+                    if disjoint {
+                        self.conflict = true;
+                    }
                 }
             }
         }
-    };
+        /// [`SortSeen::visit`] every free `LVar` of `x`.
+        fn scan(&mut self, x: &impl HasFrees) {
+            x.for_each_free(&mut |v: &LVar| self.visit(v));
+        }
+    }
+    let mut st = SortSeen { seen: tamarin_utils::FastMap::default(), conflict: false };
     for (id, rule) in sys.nodes.iter() {
-        id.for_each_free(&mut visit);
-        rule.for_each_free(&mut visit);
-        if *conflict.borrow() { return true; }
+        st.scan(id);
+        st.scan(rule);
+        if st.conflict { return true; }
     }
     for e in &sys.edges {
-        e.src.0.for_each_free(&mut visit);
-        e.tgt.0.for_each_free(&mut visit);
-        if *conflict.borrow() { return true; }
+        st.scan(&e.src.0);
+        st.scan(&e.tgt.0);
+        if st.conflict { return true; }
     }
     for l in &sys.less_atoms {
-        l.smaller.for_each_free(&mut visit);
-        l.larger.for_each_free(&mut visit);
-        if *conflict.borrow() { return true; }
+        st.scan(&l.smaller);
+        st.scan(&l.larger);
+        if st.conflict { return true; }
     }
-    if let Some(la) = &sys.last_atom { la.for_each_free(&mut visit); }
+    if let Some(la) = &sys.last_atom { st.scan(la); }
     for (g, _) in sys.goals.iter() {
         match g {
             crate::constraint::constraints::Goal::Action(n, fa) => {
-                n.for_each_free(&mut visit);
-                fa.for_each_free(&mut visit);
+                st.scan(n);
+                st.scan(fa);
             }
             crate::constraint::constraints::Goal::Premise(p, fa) => {
-                p.0.for_each_free(&mut visit);
-                fa.for_each_free(&mut visit);
+                st.scan(&p.0);
+                st.scan(fa);
             }
             crate::constraint::constraints::Goal::Chain(c, p) => {
-                c.0.for_each_free(&mut visit);
-                p.0.for_each_free(&mut visit);
+                st.scan(&c.0);
+                st.scan(&p.0);
             }
             _ => {}
         }
-        if *conflict.borrow() { return true; }
+        if st.conflict { return true; }
     }
-    // Copy the bool out first so the `Ref` temporary drops before `conflict`
-    // at end of scope; a direct `*conflict.borrow()` tail would outlive
-    // `conflict` (E0597).
-    let c = *conflict.borrow();
-    c
+    st.conflict
 }
 
 /// Has the system's formula list been forced to ⊥?

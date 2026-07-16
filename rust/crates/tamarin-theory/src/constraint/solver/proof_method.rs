@@ -233,6 +233,26 @@ fn process_cases(ctx: &ProofContext, cases: Vec<(String, System)>) -> Vec<(Strin
     distinguish_case_names(remove_redundant_cases_ctx(ctx, |p: &(String, System)| &p.1, cases))
 }
 
+/// Opt-in hit/miss counters for the Simplify no-op shortcut
+/// (`TAM_RS_SIMP_NOOP_STATS=1`); prints every 1000 Simplify execs.
+fn simp_noop_stat(hit: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    if !tamarin_utils::env_gate!("TAM_RS_SIMP_NOOP_STATS") {
+        return;
+    }
+    if hit {
+        HITS.fetch_add(1, Relaxed);
+    }
+    let calls = CALLS.fetch_add(1, Relaxed) + 1;
+    if calls % 1_000 == 0 {
+        let h = HITS.load(Relaxed);
+        eprintln!("[SIMP_NOOP_STATS] simplify_execs={} noop_hits={} ({:.1}%)",
+            calls, h, 100.0 * h as f64 / calls as f64);
+    }
+}
+
 /// Execute a proof method against `sys`, returning the resulting
 /// case list in dispatch order. `Sorry` / `Finished` produce empty
 /// cases; `Simplify` runs the simplify fan-out and returns one case
@@ -338,6 +358,30 @@ pub fn exec_proof_method(
             // Cases outcome was discarded.
             let case_systems: Vec<System> =
                 crate::constraint::solver::simplify::simplify_system_with_fanout(ctx, sys.clone());
+            // No-op shortcut: mid-proof, every case system was already
+            // simplified+cleaned at production, so `simplifySystem` usually
+            // fixpoints immediately — one output case value-equal to the
+            // input.  The arm's remaining work is then fully determined:
+            // the is_false filter drops the case (empty case-map => Simplify
+            // succeeds with zero cases, see below) or, `cleanup` being a
+            // pure function of the System value, `cleaned[0] ==
+            // cleaned_input` holds and the single-case check returns None.
+            // Skipping straight to those answers elides two full
+            // `rename_precise` passes, a System clone, and the final O(S)
+            // compare per open node (Simplify is ranked first at EVERY
+            // node).  The value compare is cheap on the hit path: a no-op
+            // simplify never triggered COW, so the Arcs are shared and Term
+            // eq takes the ptr fast path.  `TAM_RS_NO_SIMP_NOOP_SKIP=1`
+            // disables the shortcut (A/B oracle); `TAM_RS_SIMP_NOOP_STATS=1`
+            // reports the hit rate.
+            if !tamarin_utils::env_gate!("TAM_RS_NO_SIMP_NOOP_SKIP")
+                && case_systems.len() == 1
+                && case_systems[0] == *sys
+            {
+                simp_noop_stat(true);
+                return if sys.eq_store.is_false() { Some(Vec::new()) } else { None };
+            }
+            simp_noop_stat(false);
             // HS-faithful `cleanup` (ProofMethod.hs): EVERY
             // proof method's cases pass through `map (fmap cleanup .
             // fst)`, and `Simplify` goes through `process` — so its

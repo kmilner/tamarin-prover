@@ -736,6 +736,92 @@ impl ProverSession {
         }
         cache_hit
     }
+
+    /// Pre-fan-out single-flight saturation (lever #3): compute each DISTINCT
+    /// `source_key`'s refined-source cases ONCE (sequentially over keys) and
+    /// seed the session `source_cache` BEFORE the per-lemma proof fan-out, so
+    /// the concurrent fan-out lemmas all take the cache-hit restore arm of
+    /// [`Self::restore_or_saturate_sources`] rather than each recomputing the
+    /// identical `saturate_sources_with_simp` pass.  HS computes
+    /// `_crcRefinedSources` ONCE per `ClosedRuleCache` and reuses it for every
+    /// lemma (RuleItem.hs:64-69, Prover.hs:170-184); without this pre-pass the
+    /// rayon fan-out duplicates that compute per lemma, because at
+    /// `processors >= 2` every worker misses — no sibling has finished writing
+    /// the cache yet.
+    ///
+    /// `is_target(name)` reports whether the batch selector targets a lemma
+    /// (HS `--prove` match).  A lemma saturates its `source_key` iff it is a
+    /// target OR carries a stored proof skeleton — exactly the fan-out's own
+    /// gate: see the `will_emit_bare_sorry` derivation in
+    /// [`prove_lemma_in_session_mode`], where a non-target lemma with no stored
+    /// tree emits a bare `sorry`, consults no source, and so never saturates.
+    /// Such a lemma MUST NOT seed a key here, or the pre-pass would pay a full
+    /// saturation for work the fan-out skips (the spdm121 `--prove=<no match>`
+    /// 61s-vs-0.7s precedent).
+    ///
+    /// Seeding reuses [`Self::restore_or_saturate_sources`] verbatim, so its
+    /// `delta == 0` write gate stays the single source of truth: the pre-pass
+    /// caches exactly the keys the fan-out would.  Because `setup_per_lemma_ctx`
+    /// floors every clone's fresh counter at the shared `setup_counter_before`
+    /// base, the representative lemma computes the same cases any fan-out lemma
+    /// of the key would (the `CachedSources` are a pure function of the key) —
+    /// so this only converts concurrent misses into hits, changing nothing
+    /// else.  `ensure_saturated` restores the fresh counter before returning
+    /// (see its tail in context.rs), so `delta` is 0 for every key and every
+    /// saturating key is cached.
+    ///
+    /// Runs on the caller's thread before the fan-out; re-installs the
+    /// user-fn-symbol thread-locals for its `formula_to_guarded` calls (same
+    /// rationale as `prove_lemma_in_session_mode`).  Returns the number of
+    /// DISTINCT keys saturated — the count of `saturate_sources_with_simp`
+    /// passes the pre-pass runs (one per distinct key rather than one per
+    /// lemma).  `cache_disabled` (`TAM_RS_NO_SOURCE_CACHE`) makes it a no-op,
+    /// leaving every lemma on the per-lemma compute path.
+    pub fn presaturate_shared_sources(
+        &self,
+        cache_disabled: bool,
+        is_target: impl Fn(&str) -> bool,
+    ) -> usize {
+        if cache_disabled { return 0; }
+        let _lemma_user_funs_guard =
+            crate::elaborate::set_user_funs_from_collected(&self.user_funs);
+        let mut seen: tamarin_utils::FastSet<Vec<String>> =
+            tamarin_utils::FastSet::default();
+        let mut saturated = 0usize;
+        for lemma in self.theory.lemmas() {
+            // Fan-out saturation gate (see `will_emit_bare_sorry`): a lemma
+            // consults its source cases — and so saturates its key — iff it is
+            // a `--prove` target OR carries a stored proof skeleton that
+            // `check_and_extend` replays.
+            if !(is_target(lemma.name.as_str()) || lemma.proof.tree.is_some()) {
+                continue;
+            }
+            let kind = lemma_source_kind(lemma);
+            // Compute the key (guarded-convert the prior `[sources]` lemmas)
+            // BEFORE the deep `template_ctx` clone, so a repeat key skips
+            // without cloning.  A non-guardable `[sources]`/typing formula
+            // errors here; the fan-out reproduces the identical per-lemma
+            // abort, so skip it in the pre-pass rather than preempting it.
+            let source_key = match gather_typing_assumptions(
+                &self.theory, lemma.name.as_str(), kind) {
+                Ok((_, key)) => key,
+                Err(_) => continue,
+            };
+            if !seen.insert(source_key) { continue; }
+            // First lemma of this key: build its per-lemma ctx and saturate +
+            // seed through the shared `delta == 0` gate.  The cache starts
+            // empty and `seen` skips repeats, so this always misses and
+            // computes.
+            let (mut ctx, key) = match self.setup_per_lemma_ctx(
+                lemma, lemma.name.as_str(), kind) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            self.restore_or_saturate_sources(&mut ctx, key, false);
+            saturated += 1;
+        }
+        saturated
+    }
 }
 
 /// Prove a single lemma using a pre-built `ProverSession`.  Skips the
@@ -1664,5 +1750,68 @@ end
         use crate::constraint::solver::search::NodeStatus;
         assert!(!matches!(root.status, NodeStatus::Open),
             "search must terminate within budget");
+    }
+
+    /// Build a `ProverSession` from theory source for the pre-pass tests.
+    fn session_from(src: &str) -> Option<ProverSession> {
+        let h = maude()?;
+        let pt = tamarin_parser::parse_theory(src, &[]).expect("parse");
+        ProverSession::build_with_in_file_and_heuristic(
+            &pt, h, None, "", CliHeuristic::default(),
+            crate::constraint::solver::context::CutStrategy::Dfs,
+        ).ok()
+    }
+
+    const SHARED_KEY_TWO_LEMMAS: &str = "theory T begin\n\
+rule R: [ Fr(~k) ] --[ A(~k) ]-> [ Out(~k) ]\n\
+lemma a: all-traces \"All k #i. A(k) @ #i ==> Ex #j. A(k) @ #j\"\n\
+lemma b: all-traces \"All k #i. A(k) @ #i ==> Ex #j. A(k) @ #j\"\n\
+end";
+
+    /// Two lemmas with the same (empty) `source_key` saturate ONCE in the
+    /// pre-pass, seed one cache entry, and a same-key lemma then restores it.
+    #[test]
+    fn presaturate_dedups_shared_source_key() {
+        let session = match session_from(SHARED_KEY_TWO_LEMMAS) { Some(s) => s, None => return };
+        // Both lemmas are RefinedSource with no prior `[sources]` lemma, so
+        // both carry the identical empty key — one saturation covers both.
+        let n = session.presaturate_shared_sources(false, |_| true);
+        assert_eq!(n, 1, "two lemmas sharing a key must saturate once");
+        assert_eq!(session.source_cache.lock().unwrap().len(), 1,
+            "exactly one refined-source set is cached");
+        // A fan-out lemma of the same key restores from the pre-seeded cache.
+        let lemma_b = session.theory.lookup_lemma("b").expect("lemma b");
+        let kind = lemma_source_kind(lemma_b);
+        let (mut ctx, key) = session.setup_per_lemma_ctx(lemma_b, "b", kind).expect("ctx");
+        let hit = session.restore_or_saturate_sources(&mut ctx, key, false);
+        assert!(hit, "lemma b must restore from the pre-seeded shared-key cache");
+    }
+
+    /// A lemma that would emit a bare `sorry` (not a `--prove` target and with
+    /// no stored proof tree) never saturates in the fan-out, so the pre-pass
+    /// must skip it — the spdm121 `--prove=<no match>` regression precedent.
+    #[test]
+    fn presaturate_skips_bare_sorry_lemmas() {
+        let session = match session_from(SHARED_KEY_TWO_LEMMAS) { Some(s) => s, None => return };
+        // Freshly parsed lemmas have no stored proof tree; with no target
+        // selected they emit a bare sorry and never consult a source.
+        let n = session.presaturate_shared_sources(false, |_| false);
+        assert_eq!(n, 0, "bare-sorry lemmas must not be pre-saturated");
+        assert!(session.source_cache.lock().unwrap().is_empty(),
+            "no key is seeded for bare-sorry lemmas");
+        // The SAME lemmas do saturate once they are `--prove` targets.
+        let n2 = session.presaturate_shared_sources(false, |_| true);
+        assert_eq!(n2, 1, "targeted lemmas saturate their shared key once");
+    }
+
+    /// `cache_disabled` (`TAM_RS_NO_SOURCE_CACHE`) bypasses the pre-pass
+    /// entirely, falling back to the per-lemma compute path.
+    #[test]
+    fn presaturate_disabled_is_noop() {
+        let session = match session_from(SHARED_KEY_TWO_LEMMAS) { Some(s) => s, None => return };
+        let n = session.presaturate_shared_sources(true, |_| true);
+        assert_eq!(n, 0, "the disabled pre-pass saturates nothing");
+        assert!(session.source_cache.lock().unwrap().is_empty(),
+            "the disabled pre-pass seeds no cache entries");
     }
 }

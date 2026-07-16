@@ -1279,7 +1279,7 @@ pub fn candidate_methods(
 /// [`candidate_methods`] minus the `stoppingMethod` guard, for callers that
 /// have ALREADY run [`is_finished`] on `sys` and got `None` (`expand_inner`
 /// checks the terminal case immediately before ranking): `is_finished` is
-/// the full contradiction sweep, and re-running it here doubled its cost on
+/// the full contradiction sweep, and a second sweep here doubles its cost on
 /// every expanded node (measured +7% wall on CCITT_X509_3).
 fn candidate_methods_open(
     sys: &System,

@@ -421,8 +421,8 @@ pub fn rename_precise_system(sys: &mut System) {
             v.dedup_by(|a, b| crate::guarded::cmp_guarded(a, b)
                 == std::cmp::Ordering::Equal);
         };
-        sort_dedup_guarded(&mut sys.content_mut_untracked().formulas, &formula_subst);
-        sort_dedup_guarded(&mut sys.content_mut_untracked().solved_formulas, &formula_subst);
+        sort_dedup_guarded(sys.formulas_mut_untracked(), &formula_subst);
+        sort_dedup_guarded(sys.solved_formulas_mut_untracked(), &formula_subst);
         sort_dedup_guarded(&mut sys.content_mut_untracked().lemmas, &formula_subst);
     }
 
