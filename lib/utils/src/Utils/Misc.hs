@@ -20,6 +20,7 @@ module Utils.Misc (
 
   -- * Hashing
   , stringSHA256
+  , lbsSHA256
 
   -- * Set operations
   , setAny
@@ -119,9 +120,13 @@ equivClasses =
 
 -- | The SHA-256 hash of a string in base64 notation.
 stringSHA256 :: String -> String
-stringSHA256 =
+stringSHA256 = lbsSHA256 . toLazyByteString . Utf8.fromString
+
+-- | The SHA-256 hash of a lazy ByteString in base64 notation.
+lbsSHA256 :: L.ByteString -> String
+lbsSHA256 =
     C8.unpack . urlEncodeBase64 . C8.concat . L.toChunks
-  . bytestringDigest . sha256 . toLazyByteString . Utf8.fromString
+  . bytestringDigest . sha256
   where
    urlEncodeBase64 = C8.init . C8.map replace . B64.encode
    replace '/' = '_'

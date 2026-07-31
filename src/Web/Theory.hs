@@ -59,11 +59,10 @@ import System.FilePath
 
 import Text.Blaze.Html (preEscapedToMarkup, toHtml)
 import Data.ByteString.Lazy qualified as BL
-import Data.ByteString.Lazy.Char8 qualified as BC (unpack)
 import Text.Dot qualified as D
 import Text.Hamlet (Html, hamlet)
 import Text.PrettyPrint.Html
-import Utils.Misc (stringSHA256)
+import Utils.Misc (lbsSHA256, stringSHA256)
 
 import System.Exit
 import System.Process hiding (system)
@@ -205,6 +204,20 @@ getDotPath code = imageDir </> addExtension (stringSHA256 code) "dot"
 -- | Generate the image file path for the final output.
 getGraphPath :: OutputFormat -> String -> FilePath
 getGraphPath ext code = imageDir </> addExtension (stringSHA256 code) (show ext)
+
+-- | Generate the cache-relative path for a UTF-8 JSON graph, keyed on the
+-- SHA-256 of its bytes.
+getJSONGraphPath :: BL.ByteString -> FilePath
+getJSONGraphPath json = imageDir </> addExtension (lbsSHA256 json) (show OutJSON)
+
+-- | Write a UTF-8 JSON graph without using locale-sensitive text I/O.
+writeJSONGraph :: FilePath -> BL.ByteString -> IO FilePath
+writeJSONGraph cacheDir_ json = do
+  let graphPath = cacheDir_ </> getJSONGraphPath json
+      jsonPath = addExtension graphPath "json"
+  createDirectoryIfMissing True (takeDirectory jsonPath)
+  BL.writeFile jsonPath json
+  return jsonPath
 
 -- | Create a link to a given theory path.
 linkToPath :: HtmlDocument d
@@ -1333,12 +1346,7 @@ graphJsonThyPath cacheDir_ showJsonGraphFunct abbreviate thy path = go path
         return jsonGraph
 
     renderJson :: BL.ByteString -> IO FilePath
-    renderJson str = do
-      let graphPath = cacheDir_ </> getGraphPath OutJSON (BC.unpack str)
-          jsonPath = addExtension graphPath ("json")
-      createDirectoryIfMissing True (takeDirectory jsonPath)
-      BL.writeFile jsonPath str
-      return jsonPath
+    renderJson = writeJSONGraph cacheDir_
 
 -- | Send the constraint system and the legend as JSON for diff theory and given path.
 graphJsonDiffThyPath :: FilePath                    -- ^ Tamarin's cache directory
@@ -1384,12 +1392,7 @@ graphJsonDiffThyPath cacheDir_ showJsonGraphFunct abbreviate thy path mirror = g
           else diffSequent._dsSystem
         return $ showJsonGraphFunct ("Theory: " ++ thy._diffThyName ++ " Lemma: " ++ lemma) sys
 
-    renderJson str = do
-      let graphPath = cacheDir_ </> getGraphPath OutJSON (BC.unpack str)
-          jsonPath = addExtension graphPath "json"
-      createDirectoryIfMissing True (takeDirectory jsonPath)
-      BL.writeFile jsonPath str
-      return jsonPath
+    renderJson = writeJSONGraph cacheDir_
 
 -- | Output either JSON or an image corresponding to the given theory path and return the generated file's path.
 -- Returns Nothing if there was an error during the image generation.
@@ -1404,11 +1407,14 @@ imgThyPath :: ImageFormat                  -- ^ The preferred image output forma
 imgThyPath imageFormat outputCommand cacheDir_ toDot toJSON thy thyPath =
     case thyPathSystem thyPath of
       Nothing -> return Nothing
-      Just (jsonLabel, system) -> do
-        let code = case outputCommand.ocFormat  of
-                     OutDot -> Left $ prefixedShowDot $ toDot system
-                     OutJSON -> Right $ toJSON jsonLabel system
-        renderGraphCode code
+      Just (jsonLabel, system) ->
+        case outputCommand.ocFormat of
+          OutDot ->
+            let dot = prefixedShowDot $ toDot system
+            in renderGraphCode (getGraphPath OutDot dot) (`writeFile` dot)
+          OutJSON ->
+            let json = toJSON jsonLabel system
+            in renderGraphCode (getJSONGraphPath json) (`BL.writeFile` json)
   where
     thyPathSystem :: TheoryPath -> Maybe (String, System)
     thyPathSystem (TheorySource k i j)          = casesSystem k i j
@@ -1438,9 +1444,9 @@ imgThyPath imageFormat outputCommand cacheDir_ toDot toJSON thy thyPath =
         ruleList :: HasRuleName (Rule i) => [Rule i] -> String
         ruleList = intercalate ", " . nub . map showRuleCaseName
 
-    -- Render a piece of dot (Left, textual) or JSON (Right, UTF-8 bytes) code
-    renderGraphCode code = do
-      let graphPath = cacheDir_ </> getGraphPath outputCommand.ocFormat (either id BC.unpack code)
+    -- Render a graph given its cache-relative path and an encoding-appropriate writer
+    renderGraphCode relGraphPath writeGraphFile = do
+      let graphPath = cacheDir_ </> relGraphPath
           imgPath = addExtension graphPath $ show imageFormat
 
           -- A busy wait loop with a maximal number of iterations
@@ -1465,7 +1471,7 @@ imgThyPath imageFormat outputCommand cacheDir_ toDot toJSON thy thyPath =
           renderedOrRendering 50,
           -- create dot-file and render to image
           do
-            either (writeFile graphPath) (BL.writeFile graphPath) code
+            writeGraphFile graphPath
             -- select the correct command to generate img
             case outputCommand.ocFormat of
               OutDot  -> dotToImg "dot" graphPath imgPath

@@ -22,9 +22,6 @@
    - make it work for observational equivalence
    - encode historic information in the graph: sequence of nodes added
 
-   OPEN PROBLEMS:
-   - JSON encodePretty converts < and > to "\u003c" and "\u003e"
-     ghastly postprocessing has been applied to sequentToJSONPretty
 -}
 
 module Theory.Constraint.System.JSON (
@@ -547,26 +544,26 @@ sequentsToJSONGraphs pretty systems =
       graphs = jsonGraphs
     }
 
--- | Generate JSON bytestring from an abstract graph.
-sequentsToJSON :: GraphOptions -> [(String, System)] -> BL.ByteString
-sequentsToJSON graphOptions systems =
-  let graphs = map (\(label, system) -> (label, systemToGraph system graphOptions , nodeColorMap (M.elems $ get sNodes system))) systems
-      graphJSON = sequentsToJSONGraphs False graphs
-  in
-    encode graphJSON
+-- | Convert systems to JSON graphs and encode them as UTF-8 bytes.
+-- Consumers must write the result with a byte-oriented writer (e.g.
+-- 'BL.writeFile'); round-tripping through String would either mangle
+-- non-ASCII characters (byte-per-Char unpacking) or depend on the locale
+-- encoding.
+encodeSequents :: Bool -> GraphOptions -> [(String, System)] -> BL.ByteString
+encodeSequents pretty graphOptions systems =
+  let graphs = map (\(label, system) -> (label, systemToGraph system graphOptions, nodeColorMap (M.elems $ get sNodes system))) systems
+      encoder = if pretty then removePseudoUnicode . encodePretty else encode
+  in encoder $ sequentsToJSONGraphs pretty graphs
 
--- | NOTE (dschoop): encodePretty encodes < and > as "\u003c" and "\u003e" respectively.
--- The encoding is removed with function removePseudoUnicode since Data.Strings.Util is non-standard.
--- The result stays a (UTF-8 encoded) ByteString all the way to the consumer,
--- which must write it with a byte-oriented writer (e.g. 'BL.writeFile');
--- round-tripping through String would either mangle non-ASCII characters
--- (byte-per-Char unpacking) or depend on the locale encoding.
+-- | Generate UTF-8 JSON bytes from an abstract graph.
+sequentsToJSON :: GraphOptions -> [(String, System)] -> BL.ByteString
+sequentsToJSON = encodeSequents False
+
+-- | Generate pretty-printed UTF-8 JSON bytes from an abstract graph, with
+-- encodePretty's Unicode escapes for angle brackets replaced by literal
+-- '<' and '>' via 'removePseudoUnicode'.
 sequentsToJSONPretty :: GraphOptions -> [(String, System)] -> BL.ByteString
-sequentsToJSONPretty graphOptions systems =
-  let graphs = map (\(label, system) -> (label, systemToGraph system graphOptions , nodeColorMap (M.elems $ get sNodes system))) systems
-      graphJSON = sequentsToJSONGraphs True graphs
-  in
-    removePseudoUnicode $ encodePretty graphJSON
+sequentsToJSONPretty = encodeSequents True
 
 -- | Generate JSON bytestring from an abstract graph and write to a file.
 writeSequentAsJSONToFile :: FilePath -> GraphOptions -> String -> System -> IO ()
