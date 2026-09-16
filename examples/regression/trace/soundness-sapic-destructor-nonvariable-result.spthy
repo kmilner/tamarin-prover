@@ -1,0 +1,21 @@
+theory SoundnessSapicDestructorNonvariableResult
+begin
+
+// Input-validation regression: SAPIC must reject the non-variable result of
+// this destructor equation. The lemmas describe its intended semantics if
+// support is added; the current translator must reject it before proving.
+
+functions: check/1 [destructor], valid/1, okay/0
+equations: check(valid(x)) = okay
+
+process:
+  new s;
+  let y = check(valid(s)) in event Success(y) else event Failure()
+
+lemma valid_succeeds: exists-trace
+  "Ex #i. Success(okay)@i"
+
+lemma no_valid_failure:
+  "All #i. Failure()@i ==> F"
+
+end

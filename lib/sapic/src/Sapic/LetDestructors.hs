@@ -12,9 +12,11 @@ module Sapic.LetDestructors
   ) where
 
 import           Data.Set as S
+import           Data.Either (partitionEithers)
 import           Data.Maybe (mapMaybe)
 
 import           Sapic.Annotation
+import           Sapic.Exceptions
 
 import           Theory
 import           Theory.Sapic
@@ -34,11 +36,15 @@ mapProc avoidTerms rules (ProcessComb c@(Let t1 t2 mv) _ pl pr) =
   case (t1, viewTerm t1', viewTerm t2') of
     (LIT (Var _) ,Lit (Var _), FApp funsym@(NoEq (_, (_,_,Destructor,_))) rightterms) ->
       -- we are in the case where the let binding is of the form let invar = dest(rightTerms) in
-      (case mapMaybe (findRule funsym) (S.toList rules) of
+      (case partitionEithers $ mapMaybe (findRule funsym) (S.toList rules) of
+        (_:_, _) -> throwM
+          (NotImplementedError
+            "SAPIC destructor equations with non-variable right-hand sides"
+            :: SapicException AnnotatedProcess)
         -- If the destructor has no associated rule, it can never succeed, so
         -- replace the let with its else branch.
-        [] -> mapProc avoidTerms rules pr
-        equations0 -> do
+        ([], []) -> mapProc avoidTerms rules pr
+        ([], equations0) -> do
           -- We extract the equation of the dest, in the case where it is of the
           -- form dest(lefTerms) = outvar.
 
@@ -92,12 +98,13 @@ mapProc avoidTerms rules (ProcessComb c ann pl pr) = do
 
 findRule :: FunSym
             -> CtxtStRule
-            -> Maybe ([Term (Lit Name LVar)], LVar)
+            -> Maybe (Either () ([Term (Lit Name LVar)], LVar))
 findRule funsym rule =
   case ctxtStRuleToRRule rule of
     (fhs `RRule` rhs) ->
       case (viewTerm fhs, viewTerm rhs) of
-        (FApp fs y, Lit (Var v)) | fs == funsym -> Just (y, v)
+        (FApp fs y, Lit (Var v)) | fs == funsym -> Just $ Right (y, v)
+        (FApp fs _, _)           | fs == funsym -> Just $ Left ()
         _ -> Nothing
 
 translateLetDestr :: ( MonadThrow m)
