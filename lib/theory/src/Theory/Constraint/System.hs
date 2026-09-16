@@ -1348,7 +1348,10 @@ getMirrorDG ctxt side sys = {-trace (show (evalFreshAvoiding newNodes (freshNatA
         where
           jumpNotUnifiable ret x = if (null foundUnifiers)
                       then ret
-                      else (L.set sNodes (foldl (\y z -> apply z y) x (freeUnifiers x)) sys):ret
+                      -- Unifiers are alternative solutions of the graph
+                      -- equalities, not successive refinements of one solution.
+                      -- Each must instantiate the original candidate node map.
+                      else [L.set sNodes (apply subst x) sys | subst <- freeUnifiers x] ++ ret
             where
               (foundUnifiers, constSubsts) = unifiers $ equalities True x
 
