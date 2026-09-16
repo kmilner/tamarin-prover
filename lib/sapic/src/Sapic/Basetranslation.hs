@@ -253,27 +253,33 @@ baseTransComb c an p tildex
       elsBranch <- an.elseBranch
       =
         let t1or = toLNTerm t1' in
-        let (t1, t2, freevars) =
-              case an.destructorEquation of
-                Nothing -> (t1or, toLNTerm t2', freeset t1or)
-                Just (tl1,tl2) -> (tl1, tl2, freeset tl1 `difference` tildex)
+        let (inputTerm, equations) =
+              case an.destructorEquations of
+                [] -> (toLNTerm t2', [(t1or, toLNTerm t2', freeset t1or)])
+                eqs@((_, input):_) ->
+                  (input, [(t1, t2, freeset t1 `difference` tildex) | (t1, t2) <- eqs])
         in
-        let fa = Conn Imp (Ato (EqE (fmapTerm (fmap Free) t1) (fmapTerm (fmap Free) t2))) (TF False) in
+        let failureFormula (t1, t2, freeVars) =
+              let fa = Conn Imp
+                         (Ato (EqE (fmapTerm (fmap Free) t1)
+                                   (fmapTerm (fmap Free) t2)))
+                         (TF False)
+              in fold (hinted forAll) fa freeVars
+        in
         let tildexl =  freeset t1or `union` tildex in
-        let faN = fold (hinted forAll) fa freevars in
         let pos = p++[1] in
+        let startRule = ([def_state], [], [FLet pos inputTerm tildex], []) in
+        let successRules =
+              [ ([FLet pos t1 tildex], [], [def_state1 tildexl], [])
+              | (t1, _, _) <- equations
+              ] in
         if elsBranch then
-          ([
-              ([def_state], [], [FLet pos t2 tildex], []),
-              ([FLet pos t1 tildex], [], [def_state1 tildexl], []),
-              ([FLet pos t2 tildex], [] , [def_state2 tildex], [faN])
-           ],
+          (startRule : successRules ++
+              [([FLet pos inputTerm tildex], [],
+                [def_state2 tildex], map failureFormula equations)],
             tildexl, Just tildex)
         else
-          ([
-              ([def_state], [], [FLet pos t2 tildex], []),
-              ([FLet pos t1 tildex], [], [def_state1 tildexl], [])
-           ],
+          (startRule : successRules,
             tildexl, Nothing)
 
     -- Pure cell translation
