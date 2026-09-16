@@ -202,15 +202,24 @@ nonInjectiveFactInstances ctxt se = do
 
         -- FIXME: There should be a weaker version of the rule that just
         -- introduces the constraint 'k < j || k == j' here.
+        -- The last-node case is handled by mergeLastInjectiveFactNodes in
+        -- the trace simplifier, which establishes j == k instead of rejecting
+        -- a potentially valid merger. Keep this check for direct callers.
         checkRule jRu    = any conflictingFact (L.get rPrems jRu ++ L.get rConcs jRu) &&
                            (k `S.member` D.reachableSet [j] less
-                             || isLast se k)
+                             -- A last node can coincide with j. Distinct
+                             -- variable names do not establish j < k.
+                             || (isLast se k && nonUnifiableNodes j k))
 
     guard isCounterExample
     return (i, j, k) -- counter-example to unique fact instances
   where
     less      = rawLessRel se
     firstTerm = headMay . factTerms
+    nonUnifiableNodes i j = maybe False (not . runMaude) $
+        unifiableRuleACInsts <$> M.lookup i (L.get sNodes se)
+                             <*> M.lookup j (L.get sNodes se)
+    runMaude = (`runReader` L.get pcMaudeHandle ctxt)
 
 -- | The node-ids that must be instantiated to the trace, but are temporally
 -- after the last node.
