@@ -1,0 +1,19 @@
+theory SoundnessInductionEmptyEquality
+begin
+
+// The fresh input makes A unreachable. It keeps an action-bearing branch in
+// the formula so the old induction applicability check accepted the lemma.
+rule Impossible:
+  [ In(~x) ]
+  --[ A() ]->
+  []
+
+// Message quantifiers range over terms even on the empty trace. In particular,
+// x='a' has the witness x='a', so this conjunction is false on every trace.
+lemma false_direct:
+  "(All x. x='a' ==> F) & (All #i. A()@i ==> T)"
+
+lemma false_induction [use_induction]:
+  "(All x. x='a' ==> F) & (All #i. A()@i ==> T)"
+
+end

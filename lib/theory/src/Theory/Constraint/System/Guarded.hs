@@ -624,17 +624,23 @@ gnot =
     go (GConj conj)            = gdisj $ map go (getConj conj)
 
 
--- | Checks if a doubly guarded formula is satisfied by the empty trace;
--- returns @'Left' errMsg@ if the formula is not doubly guarded.
+-- | Checks if a doubly guarded formula is satisfied by the empty trace.
+-- A guarded quantifier is vacuous there only when its guard contains an
+-- action. Equality-only guards can already have witnesses on the empty trace,
+-- so induction is not applicable when their value would have to be decided.
 satisfiedByEmptyTrace :: Guarded s c v -> Either String Bool
-satisfiedByEmptyTrace =
-  foldGuarded
-    (\_ato -> throwError "atom outside the scope of a quantifier")
-    (liftM or  . sequence . getDisj)
-    (liftM and . sequence . getConj)
-    (\qua _ss _as _gf -> return $ qua == All)
-    -- the empty trace always satisfies guarded all-quantification
-    -- and always dissatisfies guarded ex-quantification
+satisfiedByEmptyTrace = go
+  where
+    go (GAto _ato) =
+      throwError "atom outside the scope of a quantifier"
+    go (GDisj disj) =
+      liftM or $ traverse go $ getDisj disj
+    go (GConj conj) =
+      liftM and $ traverse go $ getConj conj
+    go (GGuarded qua _ss as _gf)
+      | any isActionAtom as = return $ qua == All
+      | otherwise =
+          throwError "formula has an equality-only guard whose value on the empty trace is unknown"
 
 -- | Tries to convert a doubly guarded formula to an induction hypothesis.
 -- Returns @'Left' errMsg@ if the formula is not last-free or not doubly
