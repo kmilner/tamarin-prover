@@ -1,0 +1,17 @@
+theory SoundnessSapicDestructorNonvariableResult
+begin
+
+functions: check/1 [destructor], valid/1, okay/0
+equations: check(valid(x)) = okay
+
+process:
+  new s;
+  let y = check(valid(s)) in event Success(y) else event Failure()
+
+lemma valid_succeeds: exists-trace
+  "Ex #i. Success(okay)@i"
+
+lemma no_valid_failure:
+  "All #i. Failure()@i ==> F"
+
+end
