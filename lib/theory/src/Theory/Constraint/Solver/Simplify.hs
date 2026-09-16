@@ -130,6 +130,7 @@ simplifySystem = do
               c9 <- freshOrdering
               c10 <- simpSubterms
               c11 <- simpInjectiveFactEqMon
+              c12 <- mergeLastInjectiveFactNodes
 
               -- Report on looping behaviour if necessary
               let changes = filter ((Changed ==) . snd) $
@@ -144,6 +145,7 @@ simplifySystem = do
                     , ("orderings for ~vars (S_fresh-order)",             c9)
                     , ("simplification of SubtermStore",                  c10)
                     , ("equations and monotonicity from injective Facts", c11)
+                    , ("last-node equalities from injective facts",        c12)
                     ]
                   traceIfLooping
                     | n <= 10   = id
@@ -656,6 +658,32 @@ simpInjectiveFactEqMon = do
             i /= j,
             ((b, s),(_,t)) <- zip ss tt  -- the b and _ are automatically the same
             ]
+
+-- | An injective fact flowing from i to the last node k cannot also be used
+-- or produced strictly between those nodes. If j is after i and mentions the
+-- same injective identifier, it must therefore coincide with k. Add that
+-- equality rather than treating different node-variable names as a conflict.
+-- Normal substitution merges the rule instances, and existing equations and
+-- formulas decide whether the merger is possible.
+mergeLastInjectiveFactNodes :: Reduction ChangeIndicator
+mergeLastInjectiveFactNodes = do
+    se <- gets id
+    ctxt <- ask
+    let injectiveTags = S.map fst $ get pcInjectiveFactInsts ctxt
+        less = rawLessRel se
+        equalities = do
+          Edge c@(i, _) (k, _) <- S.toList $ get sEdges se
+          guard (isLast se k)
+          let fact = nodeConcFact c se
+              sameInstance other = factTag other == factTag fact &&
+                  headMay (factTerms other) == headMay (factTerms fact)
+          guard (factTag fact `S.member` injectiveTags)
+          j <- S.toList $ D.reachableSet [i] less
+          guard (j /= i && j /= k)
+          Just ru <- [M.lookup j $ get sNodes se]
+          guard (any sameInstance (get rPrems ru ++ get rConcs ru))
+          return $ Equal j k
+    solveNodeIdEqs $ nub equalities
 
 -- | Compute all less relations implied by injective fact instances.
 --
