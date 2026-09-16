@@ -189,7 +189,10 @@ simpSplitNegSt reducible sst = do
     let changedNegSubterms = S.toList (L.get negSubterms sst `S.difference` L.get oldNegSubterms sst)
     splits <- concat <$> mapM (splitSubterm reducible False) changedNegSubterms
     let splitSubterms = S.fromList $ [st | SubtermD st <- splits] ++ [st | NatSubtermD st <- splits]
-    let flippedNatSubterms = S.fromList [(t, s ++: fAppNatOne) | NatSubtermD (s, t) <- splits, isNatSubterm (s,t)]  -- isNatSubterm is necessary to exclude that s is a msgVar!!!
+    -- Negating the natural-number order is valid only once both operands
+    -- are known to be naturals. A message variable may instead become a
+    -- non-natural term, so keep its negative subterm constraint deferred.
+    let flippedNatSubterms = S.fromList [(t, s ++: fAppNatOne) | NatSubtermD (s, t) <- splits, sortOfLNTerm s == LSortNat]
     let eqFormulas = S.toList $ S.fromList [gnotAtom $ EqE (lTermToBTerm x) (lTermToBTerm y) | EqualD (x,y) <- splits]  -- ¬ x=y
     let acFormulas = S.toList $ S.fromList [closeGuarded All [newVar] [EqE smallPlus big] gfalse | ACNewVarD ((smallPlus, big), newVar) <- splits] -- ∀ newVar. x+newVar=y ⇒ ⊥
     zippedIsFalse <- zip changedNegSubterms <$> mapM (liftM null . splitSubterm reducible False) changedNegSubterms
@@ -412,6 +415,9 @@ natSubtermEqualities relation = {-trace (show (("natSubtermEqualities"
       formatEdge :: (LNTerm, LNTerm) -> [(((Bool,LVar), (Bool,LVar)), Int)]  -- empty list for invalid (>2 vars, nonNat); otherwise 1 or 2 elements
       formatEdge st | not $ isNatSubterm st = []
       formatEdge (a, b) = case (flattenedACTerms NatPlus a, flattenedACTerms NatPlus b) of
+        -- Do not silently discard non-natural summands when encoding an
+        -- inequality. Mixed-sort subterms are refined by solveSubterm first.
+        (l, r) | not (all natSummand (l ++ r)) -> []
         (l, r) | length (getVars l ++ getVars r) == 1 -> [((from, to), d)]
           where
             d = 2 * (countOnes r - countOnes l - 1)
@@ -424,6 +430,7 @@ natSubtermEqualities relation = {-trace (show (("natSubtermEqualities"
             tos = map (first not) (reverse froms)
         _ -> []
        where
+        natSummand t = t == fAppNatOne || isNatVar t
         getVars :: [LNTerm] -> [LVar]
         getVars = mapMaybe getVar . filter (/= fAppNatOne)
         countOnes :: [LNTerm] -> Int
