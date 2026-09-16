@@ -1190,24 +1190,28 @@ impliedFormulasAndSystems hnd sys gf = res
         go ((_  , _     ):acts) | otherwise                    = go acts
     equalities ((GEqE s t):as)     = map (\(x, y) -> ((Equal s t):x, (Equal s t):y)) $ equalities as
 
--- | Removes all restrictions that are not relevant for the system, i.e. that only contain atoms not present in the system.
+-- | Remove safety restrictions whose action guards cannot match the system.
+-- Action-free and non-safety restrictions cannot be discarded this way.
 filterRestrictions :: ProofContext -> System -> [LNGuarded] -> [LNGuarded]
-filterRestrictions ctxt sys formulas = filter (unifiableNodes) formulas
+filterRestrictions ctxt sys formulas = filter relevant formulas
   where
     runMaude   = (`runReader` L.get pcMaudeHandle ctxt)
 
-    -- | 'True' iff there in every solution to the system the two node-ids are
-    -- instantiated to a different index *in* the trace.
+    relevant fm = null (guardFactTags fm)
+               || not (isSafetyFormula fm)
+               || unifiableNodes fm
+
     unifiableNodes :: LNGuarded -> Bool
     unifiableNodes fm = case fm of
-         (GAto ato)  -> unifiableAtoms {-- $ trace ("atom on which bvarToLVar will be applied [ato]: " ++ show ato)-} $ [bvarToLVar ato]
-         (GDisj fms) -> any unifiableNodes $ getDisj fms
-         (GConj fms) -> any unifiableNodes $ getConj fms
-         gg@(GGuarded _ _ _ _) -> case evalFreshAvoiding (openGuarded gg) (L.get sNodes sys) of
-                                          Nothing               -> error "Bug in filterRestrictions, please report."
-                                          Just (_, _, atos, gf) -> (unifiableNodes gf) || (unifiableAtoms atos)
+         GAto ato  -> unifiableAtoms [bvarToLVar ato]
+         GDisj fms -> any unifiableNodes $ getDisj fms
+         GConj fms -> any unifiableNodes $ getConj fms
+         gg@(GGuarded _ _ _ _) ->
+           case evalFreshAvoiding (openGuarded gg) (L.get sNodes sys) of
+             Nothing -> error "Bug in filterRestrictions, please report."
+             Just (_, _, atos, gf) -> unifiableNodes gf || unifiableAtoms atos
 
-    unifiableAtoms :: [Atom (VTerm Name (LVar))] -> Bool
+    unifiableAtoms :: [Atom (VTerm Name LVar)] -> Bool
     unifiableAtoms []                   = False
     unifiableAtoms ((Action _ fact):fs) = unifiableFact fact || unifiableAtoms fs
     unifiableAtoms (_:fs)               = unifiableAtoms fs
@@ -1247,8 +1251,16 @@ evaluateRestrictions dctxt dsys mirrors isSolved =
                             (TFalse, concat $ map snd $ filter (\x -> fst x == TFalse) evals)
             where
                 oppositeCtxt = eitherProofContext dctxt (opposite side)
-                restrictions = filterRestrictions oppositeCtxt sys $ restrictions' (opposite side) $ L.get dpcRestrictions dctxt
-                evals = map (\x -> doRestrictionsHold oppositeCtxt x restrictions isSolved) mirrors
+                evals = map (\mirror ->
+                    doRestrictionsHold oppositeCtxt mirror
+                      (relevantRestrictions mirror)
+                      isSolved) mirrors
+                restrictions = restrictions' (opposite side) $ L.get dpcRestrictions dctxt
+                relevantRestrictions mirror =
+                  let originalRelevant = filterRestrictions oppositeCtxt sys restrictions
+                      mirrorRelevant = filterRestrictions oppositeCtxt mirror restrictions
+                  in filter (\r -> r `elem` originalRelevant || r `elem` mirrorRelevant)
+                            restrictions
 
                 restrictions' _  []               = []
                 restrictions' s' ((s'', form):xs) = if s' == s'' then form ++ (restrictions' s' xs) else (restrictions' s' xs)
