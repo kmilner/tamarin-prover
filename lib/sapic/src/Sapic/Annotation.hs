@@ -28,6 +28,7 @@ module Sapic.Annotation
 
 import Data.Binary
 import Data.Data
+import Data.List.NonEmpty (NonEmpty)
 import GHC.Generics (Generic)
 import Term.LTerm
 import Term.Substitution
@@ -51,7 +52,7 @@ data ProcessAnnotation v = ProcessAnnotation
   , lock          :: Maybe (AnVar v)   -- Fresh variables annotating locking action and unlocking actions.
   , unlock        :: Maybe (AnVar v)   -- Matching actions should have the same variables.
   , secretChannel :: Maybe (AnVar v)   -- If a channel is secret, we can perform a silent transition.
-  , destructorEquation :: Maybe (LNTerm, LNTerm) -- the two terms that can be matched to model a let binding with a destructor on the right hand side.
+  , destructorEquations :: Maybe (NonEmpty (LNTerm, LNTerm)) -- the term pairs that can be matched to model a let binding with a destructor on the right hand side.
   , elseBranch         :: Bool --- do we have a non-zero else branch? Used for let translation
   , pureState :: Bool -- anotates locks, inserts and lookup that correspond to a Pure state, so that they are optimized.
                       -- A pure state corresponds to a process of form `insert k,v` or `lock k; lookup k; .. ; insert k,v; unlock k` or similar (see States.hs)
@@ -79,7 +80,7 @@ instance Semigroup (ProcessAnnotation v) where
         (p1.lock <> p2.lock)
         (p1.unlock <> p2.unlock)
         (p1.secretChannel <> p2.secretChannel)
-        (mayMerge p1.destructorEquation p2.destructorEquation)
+        (mayMerge p1.destructorEquations p2.destructorEquations)
         p2.elseBranch
         (p1.pureState || p2.pureState)
         (p1.stateChannel <> p2.stateChannel)
@@ -126,8 +127,9 @@ annUnlock v = mempty {unlock = Just v}
 annSecretChannel :: AnVar v -> ProcessAnnotation v
 annSecretChannel v = mempty { secretChannel = Just v}
 
-annDestructorEquation :: LNTerm -> LNTerm -> Bool -> ProcessAnnotation v
-annDestructorEquation v1 v2 b =  mempty { destructorEquation = Just (v1, v2), elseBranch = b }
+annDestructorEquation :: NonEmpty (LNTerm, LNTerm) -> Bool -> ProcessAnnotation v
+annDestructorEquation equations b =
+    mempty { destructorEquations = Just equations, elseBranch = b }
 
 annElse ::  Bool -> ProcessAnnotation v
 annElse b = mempty {elseBranch = b}

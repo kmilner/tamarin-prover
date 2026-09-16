@@ -12,7 +12,8 @@ module Sapic.LetDestructors
   ) where
 
 import           Data.Set as S
-import           Data.List as L
+import           Data.Maybe (mapMaybe)
+import qualified Data.List.NonEmpty as NE
 
 import           Sapic.Annotation
 
@@ -34,11 +35,11 @@ mapProc avoidTerms rules (ProcessComb c@(Let t1 t2 mv) _ pl pr) =
   case (t1, viewTerm t1', viewTerm t2') of
     (LIT (Var _) ,Lit (Var _), FApp funsym@(NoEq (_, (_,_,Destructor,_))) rightterms) ->
       -- we are in the case where the let binding is of the form let invar = dest(rightTerms) in
-      (case  L.foldl (findRule funsym) Nothing rules of
-        -- if the desrtructor does not have any associated rule, it never succeed, and we thus always go in the else branch we simply substitute in the process, to optimize
-        Nothing -> mapProc avoidTerms rules pr
-        Just (leftterms0, outvar0) -> do
-          -- TODO we should handle fresh vars here
+      (case mapMaybe (findRule funsym) (S.toList rules) of
+        -- If the destructor has no associated rule, it can never succeed, so
+        -- replace the let with its else branch.
+        [] -> mapProc avoidTerms rules pr
+        equations0 -> do
           -- We extract the equation of the dest, in the case where it is of the
           -- form dest(lefTerms) = outvar.
 
@@ -54,10 +55,14 @@ mapProc avoidTerms rules (ProcessComb c@(Let t1 t2 mv) _ pl pr) =
           return $ ProcessComb c new_an npl npr
           -- Equation variables are local pattern binders. Freshen them away
           -- from the whole process, including variables bound before this let.
-          where (leftterms, outvar) = renameAvoiding (leftterms0, outvar0) avoidTerms
-                leftermssubst = apply subst $ toPairs leftterms
-                subst = substFromList [(outvar, t1')]
-                new_an = annDestructorEquation leftermssubst (toPairs rightterms) elsebranch
+          where equations = renameAvoiding equations0 avoidTerms
+                translatedEquations =
+                  [ (apply (substFromList [(outvar, t1')]) (toPairs leftterms),
+                     toPairs rightterms)
+                  | (leftterms, outvar) <- equations
+                  ]
+                new_an = annDestructorEquation
+                  (NE.fromList translatedEquations) elsebranch
           )
     (LIT (Var svar) , _ , _ )  | not (svar `S.member` mv) -> do
       res <- applyM (substFromList ((,t2) <$> make_untyped_variant svar)) pl
@@ -88,15 +93,14 @@ mapProc avoidTerms rules (ProcessComb c ann pl pr) = do
   return $ ProcessComb c ann npl npr
 
 findRule :: FunSym
-            -> Maybe ([Term (Lit Name LVar)], LVar)
             -> CtxtStRule
             -> Maybe ([Term (Lit Name LVar)], LVar)
-findRule funsym acc rule =
+findRule funsym rule =
   case ctxtStRuleToRRule rule of
     (fhs `RRule` rhs) ->
       case (viewTerm fhs, viewTerm rhs) of
         (FApp fs y, Lit (Var v)) | fs == funsym -> Just (y, v)
-        _ -> acc
+        _ -> Nothing
 
 translateLetDestr :: ( MonadThrow m)
                     =>  Set CtxtStRule -> LProcess (ProcessAnnotation LVar) -> m (LProcess (ProcessAnnotation LVar))
