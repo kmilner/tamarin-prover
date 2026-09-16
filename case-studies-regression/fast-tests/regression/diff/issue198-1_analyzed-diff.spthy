@@ -36,9 +36,19 @@ restriction OneSetup [right]:
   "∀ #i #j. ((Setup( ) @ #i) ∧ (Setup( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ #i #j. ((Setup( ) @ #i) ∧ (Setup( ) @ #j)) ⇒ (#i = #j)"
+  */
+
 restriction OneSetup [left]:
   "∀ #i #j. ((Setup( ) @ #i) ∧ (Setup( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ #i #j. ((Setup( ) @ #i) ∧ (Setup( ) @ #j)) ⇒ (#i = #j)"
+  */
 
 restriction notSameRole [right]:
   "∀ H1 H2 D1 D2 #i.
@@ -48,6 +58,15 @@ restriction notSameRole [right]:
      (¬(D1 = D2)))"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ H1 H2 D1 D2 #i.
+    (Roles( H1, H2, D1, D2 ) @ #i) ⇒
+    ((((((¬(H1 = H2)) ∧ (¬(H1 = D1))) ∧ (¬(H1 = D2))) ∧ (¬(H2 = D1))) ∧
+      (¬(H2 = D2))) ∧
+     (¬(D1 = D2)))"
+  */
+
 restriction notSameRole [left]:
   "∀ H1 H2 D1 D2 #i.
     (Roles( H1, H2, D1, D2 ) @ #i) ⇒
@@ -55,6 +74,15 @@ restriction notSameRole [left]:
       (¬(H2 = D2))) ∧
      (¬(D1 = D2)))"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ H1 H2 D1 D2 #i.
+    (Roles( H1, H2, D1, D2 ) @ #i) ⇒
+    ((((((¬(H1 = H2)) ∧ (¬(H1 = D1))) ∧ (¬(H1 = D2))) ∧ (¬(H2 = D1))) ∧
+      (¬(H2 = D2))) ∧
+     (¬(D1 = D2)))"
+  */
 
 diffLemma Observational_equivalence:
 rule-equivalence
@@ -278,8 +306,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: c1f66a89dd4225513a7d34f28e0696bd5031b9a7 (with uncommited changes), branch: msr-core-soundness
+Compiled at: 2026-09-16 21:06:54.322462762 UTC
 */
 
 end
@@ -291,8 +319,8 @@ summary of summaries:
 analyzed: examples/regression/diff/issue198-1.spthy
 
   output:          examples/regression/diff/issue198-1.spthy.tmp
-  processing time: 0.09s
-  
+  processing time: 0.22s
+
   DiffLemma:  Observational_equivalence : analysis incomplete (84 steps)
 
 ==============================================================================

@@ -12,27 +12,13 @@ equations:
 
 macros: pubkey( x ) =  pk(x)
 
+rule (modulo E) gen:
+   [ Fr( ~k ) ] --> [ !Key( ~k ), Out( pk(~k) ) ]
+
 rule (modulo E) enc:
    [ !Key( k ), Fr( ~r1 ), Fr( ~r2 ), In( x ) ]
   -->
-   [ Out( diff(~r1, penc(x, pubkey(k), ~r2)) ) ]
- left
-  rule (modulo E) enc:
-     [ !Key( k ), Fr( ~r1 ), Fr( ~r2 ), In( x ) ] --> [ Out( ~r1 ) ]
- right
-  rule (modulo E) enc:
-     [ !Key( k ), Fr( ~r1 ), Fr( ~r2 ), In( x ) ]
-    -->
-     [ Out( penc(x, pk(k), ~r2) ) ]
-
-rule (modulo E) gen:
-   [ Fr( ~k ) ] --> [ !Key( ~k ), Out( pubkey(~k) ) ]
- left
-  rule (modulo E) gen:
-     [ Fr( ~k ) ] --> [ !Key( ~k ), Out( pk(~k) ) ]
- right
-  rule (modulo E) gen:
-     [ Fr( ~k ) ] --> [ !Key( ~k ), Out( pk(~k) ) ]
+   [ Out( diff(~r1, penc(x, pk(k), ~r2)) ) ]
 
 diffLemma Observational_equivalence:
 rule-equivalence
@@ -237,8 +223,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: 8b1252212ae20e62131405ba847ca5a810b7e308 (with uncommited changes), branch: msr-core-soundness
+Compiled at: 2026-09-16 20:06:03.71123661 UTC
 */
 
 end
@@ -250,8 +236,8 @@ summary of summaries:
 analyzed: examples/features/equivalence/MacroDiffprobEnc.spthy
 
   output:          examples/features/equivalence/MacroDiffprobEnc.spthy.tmp
-  processing time: 0.04s
-  
+  processing time: 0.09s
+
   DiffLemma:  Observational_equivalence : verified (75 steps)
 
 ==============================================================================

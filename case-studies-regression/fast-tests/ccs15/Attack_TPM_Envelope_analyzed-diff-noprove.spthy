@@ -73,18 +73,42 @@ restriction challenge_restriction [right]:
     (Challenge( s ) @ #i) ⇒
     (∃ #j #k. (Secret( s ) @ #j) ∧ (Denied( s ) @ #k))"
 
+  /*
+  expanded formula:
+  "∀ s #i.
+    (Challenge( s ) @ #i) ⇒
+    (∃ #j #k. (Secret( s ) @ #j) ∧ (Denied( s ) @ #k))"
+  */
+
 restriction challenge_restriction [left]:
   "∀ s #i.
     (Challenge( s ) @ #i) ⇒
     (∃ #j #k. (Secret( s ) @ #j) ∧ (Denied( s ) @ #k))"
 
+  /*
+  expanded formula:
+  "∀ s #i.
+    (Challenge( s ) @ #i) ⇒
+    (∃ #j #k. (Secret( s ) @ #j) ∧ (Denied( s ) @ #k))"
+  */
+
 restriction PCR_Init_unique [right]:
   "∀ #i #j. ((PCR_Init( ) @ #i) ∧ (PCR_Init( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ #i #j. ((PCR_Init( ) @ #i) ∧ (PCR_Init( ) @ #j)) ⇒ (#i = #j)"
+  */
+
 restriction PCR_Init_unique [left]:
   "∀ #i #j. ((PCR_Init( ) @ #i) ∧ (PCR_Init( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ #i #j. ((PCR_Init( ) @ #i) ∧ (PCR_Init( ) @ #j)) ⇒ (#i = #j)"
+  */
 
 lemma types [right, sources]:
   all-traces
@@ -396,8 +420,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: c1f66a89dd4225513a7d34f28e0696bd5031b9a7 (with uncommited changes), branch: msr-core-soundness
+Compiled at: 2026-09-16 21:06:54.322462762 UTC
 */
 
 end
@@ -409,8 +433,8 @@ summary of summaries:
 analyzed: examples/ccs15/Attack_TPM_Envelope.spthy
 
   output:          examples/ccs15/Attack_TPM_Envelope.spthy.tmp
-  processing time: 0.09s
-  
+  processing time: 0.20s
+
   RHS :  types (all-traces): analysis incomplete (1 steps)
   LHS :  types (all-traces): analysis incomplete (1 steps)
   RHS :  PCR_Write_charn (all-traces): analysis incomplete (1 steps)

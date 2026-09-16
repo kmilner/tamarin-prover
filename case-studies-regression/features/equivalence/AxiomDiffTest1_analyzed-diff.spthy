@@ -14,6 +14,11 @@ restriction blockLeft [left]:
   "∀ #i. (Never( ) @ #i) ⇒ (⊥)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ #i. (Never( ) @ #i) ⇒ (⊥)"
+  */
+
 diffLemma Observational_equivalence:
 rule-equivalence
   case Rule_Test
@@ -30,8 +35,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: 8b1252212ae20e62131405ba847ca5a810b7e308 (with uncommited changes), branch: msr-core-soundness
+Compiled at: 2026-09-16 20:06:03.71123661 UTC
 */
 
 end
@@ -43,8 +48,8 @@ summary of summaries:
 analyzed: examples/features/equivalence/AxiomDiffTest1.spthy
 
   output:          examples/features/equivalence/AxiomDiffTest1.spthy.tmp
-  processing time: 0.03s
-  
+  processing time: 0.05s
+
   DiffLemma:  Observational_equivalence : falsified - found trace (4 steps)
 
 ==============================================================================

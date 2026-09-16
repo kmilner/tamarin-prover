@@ -18,6 +18,12 @@ restriction singleSessionTag [right]:
       ((PlayT( k ) @ #i1) ∧ (PlayT( k ) @ #i2)) ∧ (¬(#i1 = #i2)))"
   // safety formula
 
+  /*
+  expanded formula:
+  "¬(∃ k #i1 #i2.
+      ((PlayT( k ) @ #i1) ∧ (PlayT( k ) @ #i2)) ∧ (¬(#i1 = #i2)))"
+  */
+
 diffLemma Observational_equivalence:
 rule-equivalence
   case Rule_Destrd_0_fst
@@ -28,7 +34,7 @@ rule-equivalence
       case T_out
       step( solve( !Tag( t ) ▶₀ #vr ) )
         case Init
-        by step( contradiction /* impossible chain */ )
+        by sorry // bound 5 hit
       qed
     qed
   next
@@ -38,7 +44,7 @@ rule-equivalence
       case T_out
       step( solve( !Tag( t ) ▶₀ #vr ) )
         case Init
-        by step( contradiction /* impossible chain */ )
+        by sorry // bound 5 hit
       qed
     qed
   qed
@@ -51,7 +57,7 @@ next
       case T_out
       step( solve( !Tag( t ) ▶₀ #vr ) )
         case Init
-        by step( contradiction /* impossible chain */ )
+        by sorry // bound 5 hit
       qed
     qed
   next
@@ -61,7 +67,7 @@ next
       case T_out
       step( solve( !Tag( t ) ▶₀ #vr ) )
         case Init
-        by step( contradiction /* impossible chain */ )
+        by sorry // bound 5 hit
       qed
     qed
   qed
@@ -74,13 +80,7 @@ next
       case T_out
       step( solve( !Tag( t ) ▶₀ #vr ) )
         case Init
-        step( solve( (#vl, 0) ~~> (#i, 1) ) )
-          case Var_fresh_k
-          step( solve( !KU( ~k ) @ #vk ) )
-            case T_out
-            by sorry // Cannot prove
-          qed
-        qed
+        by sorry // bound 5 hit
       qed
     qed
   next
@@ -90,13 +90,7 @@ next
       case T_out
       step( solve( !Tag( t ) ▶₀ #vr ) )
         case Init
-        step( solve( (#vl, 0) ~~> (#i, 1) ) )
-          case Var_fresh_k
-          step( solve( !KU( ~k ) @ #vk ) )
-            case T_out
-            MIRRORED
-          qed
-        qed
+        by sorry // bound 5 hit
       qed
     qed
   qed
@@ -105,7 +99,7 @@ next
   backward-search
     case LHS
     step( simplify )
-    MIRRORED
+    by sorry // Cannot prove
   next
     case RHS
     step( simplify )
@@ -116,7 +110,58 @@ next
   backward-search
     case LHS
     step( simplify )
-    MIRRORED
+    step( solve( !KU( x ) @ #vk ) )
+      case c_fst
+      step( solve( !KU( fst(x) ) @ #vk ) )
+        case c_fst
+        by sorry // bound 5 hit
+      qed
+    next
+      case c_pair
+      step( solve( !KU( x ) @ #vk.1 ) )
+        case c_fst
+        by sorry // bound 5 hit
+      next
+        case c_pair
+        by sorry // bound 5 hit
+      next
+        case c_snd
+        by sorry // bound 5 hit
+      next
+        case coerce
+        by sorry // bound 5 hit
+      next
+        case fresh
+        by sorry // bound 5 hit
+      next
+        case pub
+        by sorry // bound 5 hit
+      qed
+    next
+      case c_snd
+      step( solve( !KU( snd(x) ) @ #vk ) )
+        case c_snd
+        by sorry // bound 5 hit
+      qed
+    next
+      case coerce
+      step( solve( !KD( x ) ▶₀ #vk ) )
+        case T_out
+        by sorry // bound 5 hit
+      qed
+    next
+      case fresh
+      step( solve( !KU( ~x ) @ #vk ) )
+        case fresh
+        by sorry // bound 5 hit
+      qed
+    next
+      case pub
+      step( solve( !KU( $x ) @ #vk ) )
+        case pub
+        by sorry // bound 5 hit
+      qed
+    qed
   next
     case RHS
     step( simplify )
@@ -127,7 +172,10 @@ next
   backward-search
     case LHS
     step( simplify )
-    MIRRORED
+    step( solve( !Tag( k ) ▶₀ #i ) )
+      case Init
+      by sorry // Cannot prove
+    qed
   next
     case RHS
     step( simplify )
@@ -141,8 +189,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: c1f66a89dd4225513a7d34f28e0696bd5031b9a7 (with uncommited changes), branch: msr-core-soundness
+Compiled at: 2026-09-16 21:06:54.322462762 UTC
 */
 
 end
@@ -154,9 +202,13 @@ summary of summaries:
 analyzed: examples/regression/diff/issue324.spthy
 
   output:          examples/regression/diff/issue324.spthy.tmp
-  processing time: 0.03s
-  
-  DiffLemma:  Observational_equivalence : analysis incomplete (47 steps)
+  processing time: 0.06s
+
+  DiffLemma:  Observational_equivalence : analysis incomplete (61 steps)
+  Equivalence proof may remain incomplete: preservation of these restrictions
+  across multiple events could not be established:
+    RHS: singleSessionTag
+  These restrictions remain enforced. Side lemmas and attack search are still available.
 
 ==============================================================================
 */

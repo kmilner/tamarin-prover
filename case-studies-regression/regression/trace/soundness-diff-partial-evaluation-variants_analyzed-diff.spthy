@@ -1,0 +1,121 @@
+theory SoundnessDiffPartialEvaluationVariants
+
+begin
+
+// Function signature and definition of the equational theory E
+
+functions: fst/1, pair/2, sdec/2, senc/2, snd/1
+equations:
+    fst(<x.1, x.2>) = x.1,
+    sdec(senc(x.1, x.2), x.2) = x.1,
+    snd(<x.1, x.2>) = x.2
+
+rule (modulo E) Dec:
+   [ In( x ), In( k ) ] --> [ Out( diff(sdec(x, k), x) ) ]
+ left
+  rule (modulo E) Dec:
+     [ In( x ), In( k ) ] --> [ Out( sdec(x, k) ) ]
+   variants
+    rule (modulo AC) Dec:
+       [ In( x.1 ), In( k ) ] --> [ Out( sdec(x.1, k) ) ]
+    ,
+    rule (modulo AC) Dec:
+       [ In( senc(z.1, k) ), In( k ) ] --> [ Out( z.1 ) ]
+ right
+  rule (modulo E) Dec:
+     [ In( x.1 ), In( k ) ] --> [ Out( x.1 ) ]
+
+text{* the abstract state after partial evaluation contains 3 left facts:
+
+1. Fr( ~z )
+
+2. Out( z )
+
+3. In( z )
+
+This abstract state results in 2 left refined multiset rewriting rules.
+Note that the original number of multiset rewriting rules was 1.
+
+
+
+ the abstract state after partial evaluation contains 3 right facts:
+
+1. Fr( ~z )
+
+2. Out( z )
+
+3. In( z )
+
+This abstract state results in 1 right refined multiset rewriting rules.
+Note that the original number of multiset rewriting rules was 1.
+
+*}
+
+diffLemma Observational_equivalence:
+rule-equivalence
+  case Rule_Equality
+  backward-search
+    case LHS
+    step( simplify )
+    step( solve( !KD( x ) ▶₁ #i ) )
+      case Dec_case_1
+      step( solve( (#vl, 0) ~~> (#i, 1) ) )
+        case sdec
+        step( solve( !KU( sdec(x, k) ) @ #vk ) )
+          case c_sdec
+          step( solve( !KU( x ) @ #vk.1 ) )
+            case c_fst
+            step( solve( !KU( fst(x) ) @ #vk.1 ) )
+              case c_fst
+              step( solve( !KU( k ) @ #vk.2 ) )
+                case c_fst
+                step( solve( !KU( fst(x.1) ) @ #vk.2 ) )
+                  case c_fst
+                  step( solve( !KU( x ) @ #vk.3 ) )
+                    case fresh
+                    step( solve( !KU( ~x ) @ #vk.3 ) )
+                      case fresh
+                      step( solve( !KU( x.1 ) @ #vk.4 ) )
+                        case fresh
+                        step( solve( !KU( ~x.1 ) @ #vk.4 ) )
+                          case fresh
+                          by ATTACK // trace found
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+/* All wellformedness checks were successful. */
+
+/*
+Generated from:
+Tamarin version 1.13.0
+Maude version 3.5.1
+Git revision: 8b1252212ae20e62131405ba847ca5a810b7e308 (with uncommited changes), branch: msr-core-soundness
+Compiled at: 2026-09-16 20:06:03.71123661 UTC
+*/
+
+end
+/* Output
+
+==============================================================================
+summary of summaries:
+
+analyzed: examples/regression/trace/soundness-diff-partial-evaluation-variants.spthy
+
+  output:          examples/regression/trace/soundness-diff-partial-evaluation-variants.spthy.tmp
+  processing time: 0.58s
+
+  DiffLemma:  Observational_equivalence : falsified - found trace (15 steps)
+
+==============================================================================
+*/

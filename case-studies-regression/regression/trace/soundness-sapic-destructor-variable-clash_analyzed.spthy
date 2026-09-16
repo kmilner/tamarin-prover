@@ -1,0 +1,260 @@
+theory SoundnessSapicDestructorVariableClash
+
+begin
+
+// Function signature and definition of the equational theory E
+
+functions: adec/2 [destructor], aenc/2, fst/1, pair/2, pk/1, snd/1
+equations:
+    adec(aenc(x.1, pk(x.2)), x.2) = x.1,
+    fst(<x.1, x.2>) = x.1,
+    snd(<x.1, x.2>) = x.2
+
+heuristic: p
+
+lemma dec_reach:
+  exists-trace "∃ #i. Dec( 's' ) @ #i"
+/*
+guarded formula characterizing all satisfying traces:
+"∃ #i. (Dec( 's' ) @ #i)"
+*/
+simplify
+solve( State_211111( 's', sk, x ) ▶₀ #i )
+  case letmadecxsk_1_21111
+  solve( !KU( pk(~n) ) @ #vk.2 )
+    case outpksk_0_211
+    SOLVED // trace found
+  qed
+qed
+
+lemma no_dec:
+  all-traces "∀ m #i. (Dec( m ) @ #i) ⇒ (⊥)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ m #i. (Dec( m ) @ #i)"
+*/
+simplify
+solve( State_211111( m, sk, x ) ▶₀ #i )
+  case letmadecxsk_1_21111
+  solve( !KU( pk(~n) ) @ #vk.2 )
+    case outpksk_0_211
+    SOLVED // trace found
+  qed
+qed
+
+rule (modulo E) Init[color=#ffffff, process="|", issapicrule,
+                     role='Process']:
+   [ ] --[ Init( ) ]-> [ State_( ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) p_0_[color=#ffffff, process="|", issapicrule,
+                     role='Process']:
+   [ State_( ) ] --> [ State_1( ), State_2( ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) A_0_1[color=#ffffff, process="A();", issapicrule,
+                      role='Process']:
+   [ State_1( ) ] --> [ State_11( ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) inx_0_11[color=#804046, process="in(x.1);", issapicrule,
+                         role='A']:
+   [ State_11( ), In( x.1 ) ] --> [ State_111( x.1 ) ]
+
+  /*
+  rule (modulo AC) inx_0_11[color=#804046, process="in(x.1);", issapicrule,
+                            role='A']:
+     [ State_11( ), In( x ) ] --> [ State_111( x ) ]
+  */
+
+rule (modulo E) eventDummyx_0_111[color=#804046,
+                                  process="event Dummy( x.1 );", issapicrule, role='A']:
+   [ State_111( x.1 ) ] --[ Dummy( x.1 ) ]-> [ State_1111( x.1 ) ]
+
+  /*
+  rule (modulo AC) eventDummyx_0_111[color=#804046,
+                                     process="event Dummy( x.1 );", issapicrule, role='A']:
+     [ State_111( x ) ] --[ Dummy( x ) ]-> [ State_1111( x ) ]
+  */
+
+rule (modulo E) p_0_1111[color=#804046, process="0", issapicrule,
+                         role='A']:
+   [ State_1111( x.1 ) ] --> [ ]
+
+  /*
+  rule (modulo AC) p_0_1111[color=#804046, process="0", issapicrule,
+                            role='A']:
+     [ State_1111( x ) ] --> [ ]
+  */
+
+rule (modulo E) B_0_2[color=#ffffff, process="B();", issapicrule,
+                      role='Process']:
+   [ State_2( ) ] --> [ State_21( ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) newsk_0_21[color=#628040, process="new sk.1;",
+                           issapicrule, role='B']:
+   [ State_21( ), Fr( sk.1 ) ] --> [ State_211( sk.1 ) ]
+
+  /*
+  rule (modulo AC) newsk_0_21[color=#628040, process="new sk.1;",
+                              issapicrule, role='B']:
+     [ State_21( ), Fr( sk ) ] --> [ State_211( sk ) ]
+  */
+
+rule (modulo E) outpksk_0_211[color=#628040, process="out(pk(sk.1));",
+                              issapicrule, role='B']:
+   [ State_211( sk.1 ) ] --> [ State_2111( sk.1 ), Out( pk(sk.1) ) ]
+
+  /*
+  rule (modulo AC) outpksk_0_211[color=#628040, process="out(pk(sk.1));",
+                                 issapicrule, role='B']:
+     [ State_211( sk ) ] --> [ State_2111( sk ), Out( pk(sk) ) ]
+  */
+
+rule (modulo E) inx_0_2111[color=#628040, process="in(x.2);",
+                           issapicrule, role='B']:
+   [ State_2111( sk.1 ), In( x.2 ) ] --> [ State_21111( sk.1, x.2 ) ]
+
+  /*
+  rule (modulo AC) inx_0_2111[color=#628040, process="in(x.2);",
+                              issapicrule, role='B']:
+     [ State_2111( sk ), In( x ) ] --> [ State_21111( sk, x ) ]
+  */
+
+rule (modulo E) letmadecxsk_0_21111[color=#ffffff,
+                                    process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+   [ State_21111( sk.1, x.2 ) ] --> [ Let_211111( <x.2, sk.1>, sk.1, x.2 ) ]
+
+  /*
+  rule (modulo AC) letmadecxsk_0_21111[color=#ffffff,
+                                       process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+     [ State_21111( sk, x ) ] --> [ Let_211111( <x, sk>, sk, x ) ]
+  */
+
+rule (modulo E) letmadecxsk_1_21111[color=#ffffff,
+                                    process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+   [ Let_211111( <aenc(m.1, pk(x.4)), x.4>, sk.1, x.2 ) ]
+  -->
+   [ State_211111( m.1, sk.1, x.2 ) ]
+
+  /*
+  rule (modulo AC) letmadecxsk_1_21111[color=#ffffff,
+                                       process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+     [ Let_211111( <aenc(m, pk(x)), x>, sk, x.1 ) ]
+    -->
+     [ State_211111( m, sk, x.1 ) ]
+  */
+
+restriction Restr_letmadecxsk_2_21111_1:
+  "∀ x #NOW.
+    (Restr_letmadecxsk_2_21111_1( x ) @ #NOW) ⇒
+    (∀ m x.1. (<aenc(m, pk(x.1)), x.1> = x) ⇒ (⊥))"
+  // safety formula
+
+  /*
+  expanded formula:
+  "∀ x #NOW.
+    (Restr_letmadecxsk_2_21111_1( x ) @ #NOW) ⇒
+    (∀ m x.1. (<aenc(m, pk(x.1)), x.1> = x) ⇒ (⊥))"
+  */
+
+rule (modulo E) letmadecxsk_2_21111[color=#ffffff,
+                                    process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+   [ Let_211111( <x.2, sk.1>, sk.1, x.2 ) ]
+  --[ Restr_letmadecxsk_2_21111_1( <x.2, sk.1> ) ]->
+   [ State_211112( sk.1, x.2 ) ]
+
+  /*
+  rule (modulo AC) letmadecxsk_2_21111[color=#ffffff,
+                                       process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+     [ Let_211111( <x, sk>, sk, x ) ]
+    --[ Restr_letmadecxsk_2_21111_1( <x, sk> ) ]->
+     [ State_211112( sk, x ) ]
+  */
+
+rule (modulo E) eventDecm_0_211111[color=#628040,
+                                   process="event Dec( m.1 );", issapicrule, role='B']:
+   [ State_211111( m.1, sk.1, x.2 ) ]
+  --[ Dec( m.1 ) ]->
+   [ State_2111111( m.1, sk.1, x.2 ) ]
+
+  /*
+  rule (modulo AC) eventDecm_0_211111[color=#628040,
+                                      process="event Dec( m.1 );", issapicrule, role='B']:
+     [ State_211111( m, sk, x ) ]
+    --[ Dec( m ) ]->
+     [ State_2111111( m, sk, x ) ]
+  */
+
+rule (modulo E) p_0_2111111[color=#628040, process="0", issapicrule,
+                            role='B']:
+   [ State_2111111( m.1, sk.1, x.2 ) ] --> [ ]
+
+  /*
+  rule (modulo AC) p_0_2111111[color=#628040, process="0", issapicrule,
+                               role='B']:
+     [ State_2111111( m, sk, x ) ] --> [ ]
+  */
+
+rule (modulo E) eventFail_0_211112[color=#628040,
+                                   process="event Fail( );", issapicrule, role='B']:
+   [ State_211112( sk.1, x.2 ) ]
+  --[ Fail( ) ]->
+   [ State_2111121( sk.1, x.2 ) ]
+
+  /*
+  rule (modulo AC) eventFail_0_211112[color=#628040,
+                                      process="event Fail( );", issapicrule, role='B']:
+     [ State_211112( sk, x ) ] --[ Fail( ) ]-> [ State_2111121( sk, x ) ]
+  */
+
+rule (modulo E) p_0_2111121[color=#628040, process="0", issapicrule,
+                            role='B']:
+   [ State_2111121( sk.1, x.2 ) ] --> [ ]
+
+  /*
+  rule (modulo AC) p_0_2111121[color=#628040, process="0", issapicrule,
+                               role='B']:
+     [ State_2111121( sk, x ) ] --> [ ]
+  */
+
+restriction single_session:
+  "∀ #i #j. ((Init( ) @ #i) ∧ (Init( ) @ #j)) ⇒ (#i = #j)"
+  // safety formula
+
+  /*
+  expanded formula:
+  "∀ #i #j. ((Init( ) @ #i) ∧ (Init( ) @ #j)) ⇒ (#i = #j)"
+  */
+
+/* All wellformedness checks were successful. */
+
+/*
+Generated from:
+Tamarin version 1.13.0
+Maude version 3.5.1
+Git revision: 08a5721c8d977b916645b02269b234eee0a27b8d (with uncommited changes), branch: msr-core-soundness
+Compiled at: 2026-09-16 15:08:15.317916225 UTC
+*/
+
+end
+/* Output
+
+==============================================================================
+summary of summaries:
+
+analyzed: examples/regression/trace/soundness-sapic-destructor-variable-clash.spthy
+
+  output:          examples/regression/trace/soundness-sapic-destructor-variable-clash.spthy.tmp
+  processing time: 0.08s
+
+  dec_reach (exists-trace): verified (4 steps)
+  no_dec (all-traces): falsified - found trace (4 steps)
+
+==============================================================================
+*/
