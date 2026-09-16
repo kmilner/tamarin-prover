@@ -9,6 +9,12 @@ rule Hash:
 rule Compare:
   [ In(x), In(%n) ] --[ Compare(x, %n) ]-> []
 
+rule Restricted:
+  [ In(x), In(%n) ] --[ A(x), B(x, %n) ]-> []
+
+restriction no_nat:
+  "All %m #i. A(%m)@i ==> F"
+
 // A negative mixed-sort subterm must not be flipped to natural arithmetic.
 // Expected: falsified; the reachable hash is not a subterm of a natural.
 lemma hash_is_smaller:
@@ -43,5 +49,16 @@ lemma typed_not_reflexive:
 lemma typed_total_order:
   "All %m %n #i. Compare(%m, %n)@i
     ==> (%m << %n | %n << %m | %m = %n)"
+
+// Positive x << %n must refine x to nat and activate no_nat.
+lemma restricted_subterm:
+  "All x %n #i. B(x, %n)@i ==> not (x << %n)"
+
+lemma restricted_equality:
+  "All x %n #i. B(x, %n)@i ==> not (x = %n)"
+
+// The restriction still permits non-natural messages.
+lemma restricted_non_nat_exists:
+  exists-trace "Ex %n #i. B('a', %n)@i"
 
 end
