@@ -45,6 +45,8 @@ tests maudePath = TestList <$> sequence
     , jointConditionalRestrictionTests maudePath
     , specializedMirrorTests maudePath
     , mixedRestrictionFilterTests maudePath
+    , diffRestrictionLocalityTests maudePath
+    , diffRestrictionPreservationTests maudePath
     , partialEvaluationDiffTests maudePath
     ]
 
@@ -666,6 +668,91 @@ mixedRestrictionFilterTests maudePath = do
     pure $ TestLabel "Mixed restriction filtering" $ TestCase $
       assertEqual "action-free Boolean cases keep their complete restrictions"
         restrictions (filterRestrictions rightCtxt sys restrictions)
+
+diffRestrictionLocalityTests :: FilePath -> IO Test
+diffRestrictionLocalityTests maudePath = do
+    open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+      [ "theory DiffRestrictionLocality begin"
+      , "rule R: [] --[ A('a'), B('b') ]-> []"
+      , "restriction Local [right]: \"All x #i. A(x)@i ==> x='a'\""
+      , "restriction SameNode [right]: \"All #i. A('a')@i & B('b')@i ==> F\""
+      , "restriction Conjoined [right]: \"(All #i. A('a')@i ==> F) & (All #j. B('b')@j ==> F)\""
+      , "restriction TwoNodes [right]: \"All x #i #j. A(x)@i & A(x)@j ==> #i=#j\""
+      , "restriction Causal [right]: \"All x #i. A(x)@i ==> Ex #j. B(x)@j & #j<#i\""
+      , "restriction Choice [right]: \"(All #i. A('a')@i ==> F) | (All #j. B('b')@j ==> F)\""
+      , "diffLemma D:", "end"
+      ]
+    thy <- closeDiffTheory maudePath open False
+    let restriction name = formulaToGuarded_ $ L.get rstrFormula $ head
+          [r | r <- diffTheorySideRestrictions RHS thy, L.get rstrName r == name]
+        expected = [("Local",True), ("SameNode",True), ("Conjoined",True),
+                    ("TwoNodes",False), ("Causal",False), ("Choice",False)]
+        notice = render (prettyDiffRestrictionLimit thy)
+    pure $ TestLabel "Diff restriction locality" $ TestList $
+      [TestCase $ do
+         assertEqual name local (isDiffLocalRestriction (restriction name))
+         assertEqual ("notice names only non-local restrictions: " ++ name)
+           (not local) (("RHS: " ++ name) `isInfixOf` notice)
+      | (name, local) <- expected]
+
+diffRestrictionPreservationTests :: FilePath -> IO Test
+diffRestrictionPreservationTests maudePath = do
+    cases <- sequence [check name rules restrictions expected | (name, rules, restrictions, expected) <- models]
+    pure $ TestLabel "Diff restriction preservation" $ TestList cases
+  where
+    once event = "All x #i #j. " ++ event ++ "(x)@i & " ++ event ++ "(x)@j ==> #i=#j"
+    seed = "rule Seed: [Fr(~k)] --[ Start(~k), Setup() ]-> [ State(~k), !Tag(~k) ]"
+    step = "rule Step: [State(k), !Tag(k)] --[ End(k) ]-> [ State(k), Out('ok') ]"
+    shared f = ["restriction R: \"" ++ f ++ "\""]
+    models =
+      [ ("shared marker", [seed, step],
+          shared "All #i #j. Setup()@i & Setup()@j ==> #i=#j", True)
+      , ("fresh identifier through recursive state", [seed, step], shared (once "End"), True)
+      , ("causal existential", [seed, step],
+          shared "All k #i. End(k)@i ==> Ex #j. Start(k)@j & #j<#i", True)
+      , ("whole disjunction", [seed, step],
+          shared "(All #i. Setup()@i ==> F) | (All k #j. End(k)@j ==> F)", True)
+      , ("ground arguments", ["rule R: [] --[ A('a') ]-> []"], shared (once "A"), True)
+      , ("new public argument", ["rule R: [] --[ A($p) ]-> []"], shared (once "A"), True)
+      , ("one-sided marker", [seed, step],
+          ["restriction R [right]: \"All #i #j. Setup()@i & Setup()@j ==> #i=#j\""], False)
+      , ("identical syntax with attacker input", ["rule R: [In(x)] --[ A(x) ]-> []"], shared (once "A"), False)
+      , ("changed ground argument", ["rule R: [] --[ A(diff('a','b')) ]-> []"], shared (once "A"), False)
+      , ("changed state propagates", ["rule Seed: [] --> [ F(diff('a','b')) ]",
+          "rule Move: [F(x)] --> [G(x)]", "rule R: [G(x)] --[ A(x) ]-> []"], shared (once "A"), False)
+      , ("constructor inversion is not assumed", ["functions: f/1", "rule Seed: [Fr(~k)] --> [F(f(~k))]",
+          "rule R: [F(f(x))] --[ A(x) ]-> []"], shared (once "A"), False)
+      , ("explicit sides omit an action", ["rule R: [] --[ A('a') ]-> []",
+          "left rule R: [] --[ A('a') ]-> []", "right rule R: [] --> []"], shared (once "A"), False)
+      , ("compiled variants carry different arguments", ["builtins: symmetric-encryption",
+          "rule R: [In(x), In(k)] --[ A(sdec(x,k)) ]-> []"], shared (once "A"), False)
+      , ("intruder knowledge is not certified", ["rule R: [Fr(~k)] --[ A(~k) ]-> [Out(~k)]"],
+          shared "All k #i #j. A(k)@i & KU(k)@j ==> #i<#j", False)
+      ] ++
+      [ ("empty producer " ++ input ++ " " ++ output ++ " " ++ formula,
+          [seed, "rule Observe: [" ++ premise ++ "] --[End(k)]-> []", "rule Dead: [Fr(~n), In(" ++ input ++ ")] --[" ++ actions ++ "]-> [" ++ output ++ "]"],
+          shared formula, expected)
+      | input <- ["diff(~n,'known')", "diff('known',~n)", "~n"]
+      , (actions, output, formula, independent) <-
+          [("Dead()", "Out('bad')", once "End", True),
+           ("Dead()", "Out('bad')", "All k #i. End(k)@i ==> Ex #j. Start(k)@j & #j<#i", True),
+           ("End(~n)", "Out('bad')", once "End", False),
+           ("Dead()", "State(~n)", once "End", False),
+           ("Dead()", "!Tag(~n)", once "End", False)]
+      , let premise = if output == "!Tag(~n)" then "!Tag(k)" else "State(k)"
+      , let expected = independent || input == "~n"
+      ]
+    check name rules restrictions expected = do
+      open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines $
+        ["theory RestrictionPreservation begin"] ++ rules ++ restrictions ++ ["diffLemma D:", "end"]
+      thy <- closeDiffTheory maudePath open False
+      let ctxt = getDiffProofContext (head (diffTheoryDiffLemmas thy)) thy
+          forms side = map (formulaToGuarded_ . L.get rstrFormula) (diffTheorySideRestrictions side thy)
+          supported = all (isDiffRestrictionSupported (L.get dpcPreservedActions ctxt) (forms LHS)) (forms RHS)
+      pure $ TestLabel name $ TestCase $ do
+        assertEqual "restriction certificate" expected supported
+        assertEqual "notice agrees with proof applicability" (not expected)
+          ("RHS: R" `isInfixOf` render (prettyDiffRestrictionLimit thy))
 
 partialEvaluationDiffTests :: FilePath -> IO Test
 partialEvaluationDiffTests maudePath = do

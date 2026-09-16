@@ -366,9 +366,22 @@ execDiffProofMethod ctxt method sys =
       guard (isJust $ L.get dsCurrentRule sys)
       msys' >>= guard . trivial
       mallSubtermsFinished >>= guard
+      side <- mside
+      guard $ all (isDiffRestrictionSupported (L.get dpcPreservedActions ctxt)
+                     (restrictionsFor side)) $ restrictionsFor (opposite side)
       mirrorSyss <- mmirrorSyss
-      solved <- isSolved <$> mside <*> msys'
-      guard (fst (evaluateRestrictions ctxt sys mirrorSyss solved) == TTrue)
+      solved <- isSolved side <$> msys'
+      -- Shared non-local restrictions admitted above hold on the full mirror
+      -- because their entire action interpretation is preserved. Rechecking
+      -- them on this dependency graph would lose that fact: an existential
+      -- witness, for example, can occur elsewhere in the original trace.
+      -- Keep the original restrictions for specialization checks, and leave
+      -- attack search using the complete restriction set.
+      let localMirrorRestrictions = L.modify dpcRestrictions
+            (map (\(s, forms) -> (s, if s == opposite side
+                then filter isDiffLocalRestriction $ concatMap guardedConjuncts forms
+                else forms))) ctxt
+      guard (fst (evaluateRestrictions localMirrorRestrictions sys mirrorSyss solved) == TTrue)
       return M.empty
     DiffAttack -> do
       guard (L.get dsProofType sys == Just RuleEquivalence)
@@ -401,6 +414,7 @@ execDiffProofMethod ctxt method sys =
     mmirrorSyss          = getMirrorDG ctxt <$> mside <*> msys'
     mctxt                = eitherProofContext ctxt <$> mside
     mmirrorCtxt          = eitherProofContext ctxt . opposite <$> mside
+    restrictionsFor s   = concat [forms | (s', forms) <- L.get dpcRestrictions ctxt, s == s']
     mallSubtermsFinished = do
       finished <- finishedSubterms <$> mctxt <*> msys'
       finishedMirrored <- (all . finishedSubterms <$> mmirrorCtxt) <*> mmirrorSyss

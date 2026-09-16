@@ -1,0 +1,19 @@
+theory UnrelatedEmptyFamily begin
+
+// Dead compiles to no rules on either side: a symmetric empty-family control.
+// Its unreachable family must not disable the independent A/B certificates
+// needed to transfer shared uniqueness and causal-order restrictions.
+rule Setup: [Fr(~n)] --[A(~n)]-> [State(~n), Out('ok')]
+rule Finish: [State(n)] --[B(n)]-> []
+rule Dead: [Fr(~n), In(~n)] --[Dead()]-> [Out('bad')]
+
+restriction Impossible: "All #i. Dead()@i ==> F"
+restriction Unique: "All n #i #j. A(n)@i & A(n)@j ==> #i=#j"
+restriction Order: "All n #i. B(n)@i ==> Ex #j. A(n)@j & #j<#i"
+
+lemma setup: exists-trace "Ex n #i. A(n)@i"
+lemma finish: exists-trace "Ex n #i. B(n)@i"
+lemma dead: all-traces "All #i. Dead()@i ==> F"
+
+diffLemma D:
+end

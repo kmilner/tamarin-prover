@@ -25,7 +25,7 @@ import           Prelude                             hiding (id, (.))
 
 
 -- import           Data.Typeable
-import           Data.Monoid                         (Sum(..))
+import           Data.Monoid                         (Sum(..), Any(..))
 
 -- import qualified Data.Label.Total
 
@@ -204,6 +204,7 @@ getDiffProofContext l thy = DiffProofContext (proofContext LHS) (proofContext RH
     (map (L.get dprRule) $ diffTheoryDiffRules thy) (L.get (crConstruct . crcRules . diffThyDiffCacheLeft) thy)
     (L.get (crDestruct . crcRules . diffThyDiffCacheLeft) thy)
     ((LHS, restrictionsLeft):[(RHS, restrictionsRight)]) gatherReusableLemmas
+    (preservedDiffActions thy)
   where
     items = L.get diffThyItems thy
     restrictionsLeft  = do EitherRestrictionItem (LHS, rstr) <- items
@@ -566,10 +567,45 @@ prettyClosedSummary thy =
 
     proofStepSummary = proofStepStatus &&& const (Sum (1::Integer))
 
+-- | Use the same compiled caches as the diff proof contexts. Computing the
+-- certificate once per context avoids repeating the fixed point per branch.
+preservedDiffActions :: ClosedDiffTheory -> S.Set FactTag
+preservedDiffActions thy = diffPreservedActionTags
+    (joinAllRules $ L.get (crcRules . diffThyDiffCacheLeft) thy)
+    (joinAllRules $ L.get (crcRules . diffThyDiffCacheRight) thy)
+
+-- | An informational limitation, not an input error: side lemmas and attack
+-- search remain meaningful when restriction preservation is not established.
+prettyDiffRestrictionLimit :: Document d => ClosedDiffTheory -> d
+prettyDiffRestrictionLimit thy
+  | null unsupported = emptyDoc
+  | otherwise =
+      text "Equivalence proof may remain incomplete: preservation of these restrictions" $$
+      text "across multiple events could not be established:" $$
+      nest 2 (vcat [text (show side ++ ": " ++ name) | (side, name) <- unsupported]) $$
+      text "These restrictions remain enforced. Side lemmas and attack search are still available."
+  where
+    preserved = preservedDiffActions thy
+    formula = formulaToGuarded_ . L.get rstrFormula
+    unsupported =
+      [(side, L.get rstrName restriction)
+      | (side, restriction) <- diffTheoryRestrictions thy
+      , not $ isDiffRestrictionSupported preserved
+          (map formula $ diffTheorySideRestrictions (opposite side) thy)
+          (formula restriction)
+      ]
+
 prettyClosedDiffSummary :: Document d => ClosedDiffTheory -> d
 prettyClosedDiffSummary thy =
-    (vcat lemmaSummaries) $$ (vcat diffLemmaSummaries)
+    (vcat lemmaSummaries) $$ (vcat diffLemmaSummaries) $$ limitation
   where
+    limitation
+      | any (getAny . foldDiffProof attempted . L.get lDiffProof) (diffTheoryDiffLemmas thy)
+          = prettyDiffRestrictionLimit thy
+      | otherwise = emptyDoc
+    attempted (DiffProofStep (DiffSorry _) _) = Any False
+    attempted _ = Any True
+
     lemmaSummaries = do
         EitherLemmaItem (s, lem)  <- L.get diffThyItems thy
         -- Note that here we are relying on the invariant that all proof steps

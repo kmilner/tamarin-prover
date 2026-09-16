@@ -275,6 +275,11 @@ ccs15-case-studies:	$(CCS15_TARGETS)
 REGRESSION_OBSEQ_CASE_STUDIES=issue223.spthy issue198-1.spthy issue198-2.spthy issue324.spthy issue331.spthy
 REGRESSION_OBSEQ_TARGETS=$(subst .spthy,_analyzed-diff.spthy,$(addprefix case-studies$(SUBDIR)regression/diff/,$(REGRESSION_OBSEQ_CASE_STUDIES)))
 
+# Preservation of these multi-event restrictions is not established. Bound
+# their regression searches, which deliberately leave equivalence incomplete.
+case-studies$(SUBDIR)regression/diff/issue324_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--bound=5
+case-studies$(SUBDIR)regression/diff/issue331_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--bound=5
+
 TESTOBSEQ_CASE_STUDIES=AxiomDiffTest1.spthy AxiomDiffTest2.spthy AxiomDiffTest3.spthy AxiomDiffTest4.spthy N5N6DiffTest.spthy MacroDiffprobEnc.spthy
 TESTOBSEQ_TARGETS=$(subst .spthy,_analyzed-diff.spthy,$(addprefix case-studies$(SUBDIR)features/equivalence/,$(TESTOBSEQ_CASE_STUDIES))) $(REGRESSION_OBSEQ_TARGETS)
 
@@ -484,20 +489,27 @@ accountability-case-studies:	$(ACCOUNTABILITY_CS_TARGETS)
 
 FAST_REGRESSION_CASE_STUDIES=issue446-1.spthy issue446-2.spthy issue753-4.spthy issue753-5.spthy issue753-6.spthy issue834.spthy issue777.spthy issue770.spthy issue914.spthy
 COMMON_REGRESSION_CASE_STUDIES=msr-macro-injectivity.spthy msr-injective-last.spthy msr-source-premise-index.spthy nat-subterm-sorts.spthy soundness-subterm-witness.spthy soundness-manual-variants-complete.spthy soundness-safety-false.spthy soundness-partial-evaluation-variants.spthy partial-evaluation-export.spthy partial-evaluation-collision.spthy soundness-induction-empty-equality.spthy
-DIFF_REGRESSION_CASE_STUDIES=soundness-diff-macros.spthy soundness-diff-source-side.spthy soundness-diff-mirror-restriction.spthy soundness-diff-mirror-false-restriction.spthy soundness-diff-mirror-unifiers.spthy soundness-diff-roundtrip.spthy soundness-diff-hidden-reuse.spthy soundness-diff-conditional-restriction.spthy soundness-diff-mixed-restriction.spthy soundness-diff-unreachable-trivial-goal.spthy
+DIFF_REGRESSION_CASE_STUDIES=soundness-diff-macros.spthy soundness-diff-source-side.spthy soundness-diff-mirror-restriction.spthy soundness-diff-mirror-false-restriction.spthy soundness-diff-mirror-unifiers.spthy soundness-diff-roundtrip.spthy soundness-diff-hidden-reuse.spthy soundness-diff-conditional-restriction.spthy soundness-diff-mixed-restriction.spthy soundness-diff-unreachable-trivial-goal.spthy soundness-diff-multisession-restriction.spthy
 DIFF_REGRESSION_CASE_STUDIES+=soundness-diff-partial-evaluation-variants.spthy soundness-diff-partial-evaluation-refinement.spthy
-DIFF_REGRESSION_CASE_STUDIES+=diff-alternative-conditional-restrictions.spthy
+DIFF_REGRESSION_CASE_STUDIES+=soundness-diff-preserved-restrictions.spthy diff-alternative-conditional-restrictions.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-joint-conditional-attack.spthy diff-joint-conditional-restrictions.spthy
-DIFF_REGRESSION_CASE_STUDIES+=diff-explicit-variant-export.spthy diff-asymmetric-explicit-variants.spthy diff-singleton-trivial-variants.spthy
+DIFF_REGRESSION_CASE_STUDIES+=diff-multisession-observable-restriction.spthy diff-explicit-variant-export.spthy diff-asymmetric-explicit-variants.spthy diff-singleton-trivial-variants.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-variant-family-roundtrip.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-auto-source-variable-alignment.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-empty-left-family.spthy diff-empty-right-family.spthy diff-empty-both-families.spthy
+DIFF_REGRESSION_CASE_STUDIES+=diff-unrelated-empty-left.spthy diff-unrelated-empty-right.spthy diff-unrelated-empty-both.spthy
 FAST_REGRESSION_CASE_STUDIES+=$(COMMON_REGRESSION_CASE_STUDIES)
 FAST_REGRESSION_TARGETS=$(subst .spthy,_analyzed.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(FAST_REGRESSION_CASE_STUDIES)))
 DIFF_REGRESSION_TARGETS=$(subst .spthy,_analyzed-diff.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(DIFF_REGRESSION_CASE_STUDIES)))
 
 
+# Bound the empty-family certificate regressions even if certification regresses.
+case-studies$(SUBDIR)regression/trace/diff-unrelated-empty-left_analyzed-diff.spthy case-studies$(SUBDIR)regression/trace/diff-unrelated-empty-right_analyzed-diff.spthy case-studies$(SUBDIR)regression/trace/diff-unrelated-empty-both_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--bound=10 --quit-on-warning
 
+# This one-sided multi-event restriction leaves equivalence incomplete. Bound
+# its search while retaining complete proofs of the side lemmas.
+case-studies$(SUBDIR)regression/trace/soundness-diff-multisession-restriction_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--bound=7
+case-studies$(SUBDIR)regression/trace/diff-multisession-observable-restriction_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--bound=6
 
 
 # This example checks explicit-variant export and its side lemmas. Bound the

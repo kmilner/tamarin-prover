@@ -32,6 +32,7 @@ where
 
 import Accountability qualified as Acc
 import Accountability.Generation qualified as Acc
+import ClosedTheory (prettyDiffRestrictionLimit)
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
 import Control.Monad
@@ -694,6 +695,15 @@ closeTranslatedTheory thyOpts sign srcThy = do
           (proveTheory selector prover)
           (proveDiffTheory selector prover diffProver)
           partialThy
+
+  -- Check the compiled/refined rules used by proof search, and report this
+  -- limitation only when an equivalence proof is requested. It is informational
+  -- so --quit-on-warning still permits side lemmas and attack search.
+  case partialThy of
+    Right thy | thyOpts.proveMode && any selector (diffTheoryDiffLemmas thy) -> do
+      let notice = Pretty.render (prettyDiffRestrictionLimit thy)
+      unless (null notice) (traceM notice)
+    _ -> pure ()
 
   traceM ("[Theory " ++ theoryName srcThy ++ "] Theory closed")
 
