@@ -1,0 +1,11 @@
+theory SoundnessDHActionMultiplication
+begin
+
+builtins: diffie-hellman
+
+// A product in an action must trigger the multiplication-restriction warning.
+// With --quit-on-warning this theory must be rejected.
+rule Product:
+  [ In(x), In(y) ] --[ Product(x*y) ]-> []
+
+end
