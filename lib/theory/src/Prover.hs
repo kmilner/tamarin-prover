@@ -99,8 +99,19 @@ closeDiffTheoryWithMaude sig thy0 autoSources =
     hnd = L.get sigmMaudeHandle sig
 
     theoryItems = map expandRuleItem (L.get diffThyItems thy0)
-               ++ map (\x -> EitherRuleItem (LHS, x)) leftOpenRules
-               ++ map (\x -> EitherRuleItem (RHS, x)) rightOpenRules
+               ++ missingSideRules LHS leftOpenRules
+               ++ missingSideRules RHS rightOpenRules
+    -- Reopened theories already contain the compiled side rules, including
+    -- explicit variants and generated source actions. Do not append another
+    -- copy derived from the diff rule, or replace that preserved information.
+    missingSideRules side rules =
+      [ EitherRuleItem (side, ru)
+      | ru <- rules
+      , not $ any (sameSideRule side ru) (L.get diffThyItems thy0)
+      ]
+    sameSideRule side ru (EitherRuleItem (side', ru')) =
+      side == side' && getOpenProtoRuleName ru == getOpenProtoRuleName ru'
+    sameSideRule _ _ _ = False
     expandRuleItem (DiffRuleItem ru) =
       DiffRuleItem (applyMacroInDiffProtoRule (diffTheoryMacros thy0) ru)
     expandRuleItem (EitherRuleItem (side, ru)) =

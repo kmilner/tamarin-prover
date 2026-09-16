@@ -1,6 +1,12 @@
 -- Focused invariants at boundaries that can change proof verdicts.
 module Test.VerdictTests (tests) where
 
+import Data.List (isInfixOf, sort)
+import Data.Maybe (fromJust)
+import qualified Control.Category as C
+import Control.Monad.Reader (runReader)
+import Lemma
+import Logic.Connectives (Disj(..))
 import qualified Data.Map as M
 import qualified Data.Set as S
 import qualified Extension.Data.Label as L
@@ -8,17 +14,30 @@ import Test.HUnit
 
 import ClosedTheory
 import Prover
+import OpenTheory (prettyOpenDiffTheory, addIntrRuleLabels, getLeftProtoRule, getRightProtoRule,
+                   addIntrRuleACsDiffBoth, addIntrRuleACsDiffBothDiff, addProtoRuleLabel, addDefaultDiffLemma)
 import Rule
 import Theory.Model
 import Theory.Constraint.System
+import Theory.Constraint.Solver.ProofMethod (execDiffProofMethod, DiffProofMethod(DiffRuleEquivalence))
 import Theory.Text.Parser
+import Theory.Text.Pretty (render)
+import Theory.Tools.AbstractInterpretation (EvaluationStyle(Silent))
+import Theory.Tools.IntruderRules (subtermConstructorRules, specialIntruderRules, destructionRulesNoEq)
+import Theory.Tools.Wellformedness (checkWellformednessDiff, prettyWfErrorReport)
 import TheoryObject
 
 -- Exercise the real mirror enumerator, including Maude AC unification and
 -- graph-wide consistency. Two connected consumers make four independent
 -- assignments, distinguishable by their action arguments.
 tests :: FilePath -> IO Test
-tests maudePath = do
+tests maudePath = TestList <$> sequence
+    [ mirrorTests maudePath
+    , roundTripTests maudePath
+    ]
+
+mirrorTests :: FilePath -> IO Test
+mirrorTests maudePath = do
     let parsed = parseOpenDiffTheoryString [] $ unlines
           [ "theory MirrorUnifiers begin"
           , "builtins: multiset"
@@ -54,3 +73,50 @@ tests maudePath = do
         [check 3 [[a,b] | a <- [["a","b"],["b","a"]], b <- [["c","d"],["d","c"]]] side | side <- [LHS,RHS]]
   where
     appendTests a b = TestList [a,b]
+
+roundTripTests :: FilePath -> IO Test
+roundTripTests maudePath = do
+    let models =
+          [ ["rule Emit: [] --[ A(diff('a','b')) ]-> [Out('hello')]"]
+          , [ "builtins: symmetric-encryption"
+            , "macros: m(x) = x"
+            , "rule Dec: [ Fr(~n), In(x), In(k) ] --[ A(m(~n)) ]-> [ Out(sdec(x,k)), Out(diff(m(~n),k)) ]"
+            , "lemma source [left,sources]: \"All n #i. A(n)@i ==> T\""
+            , "restriction right_only [right]: \"All n #i. A(n)@i ==> T\""
+            ]
+          , [ "rule Emit: [] --[ A(diff('a','b')) ]-> []"
+            , "left rule Emit: [] --[ A('a') ]-> []"
+            , "right rule Emit: [] --[ A('b') ]-> []"
+            ]
+          , [ "builtins: symmetric-encryption"
+            , "rule Dec: [ In(x), In(k) ] --> [ Out(sdec(x,k)) ]"
+            , "left rule Dec: [ In(x), In(k) ] --> [ Out(sdec(x,k)) ]"
+            , "variants rule (modulo AC) Dec1: [ In(x), In(k) ] --> [ Out(sdec(x,k)) ],"
+            , "rule (modulo AC) Dec2: [ In(senc(z,k)), In(k) ] --> [ Out(z) ]"
+            , "right rule Dec: [ In(x), In(k) ] --> [ Out(sdec(x,k)) ]"
+            , "variants rule (modulo AC) Dec1: [ In(x), In(k) ] --> [ Out(sdec(x,k)) ],"
+            , "rule (modulo AC) Dec2: [ In(senc(z,k)), In(k) ] --> [ Out(z) ]"
+            ]
+          , [ "builtins: multiset"
+            , "rule Produce: [] --> [ F('a' ++ 'b') ]"
+            , "rule Consume: [ F(x ++ y) ] --[ A(x,y,$p) ]-> []"
+            ]
+          ]
+    cases <- sequence [makeCase model auto | model <- models, auto <- [False,True]]
+    pure $ TestLabel "Diff theory close/open/close" $ TestList cases
+  where
+    makeCase model auto = do
+        open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $
+            unlines (["theory RoundTrip begin"] ++ model ++ ["diffLemma D:","end"])
+        first <- closeDiffTheory maudePath open auto
+        let reclose t = closeDiffTheoryWithMaude (L.get diffThySignature t) (openDiffTheory t) auto
+            second = reclose first
+            third = reclose second
+            rules t = (sort (leftTheoryRules t), sort (rightTheoryRules t))
+            caches t = [L.get label t | label <- [diffThyCacheLeft,diffThyCacheRight,diffThyDiffCacheLeft,diffThyDiffCacheRight]]
+            nonRules t = [item | item <- L.get diffThyItems (openDiffTheory t),
+                                case item of EitherRuleItem _ -> False; _ -> True]
+        pure $ TestCase $ mapM_ (\t -> do
+            assertEqual "side rules, variants and new variables" (rules first) (rules t)
+            assertEqual "lemmas, restrictions and proof skeletons" (nonRules first) (nonRules t)
+            assertEqual "all four rule/source caches" (caches first) (caches t)) [second,third]
