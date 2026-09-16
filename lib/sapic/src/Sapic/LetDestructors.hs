@@ -24,20 +24,20 @@ import           Term.SubtermRule
 import           Control.Monad.Catch
 
 mapProc :: ( MonadThrow m)
-                    =>  Set CtxtStRule -> LProcess (ProcessAnnotation LVar) -> m (LProcess (ProcessAnnotation LVar))
-mapProc _  (ProcessNull ann)  = return $ ProcessNull ann
-mapProc rules (ProcessAction ac ann p') = do
-  pr <- mapProc rules p'
+                    => [LNTerm] -> Set CtxtStRule -> LProcess (ProcessAnnotation LVar) -> m (LProcess (ProcessAnnotation LVar))
+mapProc _ _  (ProcessNull ann)  = return $ ProcessNull ann
+mapProc avoidTerms rules (ProcessAction ac ann p') = do
+  pr <- mapProc avoidTerms rules p'
   return $ ProcessAction ac ann pr
 
-mapProc rules (ProcessComb c@(Let t1 t2 mv) _ pl pr) =
+mapProc avoidTerms rules (ProcessComb c@(Let t1 t2 mv) _ pl pr) =
   case (t1, viewTerm t1', viewTerm t2') of
     (LIT (Var _) ,Lit (Var _), FApp funsym@(NoEq (_, (_,_,Destructor,_))) rightterms) ->
       -- we are in the case where the let binding is of the form let invar = dest(rightTerms) in
       (case  L.foldl (findRule funsym) Nothing rules of
         -- if the desrtructor does not have any associated rule, it never succeed, and we thus always go in the else branch we simply substitute in the process, to optimize
-        Nothing -> mapProc rules pr
-        Just  (leftterms, outvar) -> do
+        Nothing -> mapProc avoidTerms rules pr
+        Just (leftterms0, outvar0) -> do
           -- TODO we should handle fresh vars here
           -- We extract the equation of the dest, in the case where it is of the
           -- form dest(lefTerms) = outvar.
@@ -49,19 +49,22 @@ mapProc rules (ProcessComb c@(Let t1 t2 mv) _ pl pr) =
           -- sdec(m,sk) in" with the equation "sdec(senc(v,key),key) = v" into
           -- the binding "let senc(x,key),key = m,sk in"
 
-          npl <- mapProc rules pl
-          npr <- mapProc rules pr
+          npl <- mapProc avoidTerms rules pl
+          npr <- mapProc avoidTerms rules pr
           return $ ProcessComb c new_an npl npr
-          where leftermssubst = apply subst $ toPairs leftterms
+          -- Equation variables are local pattern binders. Freshen them away
+          -- from the whole process, including variables bound before this let.
+          where (leftterms, outvar) = renameAvoiding (leftterms0, outvar0) avoidTerms
+                leftermssubst = apply subst $ toPairs leftterms
                 subst = substFromList [(outvar, t1')]
                 new_an = annDestructorEquation leftermssubst (toPairs rightterms) elsebranch
           )
     (LIT (Var svar) , _ , _ )  | not (svar `S.member` mv) -> do
       res <- applyM (substFromList ((,t2) <$> make_untyped_variant svar)) pl
-      mapProc rules res
+      mapProc avoidTerms rules res
     _ -> do
-      npl <- mapProc rules pl
-      npr <- mapProc rules pr
+      npl <- mapProc avoidTerms rules pl
+      npr <- mapProc avoidTerms rules pr
       return $ ProcessComb c (annElse elsebranch)  npl npr
 
 
@@ -79,9 +82,9 @@ mapProc rules (ProcessComb c@(Let t1 t2 mv) _ pl pr) =
             [svar, SapicLVar sl_var Nothing]
           make_untyped_variant svar = [svar]
 
-mapProc rules (ProcessComb c ann pl pr) = do
-  npl <- mapProc rules pl
-  npr <- mapProc rules pr
+mapProc avoidTerms rules (ProcessComb c ann pl pr) = do
+  npl <- mapProc avoidTerms rules pl
+  npr <- mapProc avoidTerms rules pr
   return $ ProcessComb c ann npl npr
 
 findRule :: FunSym
@@ -97,4 +100,6 @@ findRule funsym acc rule =
 
 translateLetDestr :: ( MonadThrow m)
                     =>  Set CtxtStRule -> LProcess (ProcessAnnotation LVar) -> m (LProcess (ProcessAnnotation LVar))
-translateLetDestr = mapProc
+translateLetDestr rules p = mapProc processVars rules p
+  where
+    processVars = [varTerm v | SapicLVar v _ <- S.toList $ varsProc p]
