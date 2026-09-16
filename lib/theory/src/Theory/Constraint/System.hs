@@ -1119,7 +1119,12 @@ impliedFormulas hnd sys gf0 = res
             succedent'               = gall [] otherAtoms succedent
         subst <- candidateSubsts emptySubst actionsEqs
         return $ unskolemizeLNGuarded $ applySkGuarded subst succedent'
-      _ -> []
+      -- A lemma without an outer universal guard is available as a whole.
+      -- Returning it here lets the reduction insert ground atoms,
+      -- conjunctions, and disjunctions through the normal formula rules.
+      -- Previously such safety restrictions were stored in sLemmas but
+      -- never entered the constraint system.
+      _ -> [gf0]
     gf = skolemizeGuarded gf0
 
     prepare (Action i fa) = Left  (GAction i fa)
