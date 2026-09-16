@@ -21,7 +21,12 @@ import TheoryObject
 -- graph-wide consistency. Two connected consumers make four independent
 -- assignments, distinguishable by their action arguments.
 tests :: FilePath -> IO Test
-tests maudePath = TestList <$> sequence [mirrorTests maudePath, roundTripTests maudePath, assumptionTests maudePath]
+tests maudePath = TestList <$> sequence
+    [ mirrorTests maudePath
+    , roundTripTests maudePath
+    , assumptionTests maudePath
+    , conditionalRestrictionTests maudePath
+    ]
 
 mirrorTests :: FilePath -> IO Test
 mirrorTests maudePath = do
@@ -146,3 +151,33 @@ assumptionTests maudePath = do
       , TestCase $ assertEqual "all hidden diff lemmas" [] (diffAssumptions "AllHidden")
       , TestCase $ assertEqual "visible diff reuse retains both sides" [LHS,RHS] (map fst (diffAssumptions "Visible"))
       ]
+
+conditionalRestrictionTests :: FilePath -> IO Test
+conditionalRestrictionTests maudePath = do
+    let cases =
+          [ ("constant guard, symbolic action", "All #i. A('a')@i ==> F", [Nothing], TTrue)
+          , ("constant guard, permitted action", "All #i. A('a')@i ==> F", [Just "b"], TTrue)
+          , ("constant guard, forbidden action", "All #i. A('a')@i ==> F", [Just "a"], TFalse)
+          , ("unconditional symbolic violation", "All x #i. A(x)@i ==> F", [Nothing], TFalse)
+          , ("nested conditional violation", "All x #i. A(x)@i ==> (All #j. A('a')@j ==> F)", [Nothing], TTrue)
+          ]
+    tests' <- sequence [makeCase label formula values expected solved
+                      | (label,formula,values,expected) <- cases, solved <- [False,True]]
+    pure $ TestLabel "Conditional restriction instances" $ TestList tests'
+  where
+    makeCase label formula values expected solved = do
+        open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+          [ "theory ConditionalRestrictions begin"
+          , "rule R: [In(x)] --[ A(x) ]-> []"
+          , "restriction Check: \"" ++ formula ++ "\""
+          , "diffLemma D:", "end"
+          ]
+        thy <- closeDiffTheory maudePath open False
+        let ctxt = getDiffProofContext (head (diffTheoryDiffLemmas thy)) thy
+            rule = fst $ someRuleACInstAvoiding (fmap ProtoInfo (L.get cprRuleAC (head (leftTheoryRules thy)))) ([] :: [LVar])
+            atNode i value = (LVar "n" LSortNode i,
+                apply (substFromList [(v, maybe (varTerm (LVar "x" LSortMsg (100+i))) pubTerm value) | v <- frees rule]) rule)
+            sys = L.set sNodes (M.fromList (zipWith atNode [0..] values)) $ emptySystem RawSource True
+            original = L.set dsSide (Just LHS) $ L.set dsSystem (Just sys) emptyDiffSystem
+        pure $ TestCase $ assertEqual (label ++ "; solved=" ++ show solved) expected
+          (fst (evaluateRestrictions ctxt original [sys] solved))
