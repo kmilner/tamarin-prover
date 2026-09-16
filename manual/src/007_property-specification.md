@@ -430,6 +430,40 @@ properties. As there are no user-specifiable lemmas for observational
 equivalence, restrictions can be used to remove state space, which
 essentially removes degenerate cases.  
 
+Equivalence proofs support restrictions spanning multiple events when the
+restriction is shared by both sides and Tamarin can establish that mirroring
+preserves every action predicate and argument it observes. This includes
+shared `OnlyOnce()` restrictions, uniqueness conditions on preserved session
+identifiers, and ordering conditions such as
+`All k #i. Finished(k)@i ==> Ex #j. Started(k)@j & #j<#i`.
+
+The check uses the compiled rules, including explicit side rules and variants.
+It tracks equal values through corresponding protocol-fact positions, starting
+with fresh inputs, constants, and new public variables fixed by mirroring.
+Recursive state rules are supported when they preserve those values. Thus a
+session identifier created with `Fr(~k)` and passed through `State(k)` can be
+recognized as preserved. Arbitrary attacker inputs and values obtained by
+inverting constructors are not assumed equal between the sides. Matching
+restriction text alone is insufficient.
+
+Certified shared restrictions carry over from the original full trace. They
+do not have to be re-established on each partial dependency graph, which may
+omit events needed as witnesses. Attack search still checks all restrictions.
+
+Restrictions can also be checked locally: each conjunctive component refers
+to actions at at most one trace node, as in
+`All x #i. A(x)@i ==> x='a'`. These restrictions may be one-sided. Disjunctions
+are checked as a whole; choosing a different disjunct for each dependency
+graph does not establish the restriction for their combination.
+
+If neither check succeeds, Tamarin names the affected restrictions and their
+sides when an equivalence proof is requested. They remain enforced, and side
+lemmas and attack search remain available, but equivalence proofs may remain
+incomplete. In particular, general one-sided restrictions spanning multiple
+events are not supported by this check. Increasing the search bound cannot
+establish preservation; `--bound=N` can only limit search time. The notice is
+informational and does not trigger `--quit-on-warning`.
+
 <!-- Finally, one can use also use restrictions to simplify the writing of lemmas. -->
 
 ### Common restrictions
