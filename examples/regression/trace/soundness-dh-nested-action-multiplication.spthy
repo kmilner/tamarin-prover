@@ -1,0 +1,11 @@
+theory SoundnessDHNestedActionMultiplication
+begin
+
+builtins: diffie-hellman, hashing
+
+// Test nested products independently: a warning for another rule must not
+// mask a failure to traverse action-term constructors.
+rule NestedProduct:
+  [ In(x), In(y) ] --[ NestedProduct(h(x*y)) ]-> []
+
+end

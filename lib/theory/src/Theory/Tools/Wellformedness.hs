@@ -1044,7 +1044,7 @@ formulaReportsDiff thy = do
 -- 1. Consistently abstract terms with outermost reducible function symbols
 --    occuring in lhs with fresh variables in rule.
 -- 2. check vars(rhs) subset of vars(lhs) u V_Pub for abstracted rule for abstracted variables.
--- 3. check that * does not occur in rhs of abstracted rule.
+-- 3. check that * does not occur in conclusions or actions.
 multRestrictedReport' :: FunSig -> [ProtoRuleE] -> WfErrorReport
 multRestrictedReport' irreducible ru0 = do
     ru <- ru0
@@ -1090,7 +1090,10 @@ multRestrictedReport' irreducible ru0 = do
       where
         ruAbstr = abstractRule ru
 
-        mults = [ mt | Fact _ _ ts <- get rConcs ru, t <- ts, mt <- multTerms t ]
+        -- Action terms need the same restriction as conclusions: products
+        -- are not expanded into their DH cancellation variants.
+        mults = [ mt | Fact _ _ ts <- get rConcs ru ++ get rActs ru
+                     , t <- ts, mt <- multTerms t ]
 
         multTerms t@(viewTerm -> FApp (AC Mult) _)  = [t]
         multTerms   (viewTerm -> FApp _         as) = concatMap multTerms as
@@ -1107,7 +1110,7 @@ multRestrictedReport' irreducible ru0 = do
 -- 1. Consistently abstract terms with outermost reducible function symbols
 --    occuring in lhs with fresh variables in rule.
 -- 2. check vars(rhs) subset of vars(lhs) u V_Pub for abstracted rule for abstracted variables.
--- 3. check that * does not occur in rhs of abstracted rule.
+-- 3. check that * does not occur in conclusions or actions.
 multRestrictedReport :: OpenTranslatedTheory -> WfErrorReport
 multRestrictedReport thy = multRestrictedReport' irreducible (thyProtoRules thy)
   where
@@ -1121,7 +1124,7 @@ multRestrictedReport thy = multRestrictedReport' irreducible (thyProtoRules thy)
 -- 1. Consistently abstract terms with outermost reducible function symbols
 --    occuring in lhs with fresh variables in rule.
 -- 2. check vars(rhs) subset of vars(lhs) u V_Pub for abstracted rule for abstracted variables.
--- 3. check that * does not occur in rhs of abstracted rule.
+-- 3. check that * does not occur in conclusions or actions.
 multRestrictedReportDiff :: OpenDiffTheory -> WfErrorReport
 multRestrictedReportDiff thy = multRestrictedReport' irreducible (diffThyProtoRules thy)
   where
