@@ -98,7 +98,14 @@ closeDiffTheoryWithMaude sig thy0 autoSources =
     -- Maude / Signature handle
     hnd = L.get sigmMaudeHandle sig
 
-    theoryItems = L.get diffThyItems thy0 ++ map (\x -> EitherRuleItem (LHS, x)) leftOpenRules ++ map (\x -> EitherRuleItem (RHS, x)) rightOpenRules
+    theoryItems = map expandRuleItem (L.get diffThyItems thy0)
+               ++ map (\x -> EitherRuleItem (LHS, x)) leftOpenRules
+               ++ map (\x -> EitherRuleItem (RHS, x)) rightOpenRules
+    expandRuleItem (DiffRuleItem ru) =
+      DiffRuleItem (applyMacroInDiffProtoRule (diffTheoryMacros thy0) ru)
+    expandRuleItem (EitherRuleItem (side, ru)) =
+      EitherRuleItem (side, applyMacroInProtoRule (diffTheoryMacros thy0) ru)
+    expandRuleItem item = item
     -- Close all theory items: in parallel (especially useful for variants)
     --
     -- NOTE that 'rdeepseq' is OK here, as the proof has not yet been checked
@@ -111,8 +118,10 @@ closeDiffTheoryWithMaude sig thy0 autoSources =
       DiffRuleItem
       (EitherRuleItem . closeEitherProtoRule hnd)
       (DiffLemmaItem . fmap skeletonToIncrementalDiffProof)
-      (\(s, l) -> EitherLemmaItem (s, fmap skeletonToIncrementalProof l))
-      EitherRestrictionItem
+      (\(s, l) -> EitherLemmaItem
+          (s, fmap skeletonToIncrementalProof $ applyMacroInLemma (diffTheoryMacros thy0) l))
+      (\(s, r) -> EitherRestrictionItem
+          (s, applyMacroInRestriction (diffTheoryMacros thy0) r))
       DiffMacroItem
       DiffTextItem
       DiffConfigBlockItem
