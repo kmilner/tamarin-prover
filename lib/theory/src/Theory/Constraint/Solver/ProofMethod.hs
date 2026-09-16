@@ -373,14 +373,11 @@ execDiffProofMethod ctxt method sys =
     DiffAttack -> do
       guard (L.get dsProofType sys == Just RuleEquivalence)
       guard (isJust $ L.get dsCurrentRule sys)
-      s <- L.get dsSide sys
       solved <- isSolved <$> mside <*> msys'
-      sys' <- L.get dsSystem sys
-      notContradictory <- not . contradictorySystem (eitherProofContext ctxt s) <$> sequent
-      -- In the second case, the system is trivial, has no mirror and restrictions do not get in the way.
-      -- If we solve arbitrarily the last remaining trivial goals,
-      -- then there will be an attack.
-      guard (solved || (trivial sys' && notContradictory))
+      -- An attack requires a completed original trace. Even independent
+      -- trivial goals can have only producers that violate a restriction, so
+      -- their syntactic shape alone does not establish reachability.
+      guard solved
       allSubtermsFinished <- mallSubtermsFinished
       guard allSubtermsFinished
       mirrorSyss <- mmirrorSyss
@@ -1198,4 +1195,3 @@ prettyDiffProofMethod method = case method of
     DiffRuleEquivalence      -> keyword_ "rule-equivalence"
     DiffBackwardSearch       -> keyword_ "backward-search"  
     DiffBackwardSearchStep s -> keyword_ "step(" <-> prettyProofMethod s <-> keyword_ ")"
-
