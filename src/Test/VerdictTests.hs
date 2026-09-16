@@ -2,6 +2,8 @@
 module Test.VerdictTests (tests) where
 
 import Data.List (sort)
+import Data.Maybe (fromJust)
+import Lemma
 import qualified Data.Map as M
 import qualified Data.Set as S
 import qualified Extension.Data.Label as L
@@ -19,7 +21,7 @@ import TheoryObject
 -- graph-wide consistency. Two connected consumers make four independent
 -- assignments, distinguishable by their action arguments.
 tests :: FilePath -> IO Test
-tests maudePath = TestList <$> sequence [mirrorTests maudePath, roundTripTests maudePath]
+tests maudePath = TestList <$> sequence [mirrorTests maudePath, roundTripTests maudePath, assumptionTests maudePath]
 
 mirrorTests :: FilePath -> IO Test
 mirrorTests maudePath = do
@@ -107,3 +109,40 @@ roundTripTests maudePath = do
             assertEqual "side rules, variants and new variables" (rules first) (rules t)
             assertEqual "lemmas, restrictions and proof skeletons" (nonRules first) (nonRules t)
             assertEqual "all four rule/source caches" (caches first) (caches t)) [second,third]
+
+-- Check eligibility before proof search, including same-named opposite-side
+-- assumptions, declaration order for ordinary reuse, and both hide forms.
+assumptionTests :: FilePath -> IO Test
+assumptionTests maudePath = do
+    open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+      [ "theory AssumptionScope begin"
+      , "rule Emit: [] --[ A() ]-> []"
+      , "lemma assumed [left,reuse,diff_reuse]: \"All #i. A()@i ==> F\""
+      , "lemma assumed [right,reuse,diff_reuse]: \"All #i. A()@i ==> T\""
+      , "lemma hidden [left,hide_lemma=assumed]: \"All #i. A()@i ==> F\""
+      , "lemma all_hidden [left,hide_lemma=ALL]: \"All #i. A()@i ==> F\""
+      , "lemma visible [left]: \"All #i. A()@i ==> F\""
+      , "diffLemma Hidden [hide_lemma=assumed]:"
+      , "diffLemma AllHidden [hide_lemma=ALL]:"
+      , "diffLemma Visible:"
+      , "end"
+      ]
+    thy <- closeDiffTheory maudePath open False
+    let previous = [item | item@(EitherLemmaItem (_,lem)) <- L.get diffThyItems thy,
+                           L.get lName lem == "assumed"]
+        assumptions name items =
+          let lem = fromJust (lookupLemmaDiff LHS name thy)
+              ctxt = getProofContextDiff LHS lem thy
+          in L.get sLemmas $ mkSystemDiff LHS ctxt [] items (L.get lFormula lem)
+        diffAssumptions name = L.get dpcReuseLemmas $
+          getDiffProofContext (fromJust (lookupDiffLemma name thy)) thy
+        leftFormula = formulaToGuarded_ $ L.get lFormula $ fromJust (lookupLemmaDiff LHS "assumed" thy)
+    pure $ TestLabel "Reusable assumption scope" $ TestList
+      [ TestCase $ assertEqual "named hidden side lemma" S.empty (assumptions "hidden" previous)
+      , TestCase $ assertEqual "all hidden side lemmas" S.empty (assumptions "all_hidden" previous)
+      , TestCase $ assertEqual "visible reuse is side-specific" (S.singleton leftFormula) (assumptions "visible" previous)
+      , TestCase $ assertEqual "later lemmas are not supplied to ordinary reuse" S.empty (assumptions "visible" [])
+      , TestCase $ assertEqual "named hidden diff lemma" [] (diffAssumptions "Hidden")
+      , TestCase $ assertEqual "all hidden diff lemmas" [] (diffAssumptions "AllHidden")
+      , TestCase $ assertEqual "visible diff reuse retains both sides" [LHS,RHS] (map fst (diffAssumptions "Visible"))
+      ]

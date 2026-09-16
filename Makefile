@@ -484,7 +484,7 @@ accountability-case-studies:	$(ACCOUNTABILITY_CS_TARGETS)
 
 FAST_REGRESSION_CASE_STUDIES=issue446-1.spthy issue446-2.spthy issue753-4.spthy issue753-5.spthy issue753-6.spthy issue834.spthy issue777.spthy issue770.spthy issue914.spthy
 COMMON_REGRESSION_CASE_STUDIES=msr-macro-injectivity.spthy msr-injective-last.spthy msr-source-premise-index.spthy nat-subterm-sorts.spthy soundness-subterm-witness.spthy soundness-manual-variants-complete.spthy
-DIFF_REGRESSION_CASE_STUDIES=soundness-diff-macros.spthy soundness-diff-source-side.spthy soundness-diff-mirror-restriction.spthy soundness-diff-mirror-false-restriction.spthy soundness-diff-mirror-unifiers.spthy soundness-diff-roundtrip.spthy
+DIFF_REGRESSION_CASE_STUDIES=soundness-diff-macros.spthy soundness-diff-source-side.spthy soundness-diff-mirror-restriction.spthy soundness-diff-mirror-false-restriction.spthy soundness-diff-mirror-unifiers.spthy soundness-diff-roundtrip.spthy soundness-diff-hidden-reuse.spthy
 FAST_REGRESSION_CASE_STUDIES+=$(COMMON_REGRESSION_CASE_STUDIES)
 FAST_REGRESSION_TARGETS=$(subst .spthy,_analyzed.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(FAST_REGRESSION_CASE_STUDIES)))
 DIFF_REGRESSION_TARGETS=$(subst .spthy,_analyzed-diff.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(DIFF_REGRESSION_CASE_STUDIES)))
