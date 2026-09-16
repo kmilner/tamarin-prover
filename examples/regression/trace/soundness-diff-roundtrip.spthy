@@ -1,0 +1,18 @@
+theory SoundnessDiffRoundtrip
+begin
+builtins: multiset
+macros: m(x) = x
+
+rule Produce:
+ [] --> [ F(m('a') ++ m('b')) ]
+rule Consume:
+ [ F(x ++ y) ] --[ Choice(m(x),y) ]-> [ Out('ok') ]
+
+lemma source [left,sources]:
+ "All x y #i. Choice(x,y)@i ==> T"
+restriction right_only [right]:
+ "All x y #i. Choice(x,y)@i ==> x = 'b'"
+lemma witness [right]: exists-trace
+ "Ex #i. Choice('b','a')@i"
+diffLemma Observational_equivalence:
+end
