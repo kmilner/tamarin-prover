@@ -1,0 +1,50 @@
+theory PartialEvaluationExport
+begin
+
+builtins: symmetric-encryption
+
+rule Key:
+  [ Fr(~k) ] --> [ !Key(~k) ]
+
+rule Secret:
+  [ Fr(~m), !Key(~k) ]
+  --[ Secret(~m) ]->
+  [ Out(senc(~m,~k)) ]
+
+rule Dec:
+  [ In(x), !Key(k) ] --> [ Out(sdec(x,k)) ]
+  variants
+  rule (modulo AC) Dec___VARIANT_2:
+    [ In(senc(z.2,k.1)), !Key(k.1) ] --[ Decrypted(z.2) ]-> [ Out(z.2) ],
+  rule (modulo AC) Dec___VARIANT_1:
+    [ In(x.2), !Key(k.1) ]
+    --[ Unreduced(sdec(x.2,k.1)) ]->
+    [ Out(sdec(x.2,k.1)) ]
+
+// The generic variant applies only when the decryption does not reduce.
+// Exporting it as an E-rule after partial evaluation used to introduce a
+// cancelling variant with the Unreduced action, making this trace possible.
+lemma unreduced_secret:
+  exists-trace
+  "Ex m #i #j. Secret(m) @ i & Unreduced(m) @ j"
+
+lemma decrypted_reachable:
+  exists-trace
+  "Ex m #i. Decrypted(m) @ i"
+
+lemma unreduced_reachable:
+  exists-trace
+  "Ex m #i. Unreduced(m) @ i"
+
+// Other rule families can still be specialized by partial evaluation.
+rule Seed:
+  [ ] --> [ State('ok') ]
+
+rule Use:
+  [ State(x) ] --[ Used(x) ]-> [ ]
+
+lemma specialized_rule_reachable:
+  exists-trace
+  "Ex #i. Used('ok') @ i"
+
+end

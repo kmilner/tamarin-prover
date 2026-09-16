@@ -27,6 +27,7 @@ import           Theory.Proof
 import           Theory.Text.Pretty
 import           Theory.Tools.AbstractInterpretation
 import           Theory.Tools.LoopBreakers
+import           Theory.Tools.RuleVariants           (variantsProtoRule)
 import           Lemma
 import           ClosedTheory
 import           TheoryObject
@@ -242,26 +243,57 @@ applyPartialEvaluation evalStyle autosources thy0 =
       autosources True
   where
     sig          = L.get thySignature thy0
-    ruEs         = getProtoRuleEs thy0
-    (st', ruEs') = (`runReader` L.get sigmMaudeHandle sig) $
-                   partialEvaluation evalStyle ruEs
+    rules        = compiledRuleVariants (theoryRules thy0)
+    originalRuleCount = length (getProtoRuleEs thy0)
+    (st', rules') = (`runReader` L.get sigmMaudeHandle sig) $
+                    partialEvaluation evalStyle rules
+
+    -- A compiled AC variant is not necessarily an equivalent E-rule: exporting
+    -- it as one can introduce further variants on reload, with the wrong added
+    -- actions. Keep the original family if any refinement would change under
+    -- E-variant computation. Restoring the complete family preserves its added
+    -- actions and keeps manual-variant completeness checks applicable.
+    families =
+      [ (ruleName (L.get cprRuleE ru), ruleName (L.get cprRuleAC ru))
+      | ru <- concatMap unfoldRuleVariants (theoryRules thy0) ]
+    unsafeVariants = S.fromList
+      [ ruleName ru | ru <- rules', not (exportable ru) ]
+    retainedFamilies = S.fromList
+      [ family | (family, variant) <- families, variant `S.member` unsafeVariants ]
+    retainedVariants = S.fromList
+      [ variant | (family, variant) <- families, family `S.member` retainedFamilies ]
+    refinedRules = filter ((`S.notMember` retainedVariants) . ruleName) rules'
+    exportable ru = case variantsProtoRule (L.get sigmMaudeHandle sig) ru of
+      Just ac -> eqModuloFreshnessNoAC ac (compiledRuleAC ru)
+      Nothing -> False
+
+    replaceRule (RuleItem ru)
+      | ruleName ru `S.member` retainedFamilies = [RuleItem ru]
+      | otherwise =
+          [ RuleItem (openCompiledRule refined)
+          | refined <- refinedRules, ruleName refined `elem` variants ]
+      where
+        variants = [ variant | (family, variant) <- families, family == ruleName ru ]
+    replaceRule item = [item]
 
     replaceProtoRules [] = []
     replaceProtoRules (item:items)
       | isRuleItem item  =
           [ TextItem ("text", render ppAbsState)
-       -- Here we loose imported variants!
-          ] ++ map (\x -> RuleItem (OpenProtoRule x [])) ruEs' ++ filter (not . isRuleItem) items
+          ] ++ concatMap replaceRule (item:items)
       | otherwise        = item : replaceProtoRules items
 
     ppAbsState =
       (text $ " the abstract state after partial evaluation"
               ++ " contains " ++ show (S.size st') ++ " facts:") $--$
       (numbered' $ map prettyLNFact $ S.toList st') $--$
-      (text $ "This abstract state results in " ++ show (length ruEs') ++
+      (text $ "This abstract state results in " ++ show (length refinedRules) ++
               " refined multiset rewriting rules.\n" ++
+              (if S.null retainedFamilies then "" else
+                "Kept " ++ show (S.size retainedFamilies) ++
+                " original rule families to preserve their variants on export.\n") ++
               "Note that the original number of multiset rewriting rules was "
-              ++ show (length ruEs) ++ ".\n\n")
+              ++ show originalRuleCount ++ ".\n\n")
 
 -- | Apply partial evaluation.
 applyPartialEvaluationDiff :: EvaluationStyle -> Bool -> ClosedDiffTheory -> ClosedDiffTheory
@@ -302,6 +334,37 @@ applyPartialEvaluationDiff evalStyle autoSources thy0 =
               " right refined multiset rewriting rules.\n" ++
               "Note that the original number of multiset rewriting rules was "
               ++ show (length (ruEs RHS)) ++ ".\n\n")
+
+
+-- Partial evaluation only needs unification modulo AC when it starts from the
+-- already computed E-variants. Representing each compiled variant as an E-rule
+-- lets us reinstall its refined AC rule without recomputing or losing imported
+-- variants. Embedded restrictions are already separate theory items here; an
+-- empty local list avoids inferring monotonicity from a restriction whose
+-- variables were renamed while its E-variant was computed.
+compiledRuleVariants :: [ClosedProtoRule] -> [ProtoRuleE]
+compiledRuleVariants = map compiled . concatMap unfoldRuleVariants
+  where
+    compiled cru = case L.get cprRuleAC cru of
+      Rule info prems concs acts newVars ->
+        Rule (ProtoRuleEInfo
+                (L.get pracName info)
+                (L.get pracAttributes info)
+                [])
+             prems concs acts newVars
+
+openCompiledRule :: ProtoRuleE -> OpenProtoRule
+openCompiledRule ruE = OpenProtoRule ruE [compiledRuleAC ruE]
+
+compiledRuleAC :: ProtoRuleE -> ProtoRuleAC
+compiledRuleAC (Rule eInfo prems concs acts newVars) =
+    Rule acInfo prems concs acts newVars
+  where
+    acInfo = ProtoRuleACInfo
+               (L.get preName eInfo)
+               (L.get preAttributes eInfo)
+               (Disj [emptySubstVFresh])
+               []
 
 
 -- | Open a theory by dropping the closed world assumption and values whose

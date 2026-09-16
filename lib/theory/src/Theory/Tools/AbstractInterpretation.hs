@@ -86,16 +86,18 @@ interpretAbstractly unifyFactEqs initState addFact stateFacts rus =
 data EvaluationStyle = Silent | Summary | Tracing
   deriving Show
 
--- | Concrete partial evaluator activated with flag: --partial-evaluation
+-- | Concrete partial evaluator activated with flag: --partial-evaluation.
+-- The rules must be a complete, unfolded set of variants modulo E. Refinement
+-- then only needs the AC unifier used by the constraint solver.
 partialEvaluation :: EvaluationStyle
                   -> [ProtoRuleE] -> WithMaude (S.Set LNFact, [ProtoRuleE])
-partialEvaluation evalStyle ruEs = reader $ \hnd ->
+partialEvaluation evalStyle rules = reader $ \hnd ->
     consumeEvaluation $ interpretAbstractly
-        ((`runReader` hnd) . unifyLNFactEqs)  -- FIXME: Use E-unification here
+        ((`runReader` hnd) . unifyLNFactEqs)
         S.empty
         (S.insert . absFact)
         S.toList
-        ruEs
+        rules
   where
     consumeEvaluation [] = error "partialEvaluation: impossible"
     consumeEvaluation ((st0, rus0) : rest0) =
