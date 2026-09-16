@@ -26,6 +26,7 @@ tests maudePath = TestList <$> sequence
     , roundTripTests maudePath
     , assumptionTests maudePath
     , conditionalRestrictionTests maudePath
+    , mixedRestrictionFilterTests maudePath
     ]
 
 mirrorTests :: FilePath -> IO Test
@@ -181,3 +182,26 @@ conditionalRestrictionTests maudePath = do
             original = L.set dsSide (Just LHS) $ L.set dsSystem (Just sys) emptyDiffSystem
         pure $ TestCase $ assertEqual (label ++ "; solved=" ++ show solved) expected
           (fst (evaluateRestrictions ctxt original [sys] solved))
+
+mixedRestrictionFilterTests :: FilePath -> IO Test
+mixedRestrictionFilterTests maudePath = do
+    open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+      [ "theory MixedRestrictionFilter begin"
+      , "rule R: [] --[ A('b') ]-> []"
+      , "restriction Conjunction [right]: \"('a'='b') & (All #i. A('a')@i ==> F)\""
+      , "restriction Disjunction [right]: \"(('a'='b') & (All #i. A('a')@i ==> F)) | ('c'='d')\""
+      , "diffLemma D:", "end"
+      ]
+    thy <- closeDiffTheory maudePath open False
+    let ctxt = getDiffProofContext (head (diffTheoryDiffLemmas thy)) thy
+        rightCtxt = eitherProofContext ctxt RHS
+        restrictions = concat [forms | (side, forms) <- L.get dpcRestrictions ctxt,
+                                       side == RHS]
+        ru = fst $ someRuleACInstAvoiding
+             (fmap ProtoInfo (L.get cprRuleAC (head (rightTheoryRules thy))))
+             ([] :: [LVar])
+        sys = L.set sNodes (M.singleton (LVar "n" LSortNode 0) ru)
+              $ emptySystem RawSource True
+    pure $ TestLabel "Mixed restriction filtering" $ TestCase $
+      assertEqual "action-free Boolean cases keep their complete restrictions"
+        restrictions (filterRestrictions rightCtxt sys restrictions)
