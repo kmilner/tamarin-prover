@@ -370,7 +370,11 @@ variantsCheck hnd macros info (OpenProtoRule ruE ruAC) = catMaybes
       map (get cprRuleAC) $
       concatMap (unfoldRuleVariants . ClosedProtoRule ruE) $
       maybeToList (variantsProtoRule hnd (applyMacroInRule macros ruE))
-    sameVariantsUpToActions parsed computed = all (\x -> any (equalUpToAddedActions x) computed) parsed
+    sameVariantsUpToActions parsed computed =
+      all (\p -> any (equalUpToAddedActions p) computed) parsed &&
+      -- Every computed case must be present, too. Keep the parsed variant
+      -- first in both comparisons: it may contain added source-lemma actions.
+      all (\c -> any (`equalUpToAddedActions` c) parsed) computed
 
 -- | Report on missing or different variants.
 ruleVariantsReport :: SignatureWithMaude -> OpenTranslatedTheory -> WfErrorReport
