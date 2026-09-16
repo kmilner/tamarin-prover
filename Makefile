@@ -144,7 +144,7 @@ csf12-case-studies:	$(CSF12_CS_TARGETS)
 case-studies$(SUBDIR)%_analyzed.spthy:	examples/%.spthy $(TAMARIN)
 	mkdir -p $(dir $@)
 	# Use -N3, as the fourth core is used by the OS and the console
-	$(TAMARIN) $< --prove --stop-on-trace=dfs -d=0 +RTS -N3 -RTS -o$<.tmp >$<.out
+	$(TAMARIN) $< --prove --stop-on-trace=dfs -d=0 $(TRACE_EXTRA_ARGS) +RTS -N3 -RTS -o$<.tmp >$<.out
 	# We only produce the target after the run, otherwise aborted
 	# runs already 'finish' the case.
 	printf "\n/* Output\n" >>$<.tmp
@@ -483,10 +483,25 @@ accountability-case-studies:	$(ACCOUNTABILITY_CS_TARGETS)
 ##########################
 
 FAST_REGRESSION_CASE_STUDIES=issue446-1.spthy issue446-2.spthy issue753-4.spthy issue753-5.spthy issue753-6.spthy issue834.spthy issue777.spthy issue770.spthy issue914.spthy
+COMMON_REGRESSION_CASE_STUDIES=soundness-sapic-state-phases.spthy soundness-sapic-nested-destructor-failure-chain.spthy soundness-sapic-nested-destructor-progress.spthy sapic-process-call-location-scope.spthy soundness-sapic-destructor-patterns.spthy soundness-sapic-destructor-failure-chain.spthy soundness-sapic-nested-destructors.spthy soundness-sapic-destructor-variable-clash.spthy soundness-sapic-destructor-alternatives.spthy soundness-sapic-channel-alias.spthy soundness-sapic-channel-embedded.spthy soundness-sapic-channel-pattern.spthy soundness-sapic-let-match-else.spthy soundness-sapic-unlocked-lookup.spthy soundness-sapic-progress-let.spthy soundness-sapic-state-alias.spthy soundness-sapic-state-delete.spthy soundness-sapic-state-double-insert.spthy soundness-sapic-state-equivalent-key.spthy soundness-sapic-state-overwrite.spthy soundness-sapic-state-repeated-insert.spthy soundness-sapic-state-supported.spthy soundness-sapic-process-call-capture.spthy sapic-else-binding-scope.spthy sapic-process-call-caller-scope.spthy sapic-nested-call-caller-scope.spthy
+FAST_REGRESSION_CASE_STUDIES+=$(COMMON_REGRESSION_CASE_STUDIES)
 FAST_REGRESSION_TARGETS=$(subst .spthy,_analyzed.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(FAST_REGRESSION_CASE_STUDIES)))
 
 
+case-studies$(SUBDIR)regression/trace/soundness-sapic-state-phases_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+case-studies$(SUBDIR)regression/trace/sapic-process-call-location-scope_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+case-studies$(SUBDIR)regression/trace/soundness-sapic-destructor-patterns_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+case-studies$(SUBDIR)regression/trace/soundness-sapic-destructor-failure-chain_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+case-studies$(SUBDIR)regression/trace/soundness-sapic-destructor-alternatives_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+case-studies$(SUBDIR)regression/trace/soundness-sapic-nested-destructor-failure-chain_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+case-studies$(SUBDIR)regression/trace/soundness-sapic-nested-destructor-progress_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+case-studies$(SUBDIR)regression/trace/soundness-sapic-nested-destructors_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+case-studies$(SUBDIR)regression/trace/sapic-else-binding-scope_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+case-studies$(SUBDIR)regression/trace/sapic-process-call-caller-scope_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+case-studies$(SUBDIR)regression/trace/sapic-nested-call-caller-scope_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+
 REGRESSION_CASE_STUDIES=issue216.spthy issue193.spthy issue310.spthy issue519.spthy issue527.spthy issue515.spthy
+REGRESSION_CASE_STUDIES+=$(COMMON_REGRESSION_CASE_STUDIES)
 REGRESSION_TARGETS=$(subst .spthy,_analyzed.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(REGRESSION_CASE_STUDIES)))
 
 SEQDFS_CASE_STUDIES=seqdfsneeded.spthy
@@ -519,6 +534,9 @@ SAPIC_CS_TARGETS_SUPER_SLOW=$(subst .spthy,_analyzed.spthy,$(addprefix case-stud
 # 	$(info $$var is [${SAPIC_CS_TARGETS}])
 
 # case studies
+# This positive typing example must remain free of validation warnings.
+case-studies$(SUBDIR)sapic/fast/basic/typing_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
+
 sapic-case-studies:	$(SAPIC_CS_TARGETS_FAST) $(SAPIC_CS_TARGETS_SLOW) # used for regressions, skips super slow tests
 	grep "verified\|falsified\|processing time" $^
 sapic-case-studies-fast:	$(SAPIC_CS_TARGETS_FAST) # used for quick checks during development

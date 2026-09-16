@@ -82,6 +82,8 @@ jobs:
         run: |
           tamarin-prover test
           ./misc/test-export-property-instrumentation.sh
+          sh ./misc/test-sapic-input-validation.sh
+          sh ./misc/test-sapic-destructor-growth.sh
           python3 regressionTests.py -v 6 -noi
 
       - name: Store case studies as artifact
