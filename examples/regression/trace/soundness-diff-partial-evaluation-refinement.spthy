@@ -1,0 +1,15 @@
+theory SoundnessDiffPartialEvaluationRefinement
+begin
+
+rule SeedA: [] --> [ State('a') ]
+rule SeedB: [] --> [ State('b') ]
+
+// Refinement creates two instances of Use. They must remain variants of one
+// family, including when the theory is printed and closed again.
+rule Use: [ State(x) ] --[ Used(x) ]-> [ Out(x) ]
+
+lemma both: exists-trace
+  "Ex #i #j. Used('a')@i & Used('b')@j"
+
+diffLemma Observational_equivalence:
+end

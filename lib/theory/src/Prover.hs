@@ -266,26 +266,26 @@ applyPartialEvaluation evalStyle autosources thy0 =
       autosources True
   where
     sig          = L.get thySignature thy0
-    ruEs         = getProtoRuleEs thy0
-    (st', ruEs') = (`runReader` L.get sigmMaudeHandle sig) $
-                   partialEvaluation evalStyle ruEs
+    rules        = compiledRuleVariants (theoryRules thy0)
+    originalRuleCount = length (getProtoRuleEs thy0)
+    (st', rules') = (`runReader` L.get sigmMaudeHandle sig) $
+                    partialEvaluation evalStyle rules
 
     replaceProtoRules [] = []
     replaceProtoRules (item:items)
       | isRuleItem item  =
           [ TextItem ("text", render ppAbsState)
-       -- Here we loose imported variants!
-          ] ++ map (\x -> RuleItem (OpenProtoRule x [])) ruEs' ++ filter (not . isRuleItem) items
+          ] ++ map (RuleItem . openCompiledRule) rules' ++ filter (not . isRuleItem) items
       | otherwise        = item : replaceProtoRules items
 
     ppAbsState =
       (text $ " the abstract state after partial evaluation"
               ++ " contains " ++ show (S.size st') ++ " facts:") $--$
       (numbered' $ map prettyLNFact $ S.toList st') $--$
-      (text $ "This abstract state results in " ++ show (length ruEs') ++
+      (text $ "This abstract state results in " ++ show (length rules') ++
               " refined multiset rewriting rules.\n" ++
               "Note that the original number of multiset rewriting rules was "
-              ++ show (length ruEs) ++ ".\n\n")
+              ++ show originalRuleCount ++ ".\n\n")
 
 -- | Apply partial evaluation.
 applyPartialEvaluationDiff :: EvaluationStyle -> Bool -> ClosedDiffTheory -> ClosedDiffTheory
@@ -294,38 +294,75 @@ applyPartialEvaluationDiff evalStyle autoSources thy0 =
       (L.modify diffThyItems replaceProtoRules (openDiffTheory thy0)) autoSources
   where
     sig            = L.get diffThySignature thy0
-    ruEs s         = getProtoRuleEsDiff s thy0
-    (stL', ruEsL') = (`runReader` L.get sigmMaudeHandle sig) $
-                     partialEvaluation evalStyle (ruEs LHS)
-    (stR', ruEsR') = (`runReader` L.get sigmMaudeHandle sig) $
-                     partialEvaluation evalStyle (ruEs RHS)
+    -- A generated variant number is local to one side. Keep the original
+    -- family name so mirrors can choose any variant on the opposite side.
+    rules s        = concatMap familyVariants (diffTheorySideRules s thy0)
+    familyVariants cru =
+      map (L.set (preName . rInfo) (L.get (preName . rInfo . cprRuleE) cru))
+          (compiledRuleVariants [cru])
+    originalRuleCount s = length (getProtoRuleEsDiff s thy0)
+    (stL', rulesL') = (`runReader` L.get sigmMaudeHandle sig) $
+                      partialEvaluation evalStyle (rules LHS)
+    (stR', rulesR') = (`runReader` L.get sigmMaudeHandle sig) $
+                      partialEvaluation evalStyle (rules RHS)
 
-    replaceProtoRules [] = []
-    replaceProtoRules (item:items)
-      | isEitherRuleItem item  =
-          [ DiffTextItem ("text", render ppAbsState)
-       -- Here we loose imported variants!
-          ] ++ map (\x -> EitherRuleItem (LHS, OpenProtoRule x [])) ruEsL' ++ map (\x -> EitherRuleItem (RHS, OpenProtoRule x [])) ruEsR' ++ filter (not . isEitherRuleItem) items
-      | otherwise        = item : replaceProtoRules items
-
-    isEitherRuleItem (EitherRuleItem _) = True
-    isEitherRuleItem _                  = False
+    replaceProtoRules items = DiffTextItem ("text", render ppAbsState) : map replace items
+    replace (EitherRuleItem (side, OpenProtoRule ruE _)) =
+      EitherRuleItem (side, OpenProtoRule ruE (map compiledRuleAC retained))
+      where
+        family = filter ((== getRuleName ruE) . getRuleName)
+        refined = family (if side == LHS then rulesL' else rulesR')
+        -- Keep unreachable families available for rule correspondence. Their
+        -- original premises still prevent execution; dropping the side item
+        -- would cause closure to regenerate it from the diff rule anyway.
+        retained = if null refined then family (rules side) else refined
+    replace item = item
 
     ppAbsState =
       (text $ " the abstract state after partial evaluation"
               ++ " contains " ++ show (S.size stL') ++ " left facts:") $--$
       (numbered' $ map prettyLNFact $ S.toList stL') $--$
-      (text $ "This abstract state results in " ++ show (length ruEsL') ++
+      (text $ "This abstract state results in " ++ show (length rulesL') ++
               " left refined multiset rewriting rules.\n" ++
               "Note that the original number of multiset rewriting rules was "
-              ++ show (length (ruEs LHS)) ++ ".\n\n") $--$
+              ++ show (originalRuleCount LHS) ++ ".\n\n") $--$
       (text $ " the abstract state after partial evaluation"
               ++ " contains " ++ show (S.size stR') ++ " right facts:") $--$
       (numbered' $ map prettyLNFact $ S.toList stR') $--$
-      (text $ "This abstract state results in " ++ show (length ruEsR') ++
+      (text $ "This abstract state results in " ++ show (length rulesR') ++
               " right refined multiset rewriting rules.\n" ++
               "Note that the original number of multiset rewriting rules was "
-              ++ show (length (ruEs RHS)) ++ ".\n\n")
+              ++ show (originalRuleCount RHS) ++ ".\n\n")
+
+-- Partial evaluation only needs unification modulo AC when it starts from the
+-- already computed E-variants. Representing each compiled variant as an E-rule
+-- lets us reinstall its refined AC rule without recomputing or losing imported
+-- variants. Embedded restrictions are already separate theory items here; an
+-- empty local list avoids inferring monotonicity from a restriction whose
+-- variables were renamed while its E-variant was computed.
+compiledRuleVariants :: [ClosedProtoRule] -> [ProtoRuleE]
+compiledRuleVariants = map compiled . concatMap unfoldRuleVariants
+  where
+    compiled cru = case L.get cprRuleAC cru of
+      Rule info prems concs acts newVars ->
+        Rule (ProtoRuleEInfo
+                (L.get pracName info)
+                (L.get pracAttributes info)
+                [])
+             prems concs acts newVars
+
+openCompiledRule :: ProtoRuleE -> OpenProtoRule
+openCompiledRule ruE = OpenProtoRule ruE [compiledRuleAC ruE]
+
+compiledRuleAC :: ProtoRuleE -> ProtoRuleAC
+compiledRuleAC (Rule eInfo prems concs acts newVars) =
+    Rule acInfo prems concs acts newVars
+  where
+    acInfo = ProtoRuleACInfo
+               (L.get preName eInfo)
+               (L.get preAttributes eInfo)
+               (Disj [emptySubstVFresh])
+               []
 
 
 -- | Open a theory by dropping the closed world assumption and values whose
@@ -343,7 +380,7 @@ openDiffTheory :: ClosedDiffTheory -> OpenDiffTheory
 openDiffTheory  (DiffTheory n f h t sig c1 c2 c3 c4 items opts sapic) =
     -- We merge duplicate rules if they were split into variants
     DiffTheory n f h t (toSignaturePure sig) (openRuleCache c1) (openRuleCache c2) (openRuleCache c3) (openRuleCache c4)
-      (mergeOpenProtoRulesDiff $ map (mapDiffTheoryItem id (\(x, y) -> (x, (openProtoRule y))) (\(DiffLemma s a p) -> (DiffLemma s a (incrementalToSkeletonDiffProof p))) (\(x, Lemma a p m b c c' d e) -> (x, Lemma a p m b c c' d (incrementalToSkeletonProof e)))) items)
+      (mergeOpenProtoRulesDiff $ map (mapDiffTheoryItem id (openDiffSideRule items) (\(DiffLemma s a p) -> (DiffLemma s a (incrementalToSkeletonDiffProof p))) (\(x, Lemma a p m b c c' d e) -> (x, Lemma a p m b c c' d (incrementalToSkeletonProof e)))) items)
       opts sapic
 
 ------------------------------------------------------------------------------

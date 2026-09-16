@@ -16,6 +16,7 @@ import Theory.Model
 import Theory.Constraint.System
 import Theory.Text.Parser
 import Theory.Text.Pretty (render)
+import Theory.Tools.AbstractInterpretation (EvaluationStyle(Silent))
 import TheoryObject
 
 -- Exercise the real mirror enumerator, including Maude AC unification and
@@ -30,6 +31,7 @@ tests maudePath = TestList <$> sequence
     , mixedRestrictionFilterTests maudePath
     , diffRestrictionLocalityTests maudePath
     , diffRestrictionPreservationTests maudePath
+    , partialEvaluationDiffTests maudePath
     ]
 
 mirrorTests :: FilePath -> IO Test
@@ -283,3 +285,46 @@ diffRestrictionPreservationTests maudePath = do
         assertEqual "restriction certificate" expected supported
         assertEqual "notice agrees with proof applicability" (not expected)
           ("RHS: R" `isInfixOf` render (prettyDiffRestrictionLimit thy))
+
+-- Partial evaluation may split one side into more variants than the other.
+-- Keep family identities, all refinements, and repeated closure stable.
+partialEvaluationDiffTests :: FilePath -> IO Test
+partialEvaluationDiffTests maudePath = do
+    let models =
+          [ ["builtins: symmetric-encryption",
+             "rule Dec: [In(x),In(k)] --> [Out(diff(sdec(x,k),x))]"]
+          , ["rule SeedA: [] --> [State('a')]",
+             "rule SeedB: [] --> [State('b')]",
+             "rule Use: [State(x)] --[Used(x)]-> [Out(x)]"]
+          , ["rule Seed: [] --> [State(diff('a','b'))]",
+             "rule Use: [State('a')] --> [Out('ok')]"]
+          ]
+    cases <- sequence [makeCase model auto | model <- models, auto <- [False, True]]
+    pure $ TestLabel "Diff partial evaluation families" $ TestList cases
+  where
+    makeCase model auto = do
+        open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $
+            unlines (["theory PartialEvaluation begin"] ++ model ++ ["diffLemma D:", "end"])
+        original <- closeDiffTheory maudePath open auto
+        let refined = applyPartialEvaluationDiff Silent auto original
+            reopened = closeDiffTheoryWithMaude (L.get diffThySignature refined)
+                         (openDiffTheory refined) auto
+            rules t = (sort (leftTheoryRules t), sort (rightTheoryRules t))
+            names side t = S.fromList
+              [getRuleName (L.get cprRuleE r) | r <- diffTheorySideRules side t]
+        pure $ TestCase $ do
+            mapM_ (\side -> assertEqual "original family identities"
+              (names side original) (names side refined)) [LHS, RHS]
+            assertEqual "refined variants survive reopening" (rules refined) (rules reopened)
+            printed <- either (assertFailure . show) pure $
+              parseOpenDiffTheoryString [] (render (prettyClosedDiffTheory refined))
+            reparsed <- closeDiffTheory maudePath printed auto
+            -- The printer can normalize an E-rule to its sole AC variant;
+            -- compare the compiled behavior, including all action annotations.
+            mapM_ (\side -> do
+              let before = map (L.get cprRuleAC) (diffTheorySideRules side refined)
+                  after = map (L.get cprRuleAC) (diffTheorySideRules side reparsed)
+                  covered xs ys = all (\x -> any (eqModuloFreshnessNoAC x) ys) xs
+              assertEqual "printed variant count" (length before) (length after)
+              assertBool "refinements survive printing and parsing up to renaming"
+                (covered before after && covered after before)) [LHS, RHS]

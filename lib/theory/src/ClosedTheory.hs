@@ -431,6 +431,22 @@ prettyClosedTheory thy = if containsManualRuleVariants mergedRules
                       [ text "looping facts with injective instances:"
                       , nest 2 $ fsepList (text . showFactTagArity) (map fst tags) ]
 
+-- | Preserve explicitly refined side rules when reopening or printing a diff
+-- theory. Recomputing from the E-rule would discard partial evaluation, and
+-- omitting one trivial member would make an explicit family incomplete.
+openDiffSideRule :: [DiffTheoryItem r ClosedProtoRule p p2]
+                -> (Side, ClosedProtoRule) -> (Side, OpenProtoRule)
+openDiffSideRule items (side, ru)
+  | multiple || refined = (side, OpenProtoRule ruE [ruAC])
+  | otherwise           = (side, openProtoRule ru)
+  where
+    ruE = L.get cprRuleE ru
+    ruAC = L.get cprRuleAC ru
+    multiple = length [() | EitherRuleItem (s, r) <- items,
+                           s == side, L.get cprRuleE r == ruE] > 1
+    refined = L.get (pracVariants . rInfo) ruAC == Disj [emptySubstVFresh]
+           && not (isTrivialProtoVariantAC ruAC ruE)
+
 -- | Pretty print a closed diff theory.
 prettyClosedDiffTheory :: HighlightDocument d => ClosedDiffTheory -> d
 prettyClosedDiffTheory thy = if containsManualRuleVariantsDiff mergedRules
@@ -453,7 +469,7 @@ prettyClosedDiffTheory thy = if containsManualRuleVariantsDiff mergedRules
   where
     items = L.get diffThyItems thy
     mergedRules = mergeLeftRightRulesDiff $ mergeOpenProtoRulesDiff $
-       map (mapDiffTheoryItem id (\(x, y) -> (x, (openProtoRule y))) id id) items
+       map (mapDiffTheoryItem id (openDiffSideRule items) id id) items
     thy' :: DiffTheory SignatureWithMaude ClosedRuleCache DiffProtoRule OpenProtoRule IncrementalDiffProof IncrementalProof
     thy' = DiffTheory {_diffThyName=(L.get diffThyName thy)
             ,_diffThyInFile=(L.get diffThyInFile thy)

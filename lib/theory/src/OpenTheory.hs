@@ -710,16 +710,18 @@ addOpenProtoDiffRule ru@(DiffProtoRule _ Nothing) thy = do
       maybe True (ru ==) $ lookupOpenDiffProtoDiffRule (L.get (preName . rInfo . dprRule) ru) thy
 addOpenProtoDiffRule ru@(DiffProtoRule _ (Just (lr, rr))) thy = do
   guard nameNotUsedForDifferentRule
-  guard $ allRuleNamesAreDifferent lr
-  guard $ allRuleNamesAreDifferent rr
+  guard $ validVariantNames lr
+  guard $ validVariantNames rr
   guard leftAndRightHaveSameName
   return $ modify diffThyItems (++ [DiffRuleItem ru]) thy
   where
     nameNotUsedForDifferentRule =
       maybe True (ru ==) $ lookupOpenDiffProtoDiffRule (L.get (preName . rInfo . dprRule) ru) thy
-    allRuleNamesAreDifferent (OpenProtoRule ruE ruAC) =
-      (S.size (S.fromList (ruleName ruE : map ruleName ruAC)))
-        == ((length ruAC) + 1)
+    validVariantNames (OpenProtoRule ruE ruAC) =
+      -- Partial evaluation groups refinements under the original family name
+      -- for diff mirroring. Other explicitly named variants must be distinct.
+      all ((== ruleName ruE) . ruleName) ruAC ||
+      S.size (S.fromList (ruleName ruE : map ruleName ruAC)) == length ruAC + 1
     leftAndRightHaveSameName = ruleName ru == ruleName lr && ruleName lr == ruleName rr
 
 -- | Add new protocol rules. Fails, if a protocol rule with the same name
