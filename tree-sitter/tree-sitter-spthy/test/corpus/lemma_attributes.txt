@@ -1,0 +1,30 @@
+==================
+Diff reuse on side lemmas
+==================
+
+theory DiffReuse
+begin
+
+lemma left_assumption [left,reuse,diff_reuse]: "T"
+lemma right_assumption [right,reuse,diff_reuse]: "T"
+
+end
+
+---
+
+(theory
+  (ident)
+  (lemma
+    (ident)
+    (diff_lemma_attrs
+      (diff_lemma_attr)
+      (lemma_attr)
+      (lemma_attr))
+    (atom))
+  (lemma
+    (ident)
+    (diff_lemma_attrs
+      (diff_lemma_attr)
+      (lemma_attr)
+      (lemma_attr))
+    (atom)))
