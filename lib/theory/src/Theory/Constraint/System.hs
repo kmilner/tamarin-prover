@@ -1197,9 +1197,23 @@ filterRestrictions ctxt sys formulas = filter relevant formulas
   where
     runMaude   = (`runReader` L.get pcMaudeHandle ctxt)
 
-    relevant fm = null (guardFactTags fm)
-               || not (isSafetyFormula fm)
+    relevant fm = not (isSafetyFormula fm)
+               || hasActionFreeCase fm
                || unifiableNodes fm
+
+    -- Boolean combinations can contain action-free obligations even when
+    -- guardFactTags reports an action elsewhere in the formula. Such a case
+    -- must retain the complete restriction. The body of an action-guarded
+    -- universal need not count: if its guard cannot match, that implication
+    -- is vacuously true; if it can match, unifiableNodes retains it.
+    hasActionFreeCase :: LNGuarded -> Bool
+    hasActionFreeCase (GAto (Action _ _)) = False
+    hasActionFreeCase (GAto _)            = True
+    hasActionFreeCase (GDisj fms)         =
+      null (getDisj fms) || any hasActionFreeCase (getDisj fms)
+    hasActionFreeCase (GConj fms)         = any hasActionFreeCase $ getConj fms
+    hasActionFreeCase (GGuarded _ _ atos _) =
+      not (any isActionAtom atos)
 
     unifiableNodes :: LNGuarded -> Bool
     unifiableNodes fm = case fm of
