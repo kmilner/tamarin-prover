@@ -316,11 +316,21 @@ closeEitherProtoRule hnd (s, ruE) = (s, closeProtoRule hnd [] ruE)
 
 -- | Apply macro to a diff protocol rule.
 applyMacroInDiffProtoRule :: [LNMacro]-> DiffProtoRule -> DiffProtoRule
-applyMacroInDiffProtoRule mcs (DiffProtoRule ruE sides) = DiffProtoRule (applyMacroInRule mcs ruE) sides
+applyMacroInDiffProtoRule mcs (DiffProtoRule ruE sides) =
+    DiffProtoRule (applyMacroInRule mcs ruE) (applySides <$> sides)
+  where
+    applySides (leftRule, rightRule) =
+      (applyMacroInProtoRule mcs leftRule, applyMacroInProtoRule mcs rightRule)
 
 -- | Apply macro to an open protocol rule.
 applyMacroInProtoRule :: [LNMacro]-> OpenProtoRule -> OpenProtoRule
-applyMacroInProtoRule mcs (OpenProtoRule ruE variants) = OpenProtoRule (applyMacroInRule mcs ruE) variants
+applyMacroInProtoRule mcs (OpenProtoRule ruE variants) =
+    OpenProtoRule expanded variants
+  where
+    -- Explicit side rules already carry new-variable vectors aligned across
+    -- the two sides. Macro expansion does not introduce variables, so retain
+    -- that alignment instead of recomputing each side independently.
+    expanded = L.set rNewVars (L.get rNewVars ruE) (applyMacroInRule mcs ruE)
 
 
 -- -- | Convert a lemma to the corresponding guarded formula.
