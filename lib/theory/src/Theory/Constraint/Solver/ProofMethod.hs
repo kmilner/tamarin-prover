@@ -197,7 +197,7 @@ data Result =
   -- ^ A contradiction could be derived, possibly with a reason. The single
   --    formula constraint in the system.
   | Unfinishable
-  -- ^ The proof cannot be finished (due to reducible operators in subterms or
+  -- ^ The proof cannot be finished (due to unresolved subterm constraints or
   --   because a solution was found after weakening).
   deriving( Eq, Ord, Show, Generic, NFData, Binary )
 
@@ -218,7 +218,7 @@ data DiffProofMethod =
     DiffSorry (Maybe String)                 -- ^ Proof was not completed
   | DiffMirrored                             -- ^ No attack was found
   | DiffAttack                               -- ^ A potential attack was found
-  | DiffUnfinishable                         -- ^ The backward search is complete (but there are reducible operators in subterms)
+  | DiffUnfinishable                         -- ^ The backward search has unresolved subterm constraints
   | DiffRuleEquivalence                      -- ^ Consider all rules
   | DiffBackwardSearch                       -- ^ Do the backward search starting from a rule
   | DiffBackwardSearchStep ProofMethod       -- ^ A step in the backward search starting from a rule
@@ -457,9 +457,9 @@ execDiffProofMethod ctxt method sys =
       cases <- checkAndExecProofMethod (eitherProofContext ctxt s) m dsSys
       return $ M.map (\x -> L.set dsSystem (Just x) sys) cases
 
--- | returns True if there are no reducible operators on top of a right side of a subterm in the subterm store
+-- | Whether the remaining subterm constraints permit extracting a trace.
 finishedSubterms :: ProofContext -> System -> Bool
-finishedSubterms pc sys = hasReducibleOperatorsOnTop (reducibleFunSyms $ mhMaudeSig $ L.get pcMaudeHandle pc) (L.get sSubtermStore sys)
+finishedSubterms pc sys = subtermStoreIsFinished (reducibleFunSyms $ mhMaudeSig $ L.get pcMaudeHandle pc) (L.get sSubtermStore sys)
 
 ------------------------------------------------------------------------------
 -- Heuristics
@@ -1175,7 +1175,7 @@ prettyProofMethod method = case method of
     Invalidated -> lineComment_ "proof may have been invalidated by editing a reuse lemma above. You should "
     Finished Solved -> keyword_ "SOLVED" <-> lineComment_ "trace found"
     Induction  -> keyword_ "induction"
-    Finished Unfinishable -> keyword_ "UNFINISHABLE" <-> lineComment_ "reducible operator in subterm"
+    Finished Unfinishable -> keyword_ "UNFINISHABLE" <-> lineComment_ "unresolved subterm constraints"
     Sorry reason ->
         fsep [keyword_ "sorry", maybe emptyDoc closedComment_ reason]
     SolveGoal goal -> keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"
@@ -1190,7 +1190,7 @@ prettyDiffProofMethod :: HighlightDocument d => DiffProofMethod -> d
 prettyDiffProofMethod method = case method of
     DiffMirrored             -> keyword_ "MIRRORED"
     DiffAttack               -> keyword_ "ATTACK" <-> lineComment_ "trace found"
-    DiffUnfinishable         -> keyword_ "UNFINISHABLEdiff" <-> lineComment_ "reducible operator in subterm"
+    DiffUnfinishable         -> keyword_ "UNFINISHABLEdiff" <-> lineComment_ "unresolved subterm constraints"
     DiffSorry reason         ->
         fsep [keyword_ "sorry", maybe emptyDoc lineComment_ reason]
 -- MERGED with solved.
