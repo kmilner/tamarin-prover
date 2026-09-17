@@ -35,6 +35,9 @@ module Theory.Sapic.Process (
     , mapTermsAction
     , mapTermsComb
     , applyM
+    , actionBinders
+    , combinatorBinders
+    , applyProcessSubstAvoiding
     , processAddAnnotation
     , varsProc
     -- pretty printing
@@ -50,13 +53,14 @@ module Theory.Sapic.Process (
 
 import Data.Binary
 import Data.Data
-import Data.Set hiding (map, union)
-import qualified Data.Set as Set (map)
+import Data.Set hiding (map, union, (\\))
+import qualified Data.Set as Set
 import GHC.Generics (Generic)
 import Control.Parallel.Strategies
 import Term.Substitution
 import Theory.Text.Pretty
 import Data.List
+import qualified Data.Foldable as F
 import Control.Monad.Catch
 import Theory.Sapic.Term
 import Theory.Sapic.Substitution
@@ -342,7 +346,7 @@ instance {-# OVERLAPPABLE #-} (Ord v, Apply s v) => Apply s (ProcessCombinator v
             = mapTermsComb (apply subst) (apply subst) (apply subst) c
 
 instance (Apply SapicSubst ann) => Apply SapicSubst (LProcess ann) where
--- We are ignoring capturing here, use applyM below to get warnings.
+-- This pure instance ignores capture; applyM below freshens binders and checks substitution errors.
     apply _ (ProcessNull ann) = ProcessNull ann
     apply subst (ProcessComb c ann pl pr) =
                 ProcessComb (apply subst c) (apply subst ann) (apply subst pl) (apply subst pr)
@@ -408,20 +412,88 @@ instance ApplyM SapicSubst (SapicAction SapicLVar)
         where lvarName' (SapicLVar v _ ) = lvarName v
 
 
-instance (GoodAnnotation ann) => ApplyM SapicSubst (LProcess ann)
-    where
-    applyM _ (ProcessNull ann) = return $ ProcessNull ann
-    applyM subst (ProcessComb c ann pl pr) = do
-            c' <- applyM subst c
-            ann' <- applyM subst ann
-            pl' <- applyM subst pl
-            pr' <- applyM subst pr
-            return $ ProcessComb c' ann' pl' pr'
-    applyM subst (ProcessAction ac ann p) = do
-            ac' <- applyM subst ac
-            ann' <- applyM subst ann
-            p' <- applyM subst p
-            return $ ProcessAction ac' ann' p'
+-- | Binders introduced by an action scope over its continuation, not its
+-- channel expression. Pattern matching variables are references, not binders.
+-- Type annotations share one LVar namespace; retain the first typed occurrence
+-- for diagnostics and consumers that need the original declaration.
+actionBinders :: SapicAction SapicLVar -> [SapicLVar]
+actionBinders (New v) = [v]
+actionBinders (ChIn _ t matches) = patternBinders (freesSapicTerm t) matches
+actionBinders (MSR ls _ _ _ matches) = patternBinders (concatMap freesSapicFact ls) matches
+actionBinders _ = []
+
+-- | Combinator binders scope over the left (success) continuation only.
+-- The lookup key, let RHS, and right (failure) continuation are outside scope.
+combinatorBinders :: ProcessCombinator SapicLVar -> [SapicLVar]
+combinatorBinders (Lookup _ v) = [v]
+combinatorBinders (Let t _ matches) = patternBinders (freesSapicTerm t) matches
+combinatorBinders _ = []
+
+patternBinders :: [SapicLVar] -> Set SapicLVar -> [SapicLVar]
+patternBinders vars matches = unique (Set.map toLVar matches) vars
+  where
+    unique _ [] = []
+    unique seen (v:vs)
+      | toLVar v `member` seen = unique seen vs
+      | otherwise = v : unique (Set.insert (toLVar v) seen) vs
+
+-- | Apply a process substitution with a scoped alpha-renaming environment.
+-- Reserve the whole process once, including location metadata. A single fresh
+-- supply keeps later names distinct without repeatedly scanning each suffix.
+applyProcessSubstAvoiding :: (GoodAnnotation ann, MonadThrow m)
+                         => [LVar] -> SapicSubst -> LProcess ann -> m (LProcess ann)
+applyProcessSubstAvoiding reserved subst proc =
+    evalFreshTAvoiding (go (fromList reserved) (substFromList [] :: Subst Name LVar) proc) avoidVars
+  where
+    incoming = fromList $ map toLVar $ varsRange subst
+    avoidVars = reserved ++ map toLVar (dom subst ++ varsRange subst ++ toList (varsProc proc))
+             ++ pfoldMap (\p -> let ann = getProcessParsedAnnotation (processGetAnnotation p)
+                                in maybe [] (frees . toLNTerm) (location ann)
+                                   ++ map toLVar (generatedBinders ann)) proc
+    freshening used ann bound = do
+      let generated = fromList $ map toLVar $ generatedBinders $ getProcessParsedAnnotation ann
+          -- Preserve user rebinding for validation; only generated collisions
+          -- with the caller and substitution-range captures are reallocated.
+          captures = Data.List.filter (\v -> v `member` incoming ||
+                                  (v `member` generated && v `member` used)) bound
+      fresh <- mapM (\v -> freshLVar (lvarName v) (lvarSort v)) captures
+      return $ substFromList $ zip captures (map varTerm fresh)
+    markGenerated ren ann = mapProcessParsedAnnotation (\parsed -> parsed
+      { generatedBinders = nub $ generatedBinders parsed
+                            ++ map (`SapicLVar` Nothing) (varsRange ren) }) (applyAnn ren ann)
+    go used env p = case p of
+      ProcessNull ann -> return $ ProcessNull (applyAnn env ann)
+      ProcessAction ac ann rest -> do
+        let ac0 = apply env ac
+            ann0 = applyAnn env ann
+            bound = map toLVar $ actionBinders ac0
+        ren <- freshening used ann0 bound
+        let ac1 = case ac0 of
+              -- The channel is evaluated outside the input binder's scope.
+              ChIn channel t matches -> ChIn channel (apply ren t) matches
+              _ -> apply ren ac0
+        ac' <- applyM subst ac1
+        ann' <- applyM subst (markGenerated ren ann0)
+        rest' <- go (Set.union (fromList $ map toLVar $ F.toList ac') used) (ren `compose` env) rest
+        return $ ProcessAction ac' ann' rest'
+      ProcessComb comb ann left right -> do
+        let comb0 = apply env comb
+            ann0 = applyAnn env ann
+            bound = map toLVar $ combinatorBinders comb0
+        ren <- freshening used ann0 bound
+        let comb1 = case comb0 of
+              Lookup t v -> Lookup t (apply ren v)
+              Let t rhs matches -> Let (apply ren t) rhs matches
+              _ -> comb0
+        comb' <- applyM subst comb1
+        ann' <- applyM subst (markGenerated ren ann0)
+        left' <- go (Set.union (fromList $ map toLVar $ F.toList comb') used) (ren `compose` env) left
+        -- Let/lookup failure branches retain the incoming environment.
+        right' <- go used env right
+        return $ ProcessComb comb' ann' left' right'
+
+instance (GoodAnnotation ann) => ApplyM SapicSubst (LProcess ann) where
+    applyM = applyProcessSubstAvoiding []
 
 -- | Add another element to the existing annotations, e.g., yet another identifier.
 processAddAnnotation :: Monoid ann => Process ann v -> ann -> Process ann v

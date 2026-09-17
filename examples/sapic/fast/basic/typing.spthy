@@ -26,7 +26,7 @@ let Q(x) =
 
 process:
 in(a:lol); // TODO we do not typecheck call to process correctly atm. I think the trick is to type check before inlining.
-new n:truc;
+// Each parallel branch may bind n independently, with its own type.
 (
 ( new n:lol; out(n)) | (new n:rofl; out(n))
 |

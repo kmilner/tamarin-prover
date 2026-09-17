@@ -28,6 +28,8 @@ expect_rejection() {
 
 expect_rejection soundness-sapic-destructor-nonvariable-result \
   'SAPIC destructor equations with non-variable right-hand sides'
+expect_rejection sapic-typed-binding-reuse 'Variable bound twice: y.'
+expect_rejection sapic-nested-call-binding-reuse 'Variable bound twice: y.'
 
 echo 'SAPIC input validation rejects the invalid examples with the expected diagnostics.'
 
