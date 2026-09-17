@@ -113,7 +113,7 @@ rule (modulo E) letysdeckx_0_111[color=#ffffff,
 
 rule (modulo E) letysdeckx_1_111[color=#ffffff,
                                  process="let y.1=sdec(k.1, x.1)", issapicrule, role='Process']:
-   [ Let_1111( <k, senc(k, y.1)>, k.1, x.1 ) ]
+   [ Let_1111( <k.2, senc(k.2, y.1)>, k.1, x.1 ) ]
   -->
    [ State_1111( k.1, x.1, y.1 ) ]
 
@@ -126,14 +126,14 @@ rule (modulo E) letysdeckx_1_111[color=#ffffff,
 restriction Restr_letysdeckx_2_111_1:
   "∀ x #NOW.
     (Restr_letysdeckx_2_111_1( x ) @ #NOW) ⇒
-    (∀ k y. (<k, senc(k, y)> = x) ⇒ (⊥))"
+    (∀ y k. (<k, senc(k, y)> = x) ⇒ (⊥))"
   // safety formula
 
   /*
   expanded formula:
   "∀ x #NOW.
     (Restr_letysdeckx_2_111_1( x ) @ #NOW) ⇒
-    (∀ k y. (<k, senc(k, y)> = x) ⇒ (⊥))"
+    (∀ y k. (<k, senc(k, y)> = x) ⇒ (⊥))"
   */
 
 rule (modulo E) letysdeckx_2_111[color=#ffffff,
@@ -219,8 +219,8 @@ restriction single_session:
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: 0f38405632cbbbb1486edc6b67f9c2aaa9fe699b (with uncommited changes), branch: fix/sapic-soundness
+Compiled at: 2026-09-17 08:06:11.912386071 UTC
 */
 
 end
@@ -232,7 +232,7 @@ summary of summaries:
 analyzed: examples/sapic/fast/basic/destructors.spthy
 
   output:          examples/sapic/fast/basic/destructors.spthy.tmp
-  processing time: 0.04s
+  processing time: 0.09s
   
   else (exists-trace): verified (3 steps)
   main (exists-trace): verified (4 steps)
