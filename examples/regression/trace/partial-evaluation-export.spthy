@@ -36,15 +36,30 @@ lemma unreduced_reachable:
   exists-trace
   "Ex m #i. Unreduced(m) @ i"
 
-// Other rule families can still be specialized by partial evaluation.
-rule Seed:
-  [ ] --> [ State('ok') ]
+// Partial evaluation splits Use into two rules. Both must survive export
+// with distinct names, without colliding with the existing Use_PE_1 rule.
+rule SeedA:
+  [ ] --> [ State('a') ]
+
+rule SeedB:
+  [ ] --> [ State('b') ]
 
 rule Use:
   [ State(x) ] --[ Used(x) ]-> [ ]
 
-lemma specialized_rule_reachable:
+rule Use_PE_1:
+  [ ] --[ ReservedName() ]-> [ ]
+
+lemma first_specialization_reachable:
   exists-trace
-  "Ex #i. Used('ok') @ i"
+  "Ex #i. Used('a') @ i"
+
+lemma second_specialization_reachable:
+  exists-trace
+  "Ex #i. Used('b') @ i"
+
+lemma existing_rule_reachable:
+  exists-trace
+  "Ex #i. ReservedName() @ i"
 
 end

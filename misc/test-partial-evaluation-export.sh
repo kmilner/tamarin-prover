@@ -14,7 +14,9 @@ check_verdicts() {
     'unreduced_secret (exists-trace): falsified' \
     'decrypted_reachable (exists-trace): verified' \
     'unreduced_reachable (exists-trace): verified' \
-    'specialized_rule_reachable (exists-trace): verified'; do
+    'first_specialization_reachable (exists-trace): verified' \
+    'second_specialization_reachable (exists-trace): verified' \
+    'existing_rule_reachable (exists-trace): verified'; do
     if ! grep -Fq "$expected" "$log"; then
       echo "missing expected verdict in $log: $expected" >&2
       cat "$log" >&2

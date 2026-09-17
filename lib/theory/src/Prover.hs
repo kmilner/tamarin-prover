@@ -267,11 +267,32 @@ applyPartialEvaluation evalStyle autosources thy0 =
       Just ac -> eqModuloFreshnessNoAC ac (compiledRuleAC ru)
       Nothing -> False
 
+    -- Refinement can split one rule into several rules with the same name.
+    -- Allocate distinct export names before closing the theory, so proofs and
+    -- printed rules use the same names. Reserve even names of removed rules.
+    namedRefinedRules = MS.evalState (mapM nameRefinement refinedRules)
+      (retainedNames, reservedNames)
+    retainedNames = S.fromList
+      [ getRuleName ru | ru <- getProtoRuleEs thy0,
+                         ruleName ru `S.member` retainedFamilies ]
+    reservedNames = S.fromList $ map getRuleName (getProtoRuleEs thy0 ++ rules)
+    nameRefinement ru = do
+      (used, reserved) <- MS.get
+      let originalName = getRuleName ru
+          name = if originalName `S.notMember` used then originalName else
+            head [ candidate | i <- [1 :: Integer ..],
+                   let candidate = originalName ++ "_PE_" ++ show i,
+                   candidate `S.notMember` reserved ]
+          renamed = if name == originalName then ru else
+            L.set (preName . rInfo) (StandRule name) ru
+      MS.put (S.insert name used, S.insert name reserved)
+      return (ruleName ru, renamed)
+
     replaceRule (RuleItem ru)
       | ruleName ru `S.member` retainedFamilies = [RuleItem ru]
       | otherwise =
           [ RuleItem (openCompiledRule refined)
-          | refined <- refinedRules, ruleName refined `elem` variants ]
+          | (variant, refined) <- namedRefinedRules, variant `elem` variants ]
       where
         variants = [ variant | (family, variant) <- families, family == ruleName ru ]
     replaceRule item = [item]
