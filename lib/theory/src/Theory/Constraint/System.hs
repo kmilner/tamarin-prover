@@ -1151,20 +1151,30 @@ impliedFormulas hnd sys gf0 = res
         candidateSubsts (compose subst' subst) as
 
 -- | @impliedFormulasAndSystems se imp@ returns the list of guarded formulas that are
--- *potentially* implied by @se@, together with the updated system.
-impliedFormulasAndSystems :: MaudeHandle -> System -> LNGuarded -> [(LNGuarded, System)]
-impliedFormulasAndSystems hnd sys gf = res
+-- *potentially* implied by @se@, together with the updated system. The Boolean
+-- records whether the instance leaves the system's variables unconstrained
+-- (up to renaming). A violation after a proper specialization does not imply
+-- that every instance of the original system violates the restriction.
+impliedFormulasAndSystems :: MaudeHandle -> RestrictionInstance
+                          -> [RestrictionInstance]
+impliedFormulasAndSystems hnd instance0@(RestrictionInstance gf sys frame _) = res
   where
-    res = case (openGuarded gf `evalFresh` avoid (gf, sys)) of
-      Just (All, _vs, antecedent, succedent) -> map (\x -> apply x (succedent', sys)) subst
+    companions = failureFrameFrees frame
+    res = case (openGuarded gf `evalFresh` avoid (gf, companions, sys)) of
+      Just (All, _vs, antecedent, succedent) -> map instantiate subst'
         where
+          instantiate subst =
+            let freeSubst = freshToFreeAvoiding subst
+                              ((gf, subst), companions, sys)
+            in specializeRestriction freeSubst
+                 (isRenaming (restrictVFresh (frees sys) subst))
+                 instance0 { restrictionFormula = succedent' }
           (actionsEqs, otherAtoms) = first sortGAtoms . partitionEithers $ map prepare antecedent
           succedent'               = gall [] otherAtoms succedent
           subst' = concat $ map (\(x, y) ->
             if null ((`runReader` hnd) (unifyLNTerm x))
                then []
                else (`runReader` hnd) (unifyLNTerm y)) (equalities actionsEqs)
-          subst  = map (\x -> freshToFreeAvoiding x ((gf, x), sys)) subst'
       _ -> []
 
     prepare (Action i fa) = Left  (GAction i fa)
@@ -1248,71 +1258,205 @@ getMirrorDGandEvaluateRestrictions dctxt dsys isSolved =
           (Just side, Just sys) -> evaluateRestrictions dctxt dsys (getMirrorDG dctxt side sys) isSolved
 
 -- | Evaluates whether the restrictions hold. Assumes that the mirrors have been correctly computed.
--- Returns Just True and a list of mirrors if all hold, Just False and a list of attacks (if found) if at least one does not hold and Nothing otherwise.
+-- Returns TTrue when the alternatives cover all admitted original assignments,
+-- TFalse when they share a failing assignment, and TUnknown otherwise.
 evaluateRestrictions :: DiffProofContext -> DiffSystem -> [System] -> Bool -> (Trivalent, [System])
 evaluateRestrictions dctxt dsys mirrors isSolved =
     case (L.get dsSide dsys, L.get dsSystem dsys) of
         (Nothing,   _       ) -> (TFalse, [])
         (Just _ , Nothing   ) -> (TFalse, [])
-        (Just side, Just sys) -> if {-trace (show evals) $-} evals == []
-            then (TFalse, [])
-            else if any (\x -> fst x == TTrue) evals
-                    then (TTrue, concat $ map snd $ filter (\x -> fst x == TTrue) evals)
-                    else
-                        if any (\x -> fst x == TUnknown) evals
-                        then (TUnknown, concat $ map snd $ filter (\x -> fst x == TUnknown) evals)
-                        else
-                            (TFalse, concat $ map snd $ filter (\x -> fst x == TFalse) evals)
+        (Just side, Just sys)
+          | null mirrors -> (TFalse, [])
+          | not (null successful) -> (TTrue, concatMap snd successful)
+          | otherwise -> case jointFailures sys independentMirrors [] of
+              (TTrue, _) -> (TTrue, mirrors)
+              result     -> result
             where
                 oppositeCtxt = eitherProofContext dctxt (opposite side)
-                evals = map (\mirror ->
+                successful = filter ((== TTrue) . fst) $ map evaluateMirror mirrors
+                evaluateMirror mirror =
                     doRestrictionsHold oppositeCtxt mirror
-                      (relevantRestrictions mirror)
-                      isSolved) mirrors
+                      (relevantRestrictions mirror) isSolved
+                -- Only variables from the original graph are shared between
+                -- alternatives. Equal names for mirror-local variables must
+                -- not create dependencies between their failure conditions.
+                independentMirrors = evalFreshAvoiding
+                  (mapM (renameIgnoring (frees sys)) mirrors) (sys, mirrors)
+
+                -- Intersect the failure cases by applying every specialization
+                -- to the original graph, remaining mirrors, and earlier failed
+                -- mirrors together. An empty intersection establishes coverage;
+                -- a common failure must also satisfy the original restrictions.
+                jointFailures original [] failed =
+                  case fst $ doRestrictionsHold originalCtxt
+                         (normDG originalCtxt original) originalRestrictions True of
+                    TTrue    -> certifyAttack original failed
+                    TFalse   -> (TTrue, [])
+                    TUnknown -> (TUnknown, failed)
+                jointFailures original (candidate:remaining) failed =
+                  combineFailures $ map checkInstance instances
+                  where
+                    mirror = normDG oppositeCtxt candidate
+                    frame = beginAlternative original mirror remaining failed
+                    instances = restrictionInstances oppositeCtxt mirror
+                      (relevantRestrictions mirror) isSolved (Just frame)
+
+                    checkInstance (RestrictionInstance f _ _ _) | f == gtrue = (TTrue, [])
+                    checkInstance (RestrictionInstance f m (Just current) _) =
+                      case finishAlternative m current of
+                        (o, rest, previous) -> case jointFailures o rest previous of
+                          (TFalse, witnesses)
+                            | f /= gfalse || not (localsUnconstrained current) ->
+                                (TUnknown, witnesses)
+                          result -> result
+                    checkInstance _ = error "jointFailures: missing failure frame"
+
+                certifyAttack original failed
+                  -- A specialization must still describe normal rule instances.
+                  | not (all ((`runReader` L.get pcMaudeHandle originalCtxt) . nfRule)
+                             (M.elems (L.get sNodes original))) = (TUnknown, failed)
+                  | eqModuloFreshnessNoAC original sys = (TFalse, failed)
+                  | any ((== TTrue) . fst) rechecked = (TTrue, [])
+                  | all ((== TFalse) . fst) rechecked = (TFalse, concatMap snd rechecked)
+                  | otherwise = (TUnknown, refinedMirrors)
+                  where
+                    -- Fixing original variables can enable mirrors that did
+                    -- not unify with the original symbolic graph. Before
+                    -- reporting an attack, enumerate again and require their
+                    -- failures without another independent specialization.
+                    refinedMirrors = getMirrorDG dctxt side original
+                    rechecked = [doRestrictionsHold oppositeCtxt m
+                                   (relevantRestrictions m) isSolved
+                                | m <- refinedMirrors]
+
+                combineFailures results
+                  | not (null attacks) = (TFalse, concatMap snd attacks)
+                  | not (null unknown) = (TUnknown, concatMap snd unknown)
+                  | otherwise          = (TTrue, [])
+                  where
+                    attacks = filter ((== TFalse) . fst) results
+                    unknown = filter ((== TUnknown) . fst) results
                 restrictions = restrictions' (opposite side) $ L.get dpcRestrictions dctxt
-                relevantRestrictions mirror =
-                  let originalRelevant = filterRestrictions oppositeCtxt sys restrictions
-                      mirrorRelevant = filterRestrictions oppositeCtxt mirror restrictions
-                  in filter (\r -> r `elem` originalRelevant || r `elem` mirrorRelevant)
-                            restrictions
+                originalCtxt = eitherProofContext dctxt side
+                originalRestrictions = restrictions' side $ L.get dpcRestrictions dctxt
+                relevantRestrictions mirror = filterRestrictions oppositeCtxt mirror restrictions
 
                 restrictions' _  []               = []
                 restrictions' s' ((s'', form):xs) = if s' == s'' then form ++ (restrictions' s' xs) else (restrictions' s' xs)
 
 
 -- | Evaluates whether the formulas hold using safePartialAtomValuation and impliedFormulas.
--- Returns Just True if all hold, Just False if at least one does not hold and Nothing otherwise.
+-- Returns TFalse for an unconditional violation, TUnknown for a conditional
+-- violation or unresolved formula, and TTrue otherwise. Original-side admission
+-- and intersections of alternative failures belong to jointFailures above.
 doRestrictionsHold :: ProofContext -> System -> [LNGuarded] -> Bool -> (Trivalent, [System])
-doRestrictionsHold _    sys []       _        = (TTrue, [sys])
-doRestrictionsHold ctxt sys formulas isSolved = -- Just (True, [sys]) -- FIXME Jannik: This is a temporary simulation of diff-safe restrictions!
-  if (all (\(x, _) -> x == gtrue) simplifiedForms)
-    then {-trace ("doRestrictionsHold: True " ++ (render. vsep $ map (prettyGuarded) formulas) ++ " - " ++ (render. vsep $ map (\(x, _) -> prettyGuarded x) simplifiedForms) ++ " - " ++ (render $ prettySystem sys))-} (TTrue, map snd simplifiedForms)
-    else if (any (\(x, _) -> x == gfalse) simplifiedForms)
-          then {-trace ("doRestrictionsHold: False " ++ (render. vsep $ map (prettyGuarded) formulas) ++ " - " ++ (render. vsep $ map (\(x, _) -> prettyGuarded x) simplifiedForms))-} (TFalse, map snd $ filter (\(x, _) -> x == gfalse) simplifiedForms)
-          else {-trace ("doRestrictionsHold: Unkown " ++ (render. vsep $ map (prettyGuarded) formulas) ++ " - " ++ (render. vsep $ map (\(x, _) -> prettyGuarded x) simplifiedForms))-} (TUnknown, [sys])
+doRestrictionsHold _ sys [] _ = (TTrue, [sys])
+doRestrictionsHold ctxt sys formulas isSolved
+  | not (null definiteViolations) = (TFalse, definiteViolations)
+  | hasUnresolved                 = (TUnknown, [sys])
+  | otherwise                     = (TTrue, map restrictionSystem simplifiedForms)
   where
-    simplifiedForms = simplify (map (\x -> (x, sys)) formulas) isSolved
+    simplifiedForms = restrictionInstances ctxt sys formulas isSolved Nothing
+    definiteViolations = [s | RestrictionInstance f s _ True <- simplifiedForms, f == gfalse]
+    hasUnresolved = any (\(RestrictionInstance f _ _ unconditional) ->
+      f /= gtrue && (f /= gfalse || not unconditional)) simplifiedForms
 
-    simplify :: [(LNGuarded, System)] -> Bool -> [(LNGuarded, System)]
-    simplify forms solved =
-        if ({-trace ("step: " ++ (render. vsep $ map (\(x, _) -> prettyGuarded x) forms) ++ " " ++ (render. vsep $ map (\(x, _) -> prettyGuarded x) res))-} res) == forms
-            then res
-            else simplify res solved
+-- Private assignment-transport state. A standalone restriction has no failure
+-- frame; a joint alternative carries all companion graphs and its current
+-- local basis. The basis is captured only after normalizing that alternative.
+data FailureFrame = FailureFrame
+    { failureOriginal :: System
+    , failureRemaining :: [System]
+    , failurePrevious :: [System]
+    , failureLocalSorts :: [LSort]
+    , failureLocalImages :: [LNTerm]
+    } deriving (Eq)
+
+data RestrictionInstance = RestrictionInstance
+    { restrictionFormula :: LNGuarded
+    , restrictionSystem :: System
+    , restrictionFrame :: Maybe FailureFrame
+    , restrictionUnconditional :: Bool
+    } deriving (Eq)
+
+beginAlternative :: System -> System -> [System] -> [System] -> FailureFrame
+beginAlternative original mirror remaining failed =
+    FailureFrame original remaining failed (map lvarSort locals) (map varTerm locals)
+  where
+    locals = S.toList $ S.fromList (frees mirror)
+               `S.difference` S.fromList (frees original)
+
+finishAlternative :: System -> FailureFrame -> (System, [System], [System])
+finishAlternative mirror frame =
+    (failureOriginal frame, failureRemaining frame, mirror : failurePrevious frame)
+
+-- Fresh guard variables avoid every graph and every transported local image.
+-- Sorts are immutable evidence about the basis, not variable occurrences.
+failureFrameFrees :: Maybe FailureFrame -> [LVar]
+failureFrameFrees Nothing = []
+failureFrameFrees (Just frame) = frees
+    (failureOriginal frame, failureRemaining frame,
+     failurePrevious frame, failureLocalImages frame)
+
+-- This is the only guard-specialization operation: the selected formula,
+-- selected graph, all companions and local images move together. Restrict each
+-- graph's domain independently so its EqStore cannot acquire absent locals.
+specializeRestriction :: LNSubst -> Bool -> RestrictionInstance -> RestrictionInstance
+specializeRestriction subst unchanged instance' = instance'
+    { restrictionFormula = apply subst (restrictionFormula instance')
+    , restrictionSystem = applySystemSubst subst (restrictionSystem instance')
+    , restrictionFrame = fmap transport (restrictionFrame instance')
+    , restrictionUnconditional = restrictionUnconditional instance' && unchanged
+    }
+  where
+    transport current = current
+      { failureOriginal = applySystemSubst subst (failureOriginal current)
+      , failureRemaining = map (applySystemSubst subst) (failureRemaining current)
+      , failurePrevious = map (applySystemSubst subst) (failurePrevious current)
+      , failureLocalImages = apply subst (failureLocalImages current)
+      }
+
+-- Conditions on locals describe possible failures, but cannot certify attacks.
+-- Recheck after all nested guard substitutions; never cache this Boolean.
+localsUnconstrained :: FailureFrame -> Bool
+localsUnconstrained frame = case traverse getVar (failureLocalImages frame) of
+    Nothing -> False
+    Just vs -> length vs == S.size (S.fromList vs)
+      && map lvarSort vs == failureLocalSorts frame
+      && S.null (S.fromList vs `S.intersection` S.fromList (frees (failureOriginal frame)))
+
+restrictionInstances :: ProofContext -> System -> [LNGuarded] -> Bool
+                     -> Maybe FailureFrame -> [RestrictionInstance]
+restrictionInstances ctxt sys formulas isSolved frame =
+    simplify [RestrictionInstance f sys frame True | f <- formulas]
+  where
+    simplify forms =
+        if next == forms then forms else simplify next
       where
-        res = step forms solved
+        next = map simpGuard $ concatMap impliedOrInitial $ concatMap splitConjunction forms
 
-    step :: [(LNGuarded, System)] -> Bool -> [(LNGuarded, System)]
-    step forms solved = map simpGuard $ concat {-- $ trace (show (map (impliedOrInitial solved) forms))-} $ map (impliedOrInitial solved) forms
+    splitConjunction instance'@(RestrictionInstance f _ _ _)
+      | f == gtrue = [instance']
+      | otherwise = [instance' { restrictionFormula = part } | part <- guardedConjuncts f]
 
-    valuation s' = safePartialAtomValuation ctxt s'
+    simpGuard instance' = instance'
+      { restrictionFormula = simplifyGuardedOrReturn
+          (safePartialAtomValuation ctxt (restrictionSystem instance'))
+          (restrictionFormula instance') }
 
-    simpGuard :: (LNGuarded, System) -> (LNGuarded, System)
-    simpGuard (f, sys') = (simplifyGuardedOrReturn (valuation sys') f, sys')
-
-    impliedOrInitial :: Bool -> (LNGuarded, System) -> [(LNGuarded, System)]
-    impliedOrInitial solved (f, sys') = if isAllGuarded f && (solved || not (null imps)) then imps else [(f, sys')]
+    impliedOrInitial instance'
+      | isAllGuarded (restrictionFormula instance') && (isSolved || not (null imps)) = imps
+      | otherwise = [instance']
       where
-        imps = map (fmap (normDG ctxt)) $ impliedFormulasAndSystems (L.get pcMaudeHandle ctxt) sys' f
+        -- specializeRestriction composes the unconditional flag with each
+        -- nested guard; a later renaming cannot erase an outer constraint.
+        imps = [next { restrictionSystem = normDG ctxt (restrictionSystem next) }
+               | next <- impliedFormulasAndSystems (L.get pcMaudeHandle ctxt) instance']
+
+-- EqStore records substitutions, including bindings for variables absent from
+-- the graph. Do not import another mirror's local variables into this system.
+applySystemSubst :: LNSubst -> System -> System
+applySystemSubst subst sys = apply (restrict (frees sys) subst) sys
 
 -- | Normalizes all terms in the dependency graph.
 normDG :: ProofContext -> System -> System

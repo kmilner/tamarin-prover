@@ -35,6 +35,10 @@ tests maudePath = TestList <$> sequence
     [ mirrorTests maudePath
     , roundTripTests maudePath
     , assumptionTests maudePath
+    , conditionalRestrictionTests maudePath
+    , alternativeConditionalRestrictionTests maudePath
+    , jointConditionalRestrictionTests maudePath
+    , specializedMirrorTests maudePath
     , mixedRestrictionFilterTests maudePath
     ]
 
@@ -157,6 +161,223 @@ assumptionTests maudePath = do
       , TestCase $ assertEqual "all hidden diff lemmas" [] (diffAssumptions "AllHidden")
       , TestCase $ assertEqual "visible diff reuse retains both sides" [LHS,RHS] (map fst (diffAssumptions "Visible"))
       ]
+
+conditionalRestrictionTests :: FilePath -> IO Test
+conditionalRestrictionTests maudePath = do
+    let cases =
+          [ ("constant guard, symbolic action", "All #i. A('a')@i ==> F", [Nothing], True, TTrue)
+          , ("constant guard, permitted action", "All #i. A('a')@i ==> F", [Just "b"], True, TTrue)
+          , ("constant guard, forbidden mirror action", "All #i. A('a')@i ==> F", [Just "a"], False, TFalse)
+          , ("unconditional mirror violation", "All x #i. A(x)@i ==> F", [Nothing], False, TFalse)
+          , ("original also forbids the ground action", "All #i. A('a')@i ==> F", [Just "a"], True, TTrue)
+          , ("original also forbids the symbolic action", "All x #i. A(x)@i ==> F", [Nothing], True, TTrue)
+          , ("nested conditional violation", "All x #i. A(x)@i ==> (All #j. A('a')@j ==> F)", [Nothing], True, TTrue)
+          ]
+    tests' <- sequence [makeCase label formula values shared expected solved
+                      | (label,formula,values,shared,expected) <- cases, solved <- [False,True]]
+    pure $ TestLabel "Conditional restriction instances" $ TestList tests'
+  where
+    makeCase label formula values shared expected solved = do
+        open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+          [ "theory ConditionalRestrictions begin"
+          , "rule R: [] --[ A($x) ]-> []"
+          , "restriction Check" ++ (if shared then "" else " [right]") ++ ": \"" ++ formula ++ "\""
+          , "diffLemma D:", "end"
+          ]
+        thy <- closeDiffTheory maudePath open False
+        let ctxt = getDiffProofContext (head (diffTheoryDiffLemmas thy)) thy
+            rule = fst $ someRuleACInstAvoiding (fmap ProtoInfo (L.get cprRuleAC (head (leftTheoryRules thy)))) ([] :: [LVar])
+            atNode i value = (LVar "n" LSortNode i,
+                apply (substFromList [(v, maybe (varTerm (LVar "x" LSortPub (100+i))) pubTerm value) | v <- frees rule]) rule)
+            sys = L.set sNodes (M.fromList (zipWith atNode [0..] values)) $ emptySystem RawSource True
+            original = L.set dsSide (Just LHS) $ L.set dsSystem (Just sys) emptyDiffSystem
+            mirrors = getMirrorDG ctxt LHS sys
+        pure $ TestCase $ assertEqual (label ++ "; solved=" ++ show solved) expected
+          (fst (evaluateRestrictions ctxt original mirrors solved))
+
+alternativeConditionalRestrictionTests :: FilePath -> IO Test
+alternativeConditionalRestrictionTests maudePath = do
+    let avoidChosen = "All x y p #i. Choice(x,y,p)@i ==> not(x=p)"
+        cases =
+          [ ("incompatible failures", "b", avoidChosen, Nothing, Nothing, TTrue)
+          , ("shared conditional failure", "b", "All x y p #i. Choice(x,y,p)@i ==> not(p='a')", Nothing, Nothing, TFalse)
+          , ("conditional and unconditional failures", "b", "All x y p #i. Choice(x,y,p)@i ==> not(x='b') & not(x=p)", Nothing, Nothing, TFalse)
+          , ("all alternatives unconditionally fail", "b", "All x y p #i. Choice(x,y,p)@i ==> F", Nothing, Nothing, TFalse)
+          , ("one alternative always succeeds", "b", "All x y p #i. Choice(x,y,p)@i ==> x='b'", Nothing, Nothing, TTrue)
+          , ("success alongside conditional failure", "b", "All x y p #i. Choice(x,y,p)@i ==> x='b' | not(x=p)", Nothing, Nothing, TTrue)
+          , ("first ground assignment", "b", avoidChosen, Nothing, Just "a", TTrue)
+          , ("second ground assignment", "b", avoidChosen, Nothing, Just "b", TTrue)
+          , ("both alternatives succeed", "b", avoidChosen, Nothing, Just "c", TTrue)
+          , ("both fail at the same ground assignment", "b", "All x y p #i. Choice(x,y,p)@i ==> not(p='a')", Nothing, Just "a", TFalse)
+          , ("original excludes both failures", "b", avoidChosen,
+              Just "All x y p #i. Choice(x,y,p)@i ==> not(p='a') & not(p='b')", Nothing, TTrue)
+          , ("single alternative conditional failure", "a", avoidChosen, Nothing, Nothing, TFalse)
+          ]
+    tests' <- sequence [makeCase side testCase | side <- [LHS,RHS], testCase <- cases]
+    pure $ TestLabel "Conditional failures across mirror alternatives" $ TestList tests'
+  where
+    makeCase side (label, second, formula, originalFormula, publicValue, expected) = do
+        let sideName LHS = "left"
+            sideName RHS = "right"
+        open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines $
+          [ "theory AlternativeConditionalRestrictions begin"
+          , "builtins: multiset"
+          , "rule Produce: [] --> [F('a' ++ '" ++ second ++ "')]"
+          , "rule Consume: [F(x ++ y)] --[Choice(x,y,$p)]-> [Out($p)]"
+          , "restriction Mirror [" ++ sideName (opposite side) ++ "]: \"" ++ formula ++ "\""
+          ] ++
+          [ "restriction Original [" ++ sideName side ++ "]: \"" ++ f ++ "\""
+          | Just f <- [originalFormula] ] ++ ["diffLemma D:", "end"]
+        thy <- closeDiffTheory maudePath open False
+        let ctxt = getDiffProofContext (head (diffTheoryDiffLemmas thy)) thy
+            node i = LVar "n" LSortNode i
+            ground ru = apply (substFromList
+              [(v, pubTerm value) | v <- frees ru,
+                Just value <- [lookup (lvarName v)
+                  ([("x","a"),("y",second)] ++ [("p",p) | Just p <- [publicValue]])]]) ru
+            rules = map (ground . fst . (`someRuleACInstAvoiding` ([] :: [LVar]))
+                         . fmap ProtoInfo . L.get cprRuleAC) (diffTheorySideRules side thy)
+            sys = L.set sNodes (M.fromList (zip (map node [0..]) rules))
+                $ L.set sEdges (S.singleton (Edge (node 0, ConcIdx 0) (node 1, PremIdx 0)))
+                $ emptySystem RawSource True
+            original = L.set dsSide (Just side) $ L.set dsSystem (Just sys) emptyDiffSystem
+            mirrors = getMirrorDG ctxt side sys
+        pure $ TestCase $ do
+            assertEqual "all mirror alternatives enumerated" (if second == "a" then 1 else 2) (length mirrors)
+            assertBool "mirror edges are consistent" (all isCorrectDG mirrors)
+            mapM_ (\alternatives -> assertEqual (label ++ "; side=" ++ show side) expected
+              (fst (evaluateRestrictions ctxt original alternatives True))) [mirrors, reverse mirrors]
+
+jointConditionalRestrictionTests :: FilePath -> IO Test
+jointConditionalRestrictionTests maudePath = do
+    let distinctConditions = "(x='a' | not(q='b')) & (x='b' | not(p='a'))"
+        cases =
+          [ ("conditions constrain different variables", distinctConditions, Nothing, TFalse)
+          , ("original forbids only the joint assignment", distinctConditions, Just "not(p='a' & q='b')", TTrue)
+          , ("original equates the two variables", distinctConditions, Just "p=q", TTrue)
+          , ("original admits the joint assignment", distinctConditions, Just "q='b'", TFalse)
+          , ("later failure case overlaps", "not(p=x) & not(p='c')", Nothing, TFalse)
+          , ("original excludes the only overlap", "not(p=x) & not(p='c')", Just "not(p='c')", TTrue)
+          , ("unresolved existential condition", "Ex #j. Choice(x,y,p,q)@j & i<j", Nothing, TUnknown)
+          , ("definite failure alongside unresolved condition", "not(p='a') & (Ex #j. Choice(x,y,p,q)@j & i<j)", Nothing, TFalse)
+          ]
+    tests' <- sequence [makeCase side testCase | side <- [LHS,RHS], testCase <- cases]
+    pure $ TestLabel "Joint conditional mirror failures" $ TestList tests'
+  where
+    makeCase side (label, consequence, originalConsequence, expected) = do
+        let sideName LHS = "left"
+            sideName RHS = "right"
+            restriction name s f = "restriction " ++ name ++ " [" ++ sideName s ++
+              "]: \"All x y p q #i. Choice(x,y,p,q)@i ==> " ++ f ++ "\""
+        open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines $
+          [ "theory JointConditions begin"
+          , "builtins: multiset"
+          , "rule Produce: [] --> [F('a' ++ 'b')]"
+          , "rule Consume: [F(x ++ y)] --[Choice(x,y,$p,$q)]-> [Out(<$p,$q>)]"
+          , restriction "Mirror" (opposite side) consequence
+          ] ++ [restriction "Original" side f | Just f <- [originalConsequence]] ++
+          ["diffLemma D:", "end"]
+        thy <- closeDiffTheory maudePath open False
+        let ctxt = getDiffProofContext (head (diffTheoryDiffLemmas thy)) thy
+            node i = LVar "n" LSortNode i
+            ground ru = apply (substFromList
+              [(v, pubTerm value) | v <- frees ru,
+                Just value <- [lookup (lvarName v) [("x","a"),("y","b")]]]) ru
+            rules = map (ground . fst . (`someRuleACInstAvoiding` ([] :: [LVar]))
+                         . fmap ProtoInfo . L.get cprRuleAC) (diffTheorySideRules side thy)
+            sys = L.set sNodes (M.fromList (zip (map node [0..]) rules))
+                $ L.set sEdges (S.singleton (Edge (node 0, ConcIdx 0) (node 1, PremIdx 0)))
+                $ emptySystem RawSource True
+            original = L.set dsSide (Just side) $ L.set dsSystem (Just sys) emptyDiffSystem
+            mirrors = getMirrorDG ctxt side sys
+        pure $ TestCase $ do
+            assertEqual "two mirror alternatives" 2 (length mirrors)
+            mapM_ (\alternatives -> do
+              let (actual, witnesses) = evaluateRestrictions ctxt original alternatives True
+              assertEqual (label ++ "; side=" ++ show side) expected actual
+              if actual == TFalse then do
+                assertEqual "one jointly specialized witness per mirror" 2 (length witnesses)
+                let outputs m = [factTerms fa | ru <- M.elems (L.get sNodes m), fa <- L.get rConcs ru, factTag fa == OutFact]
+                assertEqual "witnesses share the original public assignment"
+                  (outputs (head witnesses)) (outputs (last witnesses))
+              else pure ()) [mirrors, reverse mirrors]
+
+specializedMirrorTests :: FilePath -> IO Test
+specializedMirrorTests maudePath = do
+    -- A ground variant becomes available only after p='a'. Its added actions
+    -- differ from the generic variant, as imported refinements can do.
+    open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+      [ "theory SpecializedMirrors begin"
+      , "rule R: [] --[A($p)]-> []"
+      , "restriction Check [right]: \"All p #i. Bad(p)@i ==> not(p='a')\""
+      , "diffLemma D:", "end"
+      ]
+    thy <- closeDiffTheory maudePath open False
+    let originalRule = fst $ someRuleACInstAvoiding
+          (fmap ProtoInfo (L.get cprRuleAC (head (leftTheoryRules thy)))) ([] :: [LVar])
+        sys = L.set sNodes (M.singleton (LVar "n" LSortNode 0) originalRule)
+              $ emptySystem RawSource True
+        original = L.set dsSide (Just LHS) $ L.set dsSystem (Just sys) emptyDiffSystem
+        base :: RuleAC
+        base = fmap ProtoInfo $ L.get cprRuleAC $ head $ rightTheoryRules thy
+        ground = substFromList [(v,pubTerm "a") | v <- frees (L.get rNewVars base)]
+        variants = [addAction base (protoFact Linear "Bad" (L.get rNewVars base)),
+                    L.modify rActs (apply ground) $ L.modify rNewVars (apply ground) base]
+        ctxt = L.set (crProtocol C.. pcRules C.. dpcPCRight) variants
+               $ getDiffProofContext (head (diffTheoryDiffLemmas thy)) thy
+        mirrors = getMirrorDG ctxt LHS sys
+        specialized = apply (substFromList
+          [(v,pubTerm "a") | v <- frees sys, lvarSort v == LSortPub]) sys
+        newMirrorCase = TestCase $ do
+          assertEqual "one initially applicable variant" 1 (length mirrors)
+          assertEqual "specialization enables a second variant" 2 (length (getMirrorDG ctxt LHS specialized))
+          assertEqual "newly enabled mirror prevents an attack" TTrue
+            (fst (evaluateRestrictions ctxt original mirrors True))
+    locals <- mapM localCase [(side, testCase) | side <- [LHS, RHS], testCase <- localConditions]
+    pure $ TestLabel "Specialized and mirror-local variables" $ TestList (newMirrorCase:locals)
+  where
+    -- Bounded nested guards exercise composed local images and original
+    -- assignments at multiple depths, on both sides of the diff context.
+    localConditions =
+      [ ("local grounding", "not(x='a')", TUnknown)
+      , ("original grounding", "not(p='a')", TFalse)
+      , ("nested local grounding", "All y q #j. A(y,q)@j ==> not(y='a')", TUnknown)
+      , ("nested original grounding", "All y q #j. A(y,q)@j ==> not(q='a')", TFalse)
+      , ("nested local aliases original", "All y q #j. A(y,q)@j ==> not(y=q)", TUnknown)
+      , ("nested guard retains local image", "All #j. A('a',p)@j ==> F", TUnknown)
+      ] ++ [("nested depth " ++ show depth ++ ": " ++ label,
+              foldr (\_ body -> "All y q #j. A(y,q)@j ==> (" ++ body ++ ")")
+                condition [1..depth], expected)
+             | depth <- [2..4 :: Int]
+             , (label, condition, expected) <-
+                 [("ground local", "not(x='a')", TUnknown),
+                  ("ground original", "not(p='a')", TFalse),
+                  ("alias local", "not(x=p)", TUnknown)]]
+    localCase (side, (label, consequence, expected)) = do
+      open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+        [ "theory LocalMirrorVariables begin"
+        , "rule R: [In(x)] --[A(x,$p)]-> [Out($p)]"
+        , "restriction Check [" ++ (if side == LHS then "right" else "left") ++ "]: \"All x p #i. A(x,p)@i ==> (" ++ consequence ++ ")\""
+        , "diffLemma D:", "end"
+        ]
+      thy <- closeDiffTheory maudePath open False
+      let rule = fst $ someRuleACInstAvoiding
+            (fmap ProtoInfo (L.get cprRuleAC (head (diffTheorySideRules side thy)))) ([] :: [LVar])
+          sys = L.set sNodes (M.singleton (LVar "n" LSortNode 0) rule) $ emptySystem RawSource True
+          ctxt = getDiffProofContext (head (diffTheoryDiffLemmas thy)) thy
+          original = L.set dsSide (Just side) $ L.set dsSystem (Just sys) emptyDiffSystem
+          mirrors = getMirrorDG ctxt side sys
+          alpha :: System -> System
+          alpha mirror = apply (substFromList
+            [(v, varTerm (v { lvarIdx = lvarIdx v + 1000 }) :: LNTerm)
+             | v <- frees mirror, v `notElem` frees sys]) mirror
+      pure $ TestCase $ do
+        assertEqual "one symbolic mirror" 1 (length mirrors)
+        assertBool "mirror has a local variable" $ not $ S.null $
+          S.fromList (frees (head mirrors)) `S.difference` S.fromList (frees sys)
+        mapM_ (\alternatives -> assertEqual label expected
+          (fst (evaluateRestrictions ctxt original alternatives True)))
+          [mirrors, map alpha mirrors]
 
 mixedRestrictionFilterTests :: FilePath -> IO Test
 mixedRestrictionFilterTests maudePath = do
