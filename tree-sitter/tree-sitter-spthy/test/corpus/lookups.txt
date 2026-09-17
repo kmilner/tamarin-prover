@@ -1,0 +1,107 @@
+==================
+Typed lookup binder
+==================
+
+theory TypedLookup
+begin
+process: lookup 'cell' as value:bitstring in 0 else 0
+end
+
+---
+
+(theory
+  theory_name: (ident)
+  (process
+    (read_state
+      from: (mset_term
+        left: (nat_term
+          left: (xor_term
+            left: (mul_term
+              left: (exp_term
+                base: (pub_name))))))
+      to: (custom_var
+        (msg_var_or_nullary_fun
+          variable_identifier: (ident))
+        variable_type: (ident))
+      in: (null)
+      else: (null))))
+
+==================
+ANY lookup binder with a sort prefix and index
+==================
+
+theory AnyLookup
+begin
+process: lookup 'cell' as $value.1:ANY in 0
+end
+
+---
+
+(theory
+  theory_name: (ident)
+  (process
+    (read_state
+      from: (mset_term
+        left: (nat_term
+          left: (xor_term
+            left: (mul_term
+              left: (exp_term
+                base: (pub_name))))))
+      to: (any_var
+        (pub_var
+          variable_identifier: (ident)
+          (natural)))
+      in: (null))))
+
+==================
+Untyped lookup binder
+==================
+
+theory UntypedLookup
+begin
+process: lookup 'cell' as value in 0
+end
+
+---
+
+(theory
+  theory_name: (ident)
+  (process
+    (read_state
+      from: (mset_term
+        left: (nat_term
+          left: (xor_term
+            left: (mul_term
+              left: (exp_term
+                base: (pub_name))))))
+      to: (msg_var_or_nullary_fun
+        variable_identifier: (ident))
+      in: (null))))
+
+==================
+Literal lookup binder rejected
+:error
+==================
+
+theory LiteralLookup
+begin
+process: lookup 'cell' as 'value':bitstring in 0
+end
+
+---
+
+(theory)
+
+==================
+Pattern lookup binder rejected
+:error
+==================
+
+theory PatternLookup
+begin
+process: lookup 'cell' as =value:bitstring in 0
+end
+
+---
+
+(theory)

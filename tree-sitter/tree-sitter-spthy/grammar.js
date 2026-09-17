@@ -576,11 +576,21 @@ module.exports = grammar({
 
       read_state: $ => prec.right('LOOKUP', seq(
           'lookup', field('from', $.mset_term),
-          'as', field('to',$._lvar),
+          'as', field('to', choice(
+              $._lvar,
+              alias($._typed_lookup_var, $.custom_var),
+              alias($._any_lookup_var, $.any_var)
+          )),
           'in', field('in', $._process),
           optional(seq('else', field('else', $._process))),
           optional(seq(';', $._process))
       )),
+
+      _typed_lookup_var: $ => seq(
+          $._lvar, ':', field('variable_type', $.ident)
+      ),
+
+      _any_lookup_var: $ => seq($._lvar, ':', 'ANY'),
 
       set_lock: $ => prec.right(seq(
           'lock', $.mset_term,

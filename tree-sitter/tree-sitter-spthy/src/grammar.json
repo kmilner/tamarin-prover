@@ -2309,8 +2309,31 @@
             "type": "FIELD",
             "name": "to",
             "content": {
-              "type": "SYMBOL",
-              "name": "_lvar"
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "_lvar"
+                },
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_typed_lookup_var"
+                  },
+                  "named": true,
+                  "value": "custom_var"
+                },
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_any_lookup_var"
+                  },
+                  "named": true,
+                  "value": "any_var"
+                }
+              ]
             }
           },
           {
@@ -2373,6 +2396,44 @@
           }
         ]
       }
+    },
+    "_typed_lookup_var": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "_lvar"
+        },
+        {
+          "type": "STRING",
+          "value": ":"
+        },
+        {
+          "type": "FIELD",
+          "name": "variable_type",
+          "content": {
+            "type": "SYMBOL",
+            "name": "ident"
+          }
+        }
+      ]
+    },
+    "_any_lookup_var": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "_lvar"
+        },
+        {
+          "type": "STRING",
+          "value": ":"
+        },
+        {
+          "type": "STRING",
+          "value": "ANY"
+        }
+      ]
     },
     "set_lock": {
       "type": "PREC_RIGHT",
