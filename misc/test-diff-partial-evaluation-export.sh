@@ -45,7 +45,7 @@ analyze() {
   check_verdicts "$tmp_dir/$1.log"
 }
 
-for model in explicit; do
+for model in explicit asymmetric; do
   input="$examples/soundness-diff-partial-evaluation-$model.spthy"
   case "$model" in
     explicit)
@@ -58,6 +58,16 @@ RHS :  decrypted_reachable (exists-trace): verified
 LHS :  unreduced_reachable (exists-trace): verified
 RHS :  unreduced_reachable (exists-trace): verified
 DiffLemma:  Observational_equivalence : analysis incomplete
+VERDICTS
+      ;;
+    asymmetric)
+      input="$examples/diff-asymmetric-explicit-variants.spthy"
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+LHS :  unreduced_plain (exists-trace): falsified - no trace found
+LHS :  decrypted_reachable (exists-trace): verified
+LHS :  unreduced_reachable (exists-trace): verified
+RHS :  echo_reachable (exists-trace): verified
+DiffLemma:  Observational_equivalence : falsified - found trace
 VERDICTS
       ;;
   esac

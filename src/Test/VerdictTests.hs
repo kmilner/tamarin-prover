@@ -33,8 +33,9 @@ import TheoryObject
 tests :: FilePath -> IO Test
 tests maudePath = TestList <$> sequence
     [ mirrorTests maudePath
-    , roundTripTests maudePath
+    , explicitVariantMirrorTests maudePath
     , diffAnnotationTests
+    , roundTripTests maudePath
     , assumptionTests maudePath
     , conditionalRestrictionTests maudePath
     , alternativeConditionalRestrictionTests maudePath
@@ -80,6 +81,51 @@ mirrorTests maudePath = do
         [check 3 [[a,b] | a <- [["a","b"],["b","a"]], b <- [["c","d"],["d","c"]]] side | side <- [LHS,RHS]]
   where
     appendTests a b = TestList [a,b]
+
+explicitVariantMirrorTests :: FilePath -> IO Test
+explicitVariantMirrorTests maudePath = do
+    cases <- sequence [makeCase swapped auto | swapped <- [False, True], auto <- [False, True]]
+    pure $ TestLabel "Explicit variant mirror families" $ TestList cases
+  where
+    makeCase swapped auto = do
+      let decryption side =
+            [ side ++ " rule Dec: [In(x), In(k)] --> [Out(sdec(x,k))]"
+            , "variants rule (modulo AC) Dec___VARIANT_1: [In(x.2), In(k.1)] --[Generic(x.2)]-> [Out(sdec(x.2,k.1))],"
+            , "rule (modulo AC) Dec___VARIANT_2: [In(senc(z.2,k.1)), In(k.1)] --[Cancelled(z.2)]-> [Out(z.2)]"
+            ]
+          identity side =
+            [ side ++ " rule Dec: [In(x), In(k)] --> [Out(x)]"
+            , "variants rule (modulo AC) Dec: [In(x), In(k)] --[Echoed(x)]-> [Out(x)]"
+            ]
+          (left, right) = if swapped then (identity, decryption) else (decryption, identity)
+          output = if swapped then "diff(x,sdec(x,k))" else "diff(sdec(x,k),x)"
+      open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines $
+        [ "theory ExplicitMirrors begin", "builtins: symmetric-encryption"
+        , "rule Dec: [In(x), In(k)] --> [Out(" ++ output ++ ")]"
+        ] ++ left "left" ++ right "right" ++
+        [ "rule Decoy: [In(x)] --[Unrelated(x)]-> [Out(x)]", "diffLemma D:", "end" ]
+      thy <- closeDiffTheory maudePath open auto
+      let ctxt = getDiffProofContext (head (diffTheoryDiffLemmas thy)) thy
+          family side = filter ((== "Dec") . getRuleName) $
+            L.get (crProtocol C.. pcRules) (eitherProofContext ctxt side)
+          node = LVar "n" LSortNode 0
+          mirrored side ru =
+            let inst = fst $ someRuleACInstAvoiding ru ([] :: [LVar])
+                sys = L.set sNodes (M.singleton node inst) $ emptySystem RawSource True
+            in map ((M.! node) . L.get sNodes) (getMirrorDG ctxt side sys)
+          actions = sort . map factTag . L.get rActs
+          decryptionSide = if swapped then RHS else LHS
+      pure $ TestCase $ do
+        assertEqual "left family size" (if swapped then 1 else 2) (length (family LHS))
+        assertEqual "right family size" (if swapped then 2 else 1) (length (family RHS))
+        assertEqual "exported variant names remain distinct"
+          ["Dec___VARIANT_1", "Dec___VARIANT_2"]
+          (sort [getRuleName (L.get cprRuleAC r) | r <- diffTheorySideRules decryptionSide thy,
+                 getRuleName (L.get cprRuleE r) == "Dec"])
+        mapM_ (\side -> mapM_ (\ru ->
+          assertEqual "every opposite variant, with its own actions"
+            (sort (map actions (family (opposite side))))
+            (sort (map actions (mirrored side ru)))) (family side)) [LHS, RHS]
 
 diffAnnotationTests :: IO Test
 diffAnnotationTests = do
