@@ -255,7 +255,7 @@ baseTransComb c an p tildex
         let t1or = toLNTerm t1' in
         let (inputTerm, equations) =
               case an.destructorEquations of
-                [] -> (toLNTerm t2', [(t1or, toLNTerm t2', freeset t1or)])
+                [] -> (toLNTerm t2', [(t1or, toLNTerm t2', freeset t1or `difference` tildex)])
                 eqs@((_, input):_) ->
                   (input, [(t1, t2, freeset t1 `difference` tildex) | (t1, t2) <- eqs])
         in
