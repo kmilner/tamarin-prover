@@ -173,6 +173,9 @@ isPureState p target loneInsert =
           -> (False, False)
      (ProcessAction (Unlock t) _ _) | t == target
           -> (False, False)
+     -- Only the lock/lookup case above can consume a pure-state fact.
+     (ProcessComb (Lookup t _) _ _ _) | t == target
+          -> (False, False)
      (ProcessAction _ _ pl)
           -> isPureState pl target loneInsert
      ProcessComb Parallel _ pl pr ->
