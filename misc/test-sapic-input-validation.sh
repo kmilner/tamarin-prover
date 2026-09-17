@@ -30,3 +30,18 @@ expect_rejection soundness-sapic-destructor-nonvariable-result \
   'SAPIC destructor equations with non-variable right-hand sides'
 
 echo 'SAPIC input validation rejects the invalid examples with the expected diagnostics.'
+
+# Semantic proofs alone would also pass if pure-state optimization were
+# disabled. Check that the supported fragment still uses its optimized fact.
+"$tamarin" "$examples/soundness-sapic-state-supported.spthy" \
+  --quit-on-warning -d=0 >"$tmp_dir/supported-state.log" 2>&1
+# Ignore source-process and metadata comments so only emitted facts count.
+awk '/\/\*/ { in_comment = 1 }
+     !in_comment { sub(/\/\/.*/, ""); print }
+     /\*\// { in_comment = 0 }' "$tmp_dir/supported-state.log" \
+  >"$tmp_dir/supported-state-rules.log"
+if ! grep -Fq 'L_PureState(' "$tmp_dir/supported-state-rules.log"; then
+  echo 'supported SAPIC state did not emit L_PureState' >&2
+  exit 1
+fi
+echo 'Supported SAPIC state emits L_PureState.'
