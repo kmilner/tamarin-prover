@@ -31,9 +31,13 @@ addProtoDiffLabel :: OpenProtoRule -> String -> OpenProtoRule
 addProtoDiffLabel (OpenProtoRule ruE ruAC) label = OpenProtoRule (addDiffLabel ruE label) (fmap ((flip addDiffLabel) label) ruAC)
 
 equalOpenRuleUpToDiffAnnotation :: OpenProtoRule -> OpenProtoRule -> Bool
-equalOpenRuleUpToDiffAnnotation (OpenProtoRule ruE1 ruAC1) (OpenProtoRule ruE2 ruAC2) =
-  equalRuleUpToDiffAnnotationSym ruE1 ruE2 && length ruAC1 == length ruAC2 &&
-  all (uncurry equalRuleUpToDiffAnnotationSym) (zip ruAC1 ruAC2)
+equalOpenRuleUpToDiffAnnotation ru1 ru2 = withoutLabel ru1 == withoutLabel ru2
+  where
+    -- Every variant carries its parent E-rule's label, even when its own name
+    -- differs. Ignore only that label; retain all other actions and rule data.
+    withoutLabel (OpenProtoRule ruE ruAC) =
+      let strip ru = removeDiffLabel ru ("DiffProto" ++ getRuleName ruE)
+      in OpenProtoRule (strip ruE) (map strip ruAC)
 
 -- Relation between open and closed rule sets
 ---------------------------------------------

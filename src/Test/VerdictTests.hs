@@ -34,6 +34,7 @@ tests :: FilePath -> IO Test
 tests maudePath = TestList <$> sequence
     [ mirrorTests maudePath
     , roundTripTests maudePath
+    , diffAnnotationTests
     , assumptionTests maudePath
     , conditionalRestrictionTests maudePath
     , alternativeConditionalRestrictionTests maudePath
@@ -79,6 +80,36 @@ mirrorTests maudePath = do
         [check 3 [[a,b] | a <- [["a","b"],["b","a"]], b <- [["c","d"],["d","c"]]] side | side <- [LHS,RHS]]
   where
     appendTests a b = TestList [a,b]
+
+diffAnnotationTests :: IO Test
+diffAnnotationTests = do
+    open <- either (fail . show) pure $ parseOpenTheoryString [] $ unlines
+      [ "theory DiffAnnotations begin"
+      , "builtins: symmetric-encryption"
+      , "rule Dec: [In(x), In(k)] --> [Out(sdec(x,k))]"
+      , "variants rule (modulo AC) Dec___VARIANT_1: [In(x.2), In(k.1)] --[GenericResult(sdec(x.2,k.1))]-> [Out(sdec(x.2,k.1))],"
+      , "rule (modulo AC) Dec___VARIANT_2: [In(senc(z.2,k.1)), In(k.1)] --[Cancelled(z.2)]-> [Out(z.2)]"
+      , "end"
+      ]
+    let original@(OpenProtoRule ruE variants) = head (theoryRules open)
+        labelled = addProtoDiffLabel original "DiffProtoDec"
+        changeFirst f = OpenProtoRule ruE (f (head variants) : tail variants)
+        changedAction = changeFirst (\ru -> addAction ru (protoFact Linear "Other" []))
+        variantLabel = changeFirst (`addDiffLabel` "DiffProtoDec___VARIANT_1")
+        changedConclusion = changeFirst (L.modify rConcs (const []))
+        missingVariant = OpenProtoRule ruE (tail variants)
+        compareCase name expected a b = TestLabel name $ TestCase $ do
+          assertEqual "forward comparison" expected (equalOpenRuleUpToDiffAnnotation a b)
+          assertEqual "reverse comparison" expected (equalOpenRuleUpToDiffAnnotation b a)
+    pure $ TestLabel "Diff family annotations" $ TestList
+      [ compareCase "unlabelled families" True original original
+      , compareCase "parent label on every variant" True original labelled
+      , compareCase "already labelled families" True labelled labelled
+      , compareCase "added user action" False labelled changedAction
+      , compareCase "variant-name label is not the parent label" False labelled variantLabel
+      , compareCase "changed conclusion" False labelled changedConclusion
+      , compareCase "missing variant" False labelled missingVariant
+      ]
 
 roundTripTests :: FilePath -> IO Test
 roundTripTests maudePath = do

@@ -1,0 +1,72 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+examples="$repo_dir/examples/regression/trace"
+tamarin=${TAMARIN:-tamarin-prover}
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/tamarin-diff-partial-evaluation-export.XXXXXX")
+trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+
+check_verdicts() {
+  log=$1
+  # Include the side as well as the lemma name, but ignore proof-step counts.
+  sed -n -E 's/^  ((LHS|RHS) : .*|DiffLemma: .*) \([0-9]+ steps\)$/\1/p' \
+    "$log" | LC_ALL=C sort >"$tmp_dir/actual"
+  LC_ALL=C sort "$tmp_dir/expected" >"$tmp_dir/sorted-expected"
+  if ! diff -u "$tmp_dir/sorted-expected" "$tmp_dir/actual"; then
+    cat "$log" >&2
+    exit 1
+  fi
+}
+
+run_tamarin() {
+  run_label=$1
+  run_input=$2
+  shift 2
+  case "$model" in
+    unrelated-empty-*) set -- --bound=10 "$@" ;;
+  esac
+  if [ "$model" = explicit ]; then
+    set -- --bound=6 "$@"
+  fi
+  if [ "$model" = auto-sources ]; then
+    set -- --bound=6 --auto-sources "$@"
+  fi
+  if ! "$tamarin" "$run_input" --diff --quit-on-warning -d=0 "$@" \
+    "-o=$tmp_dir/$run_label.spthy" >"$tmp_dir/$run_label.log" 2>&1; then
+    cat "$tmp_dir/$run_label.log" >&2
+    exit 1
+  fi
+}
+
+analyze() {
+  run_tamarin "$@"
+  check_verdicts "$tmp_dir/$1.log"
+}
+
+for model in explicit; do
+  input="$examples/soundness-diff-partial-evaluation-$model.spthy"
+  case "$model" in
+    explicit)
+      input="$examples/diff-explicit-variant-export.spthy"
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+LHS :  unreduced_secret (exists-trace): falsified - no trace found
+RHS :  unreduced_secret (exists-trace): falsified - no trace found
+LHS :  decrypted_reachable (exists-trace): verified
+RHS :  decrypted_reachable (exists-trace): verified
+LHS :  unreduced_reachable (exists-trace): verified
+RHS :  unreduced_reachable (exists-trace): verified
+DiffLemma:  Observational_equivalence : analysis incomplete
+VERDICTS
+      ;;
+  esac
+  analyze original "$input" --prove
+  # Exercise ordinary printing as well as the partial-evaluation exporter.
+  run_tamarin printed "$input"
+  analyze printed-reloaded "$tmp_dir/printed.spthy" --prove
+  analyze printed-replay "$tmp_dir/original.spthy"
+
+done
+
+echo 'Diff partial-evaluation export preserves all expected verdicts.'
