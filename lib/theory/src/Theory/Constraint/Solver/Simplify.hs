@@ -44,6 +44,7 @@ import           Safe                           (headMay)
 import           Extension.Data.Label               hiding (modify)
 import           Extension.Prelude
 
+import           Theory.Constraint.Solver.Contradictions (injectiveInterferenceCandidates)
 import           Theory.Constraint.Solver.Goals
 import           Theory.Constraint.Solver.Reduction
 import           Theory.Constraint.System
@@ -669,20 +670,15 @@ mergeLastInjectiveFactNodes :: Reduction ChangeIndicator
 mergeLastInjectiveFactNodes = do
     se <- gets id
     ctxt <- ask
-    let injectiveTags = S.map fst $ get pcInjectiveFactInsts ctxt
-        less = rawLessRel se
-        equalities = do
-          Edge c@(i, _) (k, _) <- S.toList $ get sEdges se
-          guard (isLast se k)
-          let fact = nodeConcFact c se
-              sameInstance other = factTag other == factTag fact &&
-                  headMay (factTerms other) == headMay (factTerms fact)
-          guard (factTag fact `S.member` injectiveTags)
-          j <- S.toList $ D.reachableSet [i] less
-          guard (j /= i && j /= k)
-          Just ru <- [M.lookup j $ get sNodes se]
-          guard (any sameInstance (get rPrems ru ++ get rConcs ru))
-          return $ Equal j k
+    let less = rawLessRel se
+        equalities =
+          [ Equal j k
+          | (_, j, k) <- injectiveInterferenceCandidates (isLast se) ctxt se ]
+        ordered (Equal j k) = k `S.member` D.reachableSet [j] less ||
+                              j `S.member` D.reachableSet [k] less
+    -- Merging ordered nodes would create a cycle. Reject it before unifying
+    -- their rule instances, which can be expensive for multiset counters.
+    contradictoryIf $ any ordered equalities
     solveNodeIdEqs $ nub equalities
 
 -- | Compute all less relations implied by injective fact instances.
