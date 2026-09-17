@@ -14,10 +14,8 @@ equations:
     unionUD((x add y)) = x,
     verify(sign(x.1, x.2), x.1, pk(x.2)) = true
 
-rule (modulo E) ChanOut_S:
-   [ Out_S( $A, $B, x ) ]
-  --[ ChanOut_S( $A, $B, x ) ]->
-   [ !Sec( $A, $B, x ) ]
+rule (modulo E) ChanIn_A:
+   [ !Auth( $A, x ) ] --[ ChanIn_A( $A, x ) ]-> [ In_A( $A, x ) ]
 
 rule (modulo E) ChanIn_S:
    [ !Sec( $A, $B, x ) ] --[ ChanIn_S( $A, $B, x ) ]-> [ In_S( $A, $B, x ) ]
@@ -27,13 +25,44 @@ rule (modulo E) ChanOut_A:
   --[ ChanOut_A( $A, x ) ]->
    [ !Auth( $A, x ), Out( <$A, x> ) ]
 
-rule (modulo E) ChanIn_A:
-   [ !Auth( $A, x ) ] --[ ChanIn_A( $A, x ) ]-> [ In_A( $A, x ) ]
+rule (modulo E) ChanOut_S:
+   [ Out_S( $A, $B, x ) ]
+  --[ ChanOut_S( $A, $B, x ) ]->
+   [ !Sec( $A, $B, x ) ]
 
-rule (modulo E) publickeyinfrastructure:
-   [ Fr( ~skX ) ]
-  --[ LongtermKey( $X, ~skX ) ]->
-   [ !Ltk( $X, ~skX ), !Pk( $X, pk(~skX) ), Out( pk(~skX) ) ]
+rule (modulo E) D_4:
+   [ AgSt_D0( <$D, ~skD, $S, pkS, $H> ), In_A( $S, aenc(x, pk(~skD)) ) ]
+  --[
+  Commit( $D, $S, <pk(~skD), $H, x> ), Comm_D_Y( $D, h(<$H, x>) ),
+  Secret( $D, x )
+  ]->
+   [ Out_S( $D, $H, h(<$H, x>) ) ]
+
+rule (modulo E) H_5:
+   [
+   AgSt_H0( <$H, $D, $S, $BB> ), In_S( $D, $H, yD ),
+   In_A( $BB, <'ys', (y1 add y2)> )
+   ]
+  --[ Learn_H_yD( $H, $D, yD ), Learn_H_Ys( $H, $S, <'ys', (y1 add y2)> )
+  ]->
+   [ AgSt_H5( $H, <$D, $S, $BB, yD, y1, y2> ) ]
+
+rule (modulo E) H_9:
+   [ AgSt_H5( $H, <$D, $S, $BB, yD, y1, y2> ), In_A( $BB, <'ySG', ySG> ) ]
+  --[ Learn_H_ySG( $H, $S, <'ySG', ySG> ) ]->
+   [ ]
+
+rule (modulo E) S_7:
+   [
+   AgSt_S0( $S, $BB, ~skS, <$HSel, $DSel, pkDSel, ~xSel>,
+            <$HNotsel, $DNotsel, pkDNotsel, ~xNotsel>
+   )
+   ]
+  --[
+  Comm_S_ySG( $S, <'ySG', h(<$HSel, ~xSel>)> ),
+  BB_ySG( $BB, <'ySG', h(<$HSel, ~xSel>)> )
+  ]->
+   [ Out_A( $BB, <'ySG', h(<$HSel, ~xSel>)> ) ]
 
 rule (modulo E) Setup:
    [
@@ -77,48 +106,73 @@ rule (modulo E) Setup:
           >
    )
    ]
+ left
+  rule (modulo E) Setup:
+     [
+     Fr( ~x1 ), Fr( ~x2 ), !Ltk( 'S', ~skS ), !Ltk( 'D1', ~skD1 ),
+     !Ltk( 'D2', ~skD2 )
+     ]
+    --[
+    Setup( ), Comm_S_Ys( 'S', <'ys', (h(<'H1', ~x1>) add h(<'H2', ~x2>))> ),
+    Running( 'S', 'D1', <pk(~skD1), 'H1', ~x1> ),
+    Running( 'S', 'D2', <pk(~skD2), 'H2', ~x2> ),
+    BB_Ys( 'BB', 'ys', (h(<'H1', ~x1>) add h(<'H2', ~x2>)) )
+    ]->
+     [
+     AgSt_D0( <'D1', ~skD1, 'S', pk(~skS), 'H1'> ),
+     AgSt_D0( <'D2', ~skD2, 'S', pk(~skS), 'H2'> ),
+     AgSt_S0( 'S', 'BB', ~skS, <'H1', 'D1', pk(~skD1), ~x1>,
+              <'H2', 'D2', pk(~skD2), ~x2>
+     ),
+     AgSt_H0( <'H1', 'D1', 'S', 'BB'> ), AgSt_H0( <'H2', 'D2', 'S', 'BB'> ),
+     Out_A( 'S', aenc(~x1, pk(~skD1)) ), Out_A( 'S', aenc(~x2, pk(~skD2)) ),
+     Out_A( $BB, <'ys', (h(<'H1', ~x1>) add h(<'H2', ~x2>))> )
+     ]
+ right
+  rule (modulo E) Setup:
+     [
+     Fr( ~x1 ), Fr( ~x2 ), !Ltk( 'S', ~skS ), !Ltk( 'D1', ~skD1 ),
+     !Ltk( 'D2', ~skD2 )
+     ]
+    --[
+    Setup( ), Comm_S_Ys( 'S', <'ys', (h(<'H1', ~x1>) add h(<'H2', ~x2>))> ),
+    Running( 'S', 'D1', <pk(~skD1), 'H1', ~x1> ),
+    Running( 'S', 'D2', <pk(~skD2), 'H2', ~x2> ),
+    BB_Ys( 'BB', 'ys', (h(<'H1', ~x1>) add h(<'H2', ~x2>)) )
+    ]->
+     [
+     AgSt_D0( <'D2', ~skD2, 'S', pk(~skS), 'H2'> ),
+     AgSt_D0( <'D1', ~skD1, 'S', pk(~skS), 'H1'> ),
+     AgSt_S0( 'S', 'BB', ~skS, <'H2', 'D2', pk(~skD2), ~x2>,
+              <'H1', 'D1', pk(~skD1), ~x1>
+     ),
+     AgSt_H0( <'H2', 'D2', 'S', 'BB'> ), AgSt_H0( <'H1', 'D1', 'S', 'BB'> ),
+     Out_A( 'S', aenc(~x2, pk(~skD2)) ), Out_A( 'S', aenc(~x1, pk(~skD1)) ),
+     Out_A( $BB, <'ys', (h(<'H1', ~x1>) add h(<'H2', ~x2>))> )
+     ]
 
-rule (modulo E) D_4:
-   [ AgSt_D0( <$D, ~skD, $S, pkS, $H> ), In_A( $S, aenc(x, pk(~skD)) ) ]
-  --[
-  Commit( $D, $S, <pk(~skD), $H, x> ), Comm_D_Y( $D, h(<$H, x>) ),
-  Secret( $D, x )
-  ]->
-   [ Out_S( $D, $H, h(<$H, x>) ) ]
-
-rule (modulo E) H_5:
-   [
-   AgSt_H0( <$H, $D, $S, $BB> ), In_S( $D, $H, yD ),
-   In_A( $BB, <'ys', (y1 add y2)> )
-   ]
-  --[ Learn_H_yD( $H, $D, yD ), Learn_H_Ys( $H, $S, <'ys', (y1 add y2)> )
-  ]->
-   [ AgSt_H5( $H, <$D, $S, $BB, yD, y1, y2> ) ]
-
-rule (modulo E) S_7:
-   [
-   AgSt_S0( $S, $BB, ~skS, <$HSel, $DSel, pkDSel, ~xSel>,
-            <$HNotsel, $DNotsel, pkDNotsel, ~xNotsel>
-   )
-   ]
-  --[
-  Comm_S_ySG( $S, <'ySG', h(<$HSel, ~xSel>)> ),
-  BB_ySG( $BB, <'ySG', h(<$HSel, ~xSel>)> )
-  ]->
-   [ Out_A( $BB, <'ySG', h(<$HSel, ~xSel>)> ) ]
-
-rule (modulo E) H_9:
-   [ AgSt_H5( $H, <$D, $S, $BB, yD, y1, y2> ), In_A( $BB, <'ySG', ySG> ) ]
-  --[ Learn_H_ySG( $H, $S, <'ySG', ySG> ) ]->
-   [ ]
+rule (modulo E) publickeyinfrastructure:
+   [ Fr( ~skX ) ]
+  --[ LongtermKey( $X, ~skX ) ]->
+   [ !Ltk( $X, ~skX ), !Pk( $X, pk(~skX) ), Out( pk(~skX) ) ]
 
 restriction OneSetup [right]:
   "∀ #i #j. ((Setup( ) @ #i) ∧ (Setup( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ #i #j. ((Setup( ) @ #i) ∧ (Setup( ) @ #j)) ⇒ (#i = #j)"
+  */
+
 restriction OneSetup [left]:
   "∀ #i #j. ((Setup( ) @ #i) ∧ (Setup( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ #i #j. ((Setup( ) @ #i) ∧ (Setup( ) @ #j)) ⇒ (#i = #j)"
+  */
 
 lemma functional [right]:
   exists-trace
@@ -3584,8 +3638,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: 1e4622f694f4f4caddc5a6df509f44c6c7e00e5f (with uncommited changes), branch: HEAD
+Compiled at: 2026-09-17 09:37:03.614454025 UTC
 */
 
 end
@@ -3597,7 +3651,7 @@ summary of summaries:
 analyzed: examples/csf26-ac/fast/diff/alethea_selectionphase_anonymity.spthy
 
   output:          examples/csf26-ac/fast/diff/alethea_selectionphase_anonymity.spthy.tmp
-  processing time: 2.71s
+  processing time: 3.46s
   
   RHS :  functional (exists-trace): verified (20 steps)
   LHS :  functional (exists-trace): verified (20 steps)

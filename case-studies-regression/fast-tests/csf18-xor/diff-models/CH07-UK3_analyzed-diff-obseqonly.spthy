@@ -18,29 +18,27 @@ rule (modulo E) Setup:
    Tag( ('1'++diff((<~k1, ~id1>++<~k2, ~id2>), (<~k1, ~id1>++<~k1, ~id1>)))
    )
    ]
-
-rule (modulo E) select_tag:
-   [ Tag( (z++<~k, ~id>) ) ]
-  --[ Tag( (z++<~k, ~id>) ) ]->
-   [ TagRun( ~k, ~id ), Tag( z ) ]
-
-rule (modulo E) select_reader:
-   [ Reader( (z++<~k, ~id>) ) ]
-  --[ Reader( (z++<~k, ~id>) ) ]->
-   [ ReaderRun( ~k, ~id ), Reader( z ) ]
+ left
+  rule (modulo E) Setup:
+     [ Fr( ~k1 ), Fr( ~id1 ), Fr( ~k2 ), Fr( ~id2 ) ]
+    --[ OnlyOnce( ) ]->
+     [
+     Reader( ('1'++<~k1, ~id1>++<~k2, ~id2>) ),
+     Tag( ('1'++<~k1, ~id1>++<~k2, ~id2>) )
+     ]
+ right
+  rule (modulo E) Setup:
+     [ Fr( ~k1 ), Fr( ~id1 ), Fr( ~k2 ), Fr( ~id2 ) ]
+    --[ OnlyOnce( ) ]->
+     [
+     Reader( ('1'++<~k1, ~id1>++<~k1, ~id1>) ),
+     Tag( ('1'++<~k1, ~id1>++<~k1, ~id1>) )
+     ]
 
 rule (modulo E) reader1:
    [ Fr( ~r1 ) ]
   --[ Challenge( ~r1, 'Reader' ) ]->
    [ Out( ~r1 ), Initiated( ~r1 ) ]
-
-rule (modulo E) tag1:
-   [ In( r1 ), Fr( ~r2 ), TagRun( ~k, ~id ) ]
-  --[ Response( ~k, 'Tag' ), Challenge( ~r2, 'Tag' ) ]->
-   [
-   Out( <~r2, lh((h((~k⊕~r2⊕r1))⊕rot(~id, h((~k⊕~r2⊕r1)))))> ),
-   TagState( ~k, ~id, r1, ~r2, h((~k⊕~r2⊕r1)) )
-   ]
 
 rule (modulo E) reader2:
    [
@@ -52,6 +50,24 @@ rule (modulo E) reader2:
   ]->
    [ Out( rh((hash⊕rot(~id, hash))) ) ]
 
+rule (modulo E) select_reader:
+   [ Reader( (z++<~k, ~id>) ) ]
+  --[ Reader( (z++<~k, ~id>) ) ]->
+   [ ReaderRun( ~k, ~id ), Reader( z ) ]
+
+rule (modulo E) select_tag:
+   [ Tag( (z++<~k, ~id>) ) ]
+  --[ Tag( (z++<~k, ~id>) ) ]->
+   [ TagRun( ~k, ~id ), Tag( z ) ]
+
+rule (modulo E) tag1:
+   [ In( r1 ), Fr( ~r2 ), TagRun( ~k, ~id ) ]
+  --[ Response( ~k, 'Tag' ), Challenge( ~r2, 'Tag' ) ]->
+   [
+   Out( <~r2, lh((h((~k⊕~r2⊕r1))⊕rot(~id, h((~k⊕~r2⊕r1)))))> ),
+   TagState( ~k, ~id, r1, ~r2, h((~k⊕~r2⊕r1)) )
+   ]
+
 rule (modulo E) tag2:
    [ In( rh((hash⊕rot(~id, hash))) ), TagState( ~k, ~id, r1, ~r2, hash ) ]
   --[ Alive( ~k, 'Reader' ) ]->
@@ -61,33 +77,73 @@ restriction equality [right]:
   "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  */
+
 restriction equality [left]:
   "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  */
 
 restriction max_number_of_tags_tag [right]:
   "∀ a b c d #i. (Tag( (a++b++c++d) ) @ #i) ⇒ (⊥)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ a b c d #i. (Tag( (a++b++c++d) ) @ #i) ⇒ (⊥)"
+  */
+
 restriction max_number_of_tags_tag [left]:
   "∀ a b c d #i. (Tag( (a++b++c++d) ) @ #i) ⇒ (⊥)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ a b c d #i. (Tag( (a++b++c++d) ) @ #i) ⇒ (⊥)"
+  */
 
 restriction max_number_of_tags_tag_reader [right]:
   "∀ a b c d #i. (Reader( (a++b++c++d) ) @ #i) ⇒ (⊥)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ a b c d #i. (Reader( (a++b++c++d) ) @ #i) ⇒ (⊥)"
+  */
+
 restriction max_number_of_tags_tag_reader [left]:
   "∀ a b c d #i. (Reader( (a++b++c++d) ) @ #i) ⇒ (⊥)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ a b c d #i. (Reader( (a++b++c++d) ) @ #i) ⇒ (⊥)"
+  */
 
 restriction unique [right]:
   "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
+  */
+
 restriction unique [left]:
   "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
+  */
 
 lemma recentalive_tag [right]:
   all-traces
@@ -264,8 +320,8 @@ Check presence of the --prove/--lemma arguments in theory
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: 1e4622f694f4f4caddc5a6df509f44c6c7e00e5f (with uncommited changes), branch: HEAD
+Compiled at: 2026-09-17 09:37:03.614454025 UTC
 */
 
 end
@@ -277,7 +333,7 @@ summary of summaries:
 analyzed: examples/csf18-xor/diff-models/CH07-UK3.spthy
 
   output:          examples/csf18-xor/diff-models/CH07-UK3.spthy.tmp
-  processing time: 61.24s
+  processing time: 90.47s
   
   WARNING: 1 wellformedness check failed!
            The analysis results might be wrong!

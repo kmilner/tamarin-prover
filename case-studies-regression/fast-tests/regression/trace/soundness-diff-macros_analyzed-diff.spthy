@@ -1,0 +1,102 @@
+theory SoundnessDiffMacros
+
+begin
+
+// Function signature and definition of the equational theory E
+
+functions: fst/1, pair/2, snd/1
+equations: fst(<x.1, x.2>) = x.1, snd(<x.1, x.2>) = x.2
+
+macros: m( x ) =  x
+
+rule (modulo E) EmitA:
+   [ ] --[ A( 'a' ) ]-> [ ]
+
+rule (modulo E) EmitB:
+   [ ] --[ B( 'b' ) ]-> [ ]
+
+rule (modulo E) FreshAlignment:
+   [ ] --> [ Out( diff($x, 'right') ) ]
+
+lemma macro_lemma [left]:
+  all-traces "∀ #i. (A( m('a') ) @ #i) ⇒ (⊥)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ #i. (A( 'a' ) @ #i)"
+*/
+simplify
+SOLVED // trace found
+
+restriction BanB [right]:
+  "∀ #i. (B( m('b') ) @ #i) ⇒ (⊥)"
+  // safety formula
+
+  /*
+  expanded formula:
+  "∀ #i. (B( 'b' ) @ #i) ⇒ (⊥)"
+  */
+
+restriction BanB [left]:
+  "∀ #i. (B( m('b') ) @ #i) ⇒ (⊥)"
+  // safety formula
+
+  /*
+  expanded formula:
+  "∀ #i. (B( 'b' ) @ #i) ⇒ (⊥)"
+  */
+
+lemma blocked_by_macro_restriction [left]:
+  exists-trace "∃ #i. B( 'b' ) @ #i"
+/*
+guarded formula characterizing all satisfying traces:
+"∃ #i. (B( 'b' ) @ #i)"
+*/
+simplify
+by contradiction /* from formulas */
+
+diffLemma Observational_equivalence:
+rule-equivalence
+  case Rule_Equality
+  backward-search
+    case LHS
+    step( simplify )
+    step( solve( !KD( x ) ▶₁ #i ) )
+      case FreshAlignment
+      step( solve( (#vl, 0) ~~> (#i, 1) ) )
+        case Var_pub_1_x
+        step( solve( !KU( $x ) @ #vk ) )
+          case pub
+          by ATTACK // trace found
+        qed
+      qed
+    qed
+  qed
+qed
+
+/* All wellformedness checks were successful. */
+
+/*
+Generated from:
+Tamarin version 1.13.0
+Maude version 3.5.1
+Git revision: c8f67ec1caa3e57e489eb70f7e01acb68f1b767e (with uncommited changes), branch: fix/diff-soundness
+Compiled at: 2026-09-17 09:26:49.324027181 UTC
+*/
+
+end
+/* Output
+
+==============================================================================
+summary of summaries:
+
+analyzed: examples/regression/trace/soundness-diff-macros.spthy
+
+  output:          examples/regression/trace/soundness-diff-macros.spthy.tmp
+  processing time: 0.05s
+  
+  LHS :  macro_lemma (all-traces): falsified - found trace (2 steps)
+  LHS :  blocked_by_macro_restriction (exists-trace): falsified - no trace found (2 steps)
+  DiffLemma:  Observational_equivalence : falsified - found trace (7 steps)
+
+==============================================================================
+*/

@@ -1,0 +1,457 @@
+theory UnrelatedEmptyFamily
+
+begin
+
+// Function signature and definition of the equational theory E
+
+functions: fst/1, pair/2, snd/1
+equations: fst(<x.1, x.2>) = x.1, snd(<x.1, x.2>) = x.2
+
+rule (modulo E) Setup:
+   [ Fr( ~n ) ] --[ A( ~n ) ]-> [ State( ~n ), Out( 'ok' ) ]
+
+rule (modulo E) Finish:
+   [ State( n ) ] --[ B( n ) ]-> [ ]
+
+rule (modulo E) Dead:
+   [ Fr( ~n ), In( diff(~n, 'known') ) ] --[ Dead( ) ]-> [ Out( 'bad' ) ]
+
+restriction Impossible [right]:
+  "∀ #i. (Dead( ) @ #i) ⇒ (⊥)"
+  // safety formula
+
+  /*
+  expanded formula:
+  "∀ #i. (Dead( ) @ #i) ⇒ (⊥)"
+  */
+
+restriction Impossible [left]:
+  "∀ #i. (Dead( ) @ #i) ⇒ (⊥)"
+  // safety formula
+
+  /*
+  expanded formula:
+  "∀ #i. (Dead( ) @ #i) ⇒ (⊥)"
+  */
+
+restriction Unique [right]:
+  "∀ n #i #j. ((A( n ) @ #i) ∧ (A( n ) @ #j)) ⇒ (#i = #j)"
+  // safety formula
+
+  /*
+  expanded formula:
+  "∀ n #i #j. ((A( n ) @ #i) ∧ (A( n ) @ #j)) ⇒ (#i = #j)"
+  */
+
+restriction Unique [left]:
+  "∀ n #i #j. ((A( n ) @ #i) ∧ (A( n ) @ #j)) ⇒ (#i = #j)"
+  // safety formula
+
+  /*
+  expanded formula:
+  "∀ n #i #j. ((A( n ) @ #i) ∧ (A( n ) @ #j)) ⇒ (#i = #j)"
+  */
+
+restriction Order [right]:
+  "∀ n #i. (B( n ) @ #i) ⇒ (∃ #j. (A( n ) @ #j) ∧ (#j < #i))"
+
+  /*
+  expanded formula:
+  "∀ n #i. (B( n ) @ #i) ⇒ (∃ #j. (A( n ) @ #j) ∧ (#j < #i))"
+  */
+
+restriction Order [left]:
+  "∀ n #i. (B( n ) @ #i) ⇒ (∃ #j. (A( n ) @ #j) ∧ (#j < #i))"
+
+  /*
+  expanded formula:
+  "∀ n #i. (B( n ) @ #i) ⇒ (∃ #j. (A( n ) @ #j) ∧ (#j < #i))"
+  */
+
+lemma setup [right]:
+  exists-trace "∃ n #i. A( n ) @ #i"
+/*
+guarded formula characterizing all satisfying traces:
+"∃ n #i. (A( n ) @ #i)"
+*/
+simplify
+SOLVED // trace found
+
+lemma setup [left]:
+  exists-trace "∃ n #i. A( n ) @ #i"
+/*
+guarded formula characterizing all satisfying traces:
+"∃ n #i. (A( n ) @ #i)"
+*/
+simplify
+SOLVED // trace found
+
+lemma finish [right]:
+  exists-trace "∃ n #i. B( n ) @ #i"
+/*
+guarded formula characterizing all satisfying traces:
+"∃ n #i. (B( n ) @ #i)"
+*/
+simplify
+solve( State( ~n ) ▶₀ #i )
+  case Setup
+  SOLVED // trace found
+qed
+
+lemma finish [left]:
+  exists-trace "∃ n #i. B( n ) @ #i"
+/*
+guarded formula characterizing all satisfying traces:
+"∃ n #i. (B( n ) @ #i)"
+*/
+simplify
+solve( State( ~n ) ▶₀ #i )
+  case Setup
+  SOLVED // trace found
+qed
+
+lemma dead [right]:
+  all-traces "∀ #i. (Dead( ) @ #i) ⇒ (⊥)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ #i. (Dead( ) @ #i)"
+*/
+simplify
+by contradiction /* from formulas */
+
+lemma dead [left]:
+  all-traces "∀ #i. (Dead( ) @ #i) ⇒ (⊥)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ #i. (Dead( ) @ #i)"
+*/
+simplify
+by contradiction /* from formulas */
+
+diffLemma D:
+rule-equivalence
+  case Rule_Dead
+  backward-search
+    case LHS
+    step( simplify )
+    by step( solve( DiffProtoDead( ) @ #i ) )
+  next
+    case RHS
+    step( simplify )
+    by step( contradiction /* from formulas */ )
+  qed
+next
+  case Rule_Destrd_0_fst
+  backward-search
+    case LHS
+    step( simplify )
+    step( solve( !KD( <x, x.1> ) ▶₀ #i ) )
+      case Setup
+      by step( contradiction /* impossible chain */ )
+    qed
+  next
+    case RHS
+    step( simplify )
+    step( solve( !KD( <x, x.1> ) ▶₀ #i ) )
+      case Dead
+      by step( contradiction /* impossible chain */ )
+    next
+      case Setup
+      by step( contradiction /* impossible chain */ )
+    qed
+  qed
+next
+  case Rule_Destrd_0_snd
+  backward-search
+    case LHS
+    step( simplify )
+    step( solve( !KD( <x, x.1> ) ▶₀ #i ) )
+      case Setup
+      by step( contradiction /* impossible chain */ )
+    qed
+  next
+    case RHS
+    step( simplify )
+    step( solve( !KD( <x, x.1> ) ▶₀ #i ) )
+      case Dead
+      by step( contradiction /* impossible chain */ )
+    next
+      case Setup
+      by step( contradiction /* impossible chain */ )
+    qed
+  qed
+next
+  case Rule_Equality
+  backward-search
+    case LHS
+    step( simplify )
+    step( solve( !KD( x ) ▶₁ #i ) )
+      case Setup
+      step( solve( (#vl, 0) ~~> (#i, 1) ) )
+        case Const_pub_ok
+        step( solve( !KU( 'ok' ) @ #vk ) )
+          case coerce
+          step( solve( !KD( 'ok' ) ▶₀ #vk ) )
+            case Setup
+            by step( contradiction /* impossible chain */ )
+          qed
+        next
+          case pub
+          MIRRORED
+        qed
+      qed
+    qed
+  next
+    case RHS
+    step( simplify )
+    step( solve( !KD( x ) ▶₁ #i ) )
+      case Dead
+      by step( contradiction /* from formulas */ )
+    next
+      case Setup
+      step( solve( (#vl, 0) ~~> (#i, 1) ) )
+        case Const_pub_ok
+        step( solve( !KU( 'ok' ) @ #vk ) )
+          case coerce
+          step( solve( !KD( 'ok' ) ▶₀ #vk ) )
+            case Dead
+            by step( contradiction /* impossible chain */ )
+          next
+            case Setup
+            by step( contradiction /* impossible chain */ )
+          qed
+        next
+          case pub
+          MIRRORED
+        qed
+      qed
+    qed
+  qed
+next
+  case Rule_Finish
+  backward-search
+    case LHS
+    step( simplify )
+    step( solve( State( ~n ) ▶₀ #i ) )
+      case Setup
+      MIRRORED
+    qed
+  next
+    case RHS
+    step( simplify )
+    step( solve( State( ~n ) ▶₀ #i ) )
+      case Setup
+      MIRRORED
+    qed
+  qed
+next
+  case Rule_Send
+  backward-search
+    case LHS
+    step( simplify )
+    MIRRORED
+  next
+    case RHS
+    step( simplify )
+    MIRRORED
+  qed
+next
+  case Rule_Setup
+  backward-search
+    case LHS
+    step( simplify )
+    MIRRORED
+  next
+    case RHS
+    step( simplify )
+    MIRRORED
+  qed
+qed
+
+diffLemma Observational_equivalence:
+rule-equivalence
+  case Rule_Dead
+  backward-search
+    case LHS
+    step( simplify )
+    by step( solve( DiffProtoDead( ) @ #i ) )
+  next
+    case RHS
+    step( simplify )
+    by step( contradiction /* from formulas */ )
+  qed
+next
+  case Rule_Destrd_0_fst
+  backward-search
+    case LHS
+    step( simplify )
+    step( solve( !KD( <x, x.1> ) ▶₀ #i ) )
+      case Setup
+      by step( contradiction /* impossible chain */ )
+    qed
+  next
+    case RHS
+    step( simplify )
+    step( solve( !KD( <x, x.1> ) ▶₀ #i ) )
+      case Dead
+      by step( contradiction /* impossible chain */ )
+    next
+      case Setup
+      by step( contradiction /* impossible chain */ )
+    qed
+  qed
+next
+  case Rule_Destrd_0_snd
+  backward-search
+    case LHS
+    step( simplify )
+    step( solve( !KD( <x, x.1> ) ▶₀ #i ) )
+      case Setup
+      by step( contradiction /* impossible chain */ )
+    qed
+  next
+    case RHS
+    step( simplify )
+    step( solve( !KD( <x, x.1> ) ▶₀ #i ) )
+      case Dead
+      by step( contradiction /* impossible chain */ )
+    next
+      case Setup
+      by step( contradiction /* impossible chain */ )
+    qed
+  qed
+next
+  case Rule_Equality
+  backward-search
+    case LHS
+    step( simplify )
+    step( solve( !KD( x ) ▶₁ #i ) )
+      case Setup
+      step( solve( (#vl, 0) ~~> (#i, 1) ) )
+        case Const_pub_ok
+        step( solve( !KU( 'ok' ) @ #vk ) )
+          case coerce
+          step( solve( !KD( 'ok' ) ▶₀ #vk ) )
+            case Setup
+            by step( contradiction /* impossible chain */ )
+          qed
+        next
+          case pub
+          MIRRORED
+        qed
+      qed
+    qed
+  next
+    case RHS
+    step( simplify )
+    step( solve( !KD( x ) ▶₁ #i ) )
+      case Dead
+      by step( contradiction /* from formulas */ )
+    next
+      case Setup
+      step( solve( (#vl, 0) ~~> (#i, 1) ) )
+        case Const_pub_ok
+        step( solve( !KU( 'ok' ) @ #vk ) )
+          case coerce
+          step( solve( !KD( 'ok' ) ▶₀ #vk ) )
+            case Dead
+            by step( contradiction /* impossible chain */ )
+          next
+            case Setup
+            by step( contradiction /* impossible chain */ )
+          qed
+        next
+          case pub
+          MIRRORED
+        qed
+      qed
+    qed
+  qed
+next
+  case Rule_Finish
+  backward-search
+    case LHS
+    step( simplify )
+    step( solve( State( ~n ) ▶₀ #i ) )
+      case Setup
+      MIRRORED
+    qed
+  next
+    case RHS
+    step( simplify )
+    step( solve( State( ~n ) ▶₀ #i ) )
+      case Setup
+      MIRRORED
+    qed
+  qed
+next
+  case Rule_Send
+  backward-search
+    case LHS
+    step( simplify )
+    MIRRORED
+  next
+    case RHS
+    step( simplify )
+    MIRRORED
+  qed
+next
+  case Rule_Setup
+  backward-search
+    case LHS
+    step( simplify )
+    MIRRORED
+  next
+    case RHS
+    step( simplify )
+    MIRRORED
+  qed
+qed
+
+/* All wellformedness checks were successful. */
+
+/*
+Generated from:
+Tamarin version 1.13.0
+Maude version 3.5.1
+Git revision: 694c5d42fd970c7e081523088361f9afe24d5fea (with uncommited changes), branch: fix/diff-soundness
+Compiled at: 2026-09-19 08:28:00.942091369 UTC
+*/
+
+end
+/* Output
+maude tool: 'maude'
+ checking version: 3.5.1. OK.
+ checking installation: OK.
+diffLemma
+[Theory UnrelatedEmptyFamily] Theory loaded
+[Theory UnrelatedEmptyFamily] Theory translated
+[Theory UnrelatedEmptyFamily] No Deconstruction Chain checks started
+[Theory UnrelatedEmptyFamily] No Deconstruction Chain checks ended
+[Theory UnrelatedEmptyFamily] No Deconstruction Chain checks for diff mode started
+[Theory UnrelatedEmptyFamily] No Deconstruction Chain checks ended
+[Theory UnrelatedEmptyFamily] Theory closed
+[Saturating Sources] Done
+[Saturating Sources] Done
+[Saturating Sources] Done
+[Saturating Sources] Done
+
+==============================================================================
+summary of summaries:
+
+analyzed: examples/regression/trace/diff-unrelated-empty-left.spthy
+
+  output:          /tmp/round8-diff/unrelated-left.spthy
+  processing time: 0.10s
+  
+  RHS :  setup (exists-trace): verified (2 steps)
+  LHS :  setup (exists-trace): verified (2 steps)
+  RHS :  finish (exists-trace): verified (3 steps)
+  LHS :  finish (exists-trace): verified (3 steps)
+  RHS :  dead (all-traces): verified (2 steps)
+  LHS :  dead (all-traces): verified (2 steps)
+  DiffLemma:  D : verified (56 steps)
+  DiffLemma:  Observational_equivalence : verified (56 steps)
+
+==============================================================================
+*/

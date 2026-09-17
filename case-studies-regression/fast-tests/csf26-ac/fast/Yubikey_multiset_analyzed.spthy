@@ -693,8 +693,8 @@ by simplify
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 18b8c44739030bd9beed321965c3caf564884b2b (with uncommited changes), branch: HEAD
-Compiled at: 2026-09-17 09:24:16.873009456 UTC
+Git revision: 1e4622f694f4f4caddc5a6df509f44c6c7e00e5f (with uncommited changes), branch: HEAD
+Compiled at: 2026-09-17 09:37:03.614454025 UTC
 */
 
 end
@@ -706,7 +706,7 @@ summary of summaries:
 analyzed: examples/csf26-ac/fast/Yubikey_multiset.spthy
 
   output:          examples/csf26-ac/fast/Yubikey_multiset.spthy.tmp
-  processing time: 3.95s
+  processing time: 4.20s
   
   transitivity (all-traces): verified (2 steps)
   Login_reachable (exists-trace): verified (9 steps)
