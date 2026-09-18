@@ -8,6 +8,7 @@ module Prover (
 
 import           Prelude                             hiding (id, (.))
 
+import qualified Data.Map                            as M
 import           Data.Maybe
 import qualified Data.Set                            as S
 
@@ -235,6 +236,12 @@ mkDiffSystem _ _ _ = emptyDiffSystem
 -- Partial evaluation / abstract interpretation
 -----------------------------------------------
 
+-- | Export disposition for one original rule family.
+data PartialEvaluationFamilyPlan
+    = KeepOriginal
+    | EmitRefinements [ProtoRuleE]
+    | DropFamily
+
 -- | Apply partial evaluation.
 applyPartialEvaluation :: EvaluationStyle -> Bool -> ClosedTheory -> ClosedTheory
 applyPartialEvaluation evalStyle autosources thy0 =
@@ -243,8 +250,19 @@ applyPartialEvaluation evalStyle autosources thy0 =
       autosources True
   where
     sig          = L.get thySignature thy0
-    rules        = compiledRuleVariants (theoryRules thy0)
-    originalRuleCount = length (getProtoRuleEs thy0)
+    originals = getProtoRuleEs thy0
+    familyIds = M.fromList $ zip originals [0 :: Int ..]
+    familyId ru = familyIds M.! ru
+    -- Keep ownership separate from names: a generated variant name can also
+    -- be the name of an independent E-rule. All imported variants belong to
+    -- the same original E-rule, and this ID survives refinement and renaming.
+    -- Parser/SAPIC insertion checks E-name uniqueness, but programmatic
+    -- addRules/closeTheoryWithMaude callers need not, so names cannot be IDs.
+    rules =
+      [ fmap (\info -> (familyId (L.get cprRuleE ru), info))
+          (compiledRule variant)
+      | ru <- theoryRules thy0, variant <- unfoldRuleVariants ru ]
+    originalRuleCount = length originals
     (st', rules') = (`runReader` L.get sigmMaudeHandle sig) $
                     partialEvaluation evalStyle rules
 
@@ -253,16 +271,20 @@ applyPartialEvaluation evalStyle autosources thy0 =
     -- actions. Keep the original family if any refinement would change under
     -- E-variant computation. Restoring the complete family preserves its added
     -- actions and keeps manual-variant completeness checks applicable.
-    families =
-      [ (ruleName (L.get cprRuleE ru), ruleName (L.get cprRuleAC ru))
-      | ru <- concatMap unfoldRuleVariants (theoryRules thy0) ]
-    unsafeVariants = S.fromList
-      [ ruleName ru | ru <- rules', not (exportable ru) ]
-    retainedFamilies = S.fromList
-      [ family | (family, variant) <- families, variant `S.member` unsafeVariants ]
-    retainedVariants = S.fromList
-      [ variant | (family, variant) <- families, family `S.member` retainedFamilies ]
-    refinedRules = filter ((`S.notMember` retainedVariants) . ruleName) rules'
+    -- Prepend each refinement, then restore family order once. Appending to
+    -- the growing bucket would repeatedly copy its prefix.
+    refinements = M.map reverse $ M.fromListWith (++)
+      [ (fst (L.get rInfo ru), [fmap snd ru])
+      | ru <- rules' ]
+    -- Include pruned families explicitly, so deletion is never inferred from
+    -- a missing lookup. All original rules have an entry, including duplicates.
+    familyPlans = M.fromList
+      [ (familyId ru, planFamily (M.findWithDefault [] (familyId ru) refinements))
+      | ru <- originals ]
+    planFamily [] = DropFamily
+    planFamily rs
+      | any (not . exportable) rs = KeepOriginal
+      | otherwise = EmitRefinements rs
     exportable ru = case variantsProtoRule (L.get sigmMaudeHandle sig) ru of
       Just ac -> eqModuloFreshnessNoAC ac (compiledRuleAC ru)
       Nothing -> False
@@ -270,12 +292,15 @@ applyPartialEvaluation evalStyle autosources thy0 =
     -- Refinement can split one rule into several rules with the same name.
     -- Allocate distinct export names before closing the theory, so proofs and
     -- printed rules use the same names. Reserve even names of removed rules.
-    namedRefinedRules = MS.evalState (mapM nameRefinement refinedRules)
+    namedFamilyPlans = MS.evalState (traverse nameFamily familyPlans)
       (retainedNames, reservedNames)
+    nameFamily (EmitRefinements rs) = EmitRefinements <$> mapM nameRefinement rs
+    nameFamily plan = return plan
     retainedNames = S.fromList
-      [ getRuleName ru | ru <- getProtoRuleEs thy0,
-                         ruleName ru `S.member` retainedFamilies ]
-    reservedNames = S.fromList $ map getRuleName (getProtoRuleEs thy0 ++ rules)
+      [ getRuleName ru | ru <- originals,
+                         KeepOriginal <- [familyPlans M.! familyId ru] ]
+    reservedNames = S.fromList $ map getRuleName originals ++
+      map (getRuleName . fmap snd) rules
     nameRefinement ru = do
       (used, reserved) <- MS.get
       let originalName = getRuleName ru
@@ -286,15 +311,14 @@ applyPartialEvaluation evalStyle autosources thy0 =
           renamed = if name == originalName then ru else
             L.set (preName . rInfo) (StandRule name) ru
       MS.put (S.insert name used, S.insert name reserved)
-      return (ruleName ru, renamed)
+      return renamed
 
-    replaceRule (RuleItem ru)
-      | ruleName ru `S.member` retainedFamilies = [RuleItem ru]
-      | otherwise =
-          [ RuleItem (openCompiledRule refined)
-          | (variant, refined) <- namedRefinedRules, variant `elem` variants ]
+    replaceRule (RuleItem ru) = case namedFamilyPlans M.! owner of
+      KeepOriginal -> [RuleItem ru]
+      EmitRefinements rs -> map (RuleItem . openCompiledRule) rs
+      DropFamily -> []
       where
-        variants = [ variant | (family, variant) <- families, family == ruleName ru ]
+        owner = familyId (L.get oprRuleE ru)
     replaceRule item = [item]
 
     replaceProtoRules [] = []
@@ -304,14 +328,16 @@ applyPartialEvaluation evalStyle autosources thy0 =
           ] ++ concatMap replaceRule (item:items)
       | otherwise        = item : replaceProtoRules items
 
+    retainedCount = length [() | KeepOriginal <- M.elems familyPlans]
+
     ppAbsState =
       (text $ " the abstract state after partial evaluation"
               ++ " contains " ++ show (S.size st') ++ " facts:") $--$
       (numbered' $ map prettyLNFact $ S.toList st') $--$
-      (text $ "This abstract state results in " ++ show (length refinedRules) ++
+      (text $ "This abstract state results in " ++ show (sum [length rs | EmitRefinements rs <- M.elems familyPlans]) ++
               " refined multiset rewriting rules.\n" ++
-              (if S.null retainedFamilies then "" else
-                "Kept " ++ show (S.size retainedFamilies) ++
+              (if retainedCount == 0 then "" else
+                "Kept " ++ show retainedCount ++
                 " original rule families to preserve their variants on export.\n") ++
               "Note that the original number of multiset rewriting rules was "
               ++ show originalRuleCount ++ ".\n\n")
@@ -363,16 +389,14 @@ applyPartialEvaluationDiff evalStyle autoSources thy0 =
 -- variants. Embedded restrictions are already separate theory items here; an
 -- empty local list avoids inferring monotonicity from a restriction whose
 -- variables were renamed while its E-variant was computed.
-compiledRuleVariants :: [ClosedProtoRule] -> [ProtoRuleE]
-compiledRuleVariants = map compiled . concatMap unfoldRuleVariants
-  where
-    compiled cru = case L.get cprRuleAC cru of
-      Rule info prems concs acts newVars ->
-        Rule (ProtoRuleEInfo
-                (L.get pracName info)
-                (L.get pracAttributes info)
-                [])
-             prems concs acts newVars
+compiledRule :: ClosedProtoRule -> ProtoRuleE
+compiledRule cru = case L.get cprRuleAC cru of
+  Rule info prems concs acts newVars ->
+    Rule (ProtoRuleEInfo
+            (L.get pracName info)
+            (L.get pracAttributes info)
+            [])
+         prems concs acts newVars
 
 openCompiledRule :: ProtoRuleE -> OpenProtoRule
 openCompiledRule ruE = OpenProtoRule ruE [compiledRuleAC ruE]

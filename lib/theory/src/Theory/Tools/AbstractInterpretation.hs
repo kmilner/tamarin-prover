@@ -87,10 +87,14 @@ data EvaluationStyle = Silent | Summary | Tracing
   deriving Show
 
 -- | Concrete partial evaluator activated with flag: --partial-evaluation.
--- The rules must be a complete, unfolded set of variants modulo E. Refinement
--- then only needs the AC unifier used by the constraint solver.
-partialEvaluation :: EvaluationStyle
-                  -> [ProtoRuleE] -> WithMaude (S.Set LNFact, [ProtoRuleE])
+-- Refinement uses the AC unifier used by the constraint solver. To preserve
+-- reachability modulo E, callers must supply a complete, unfolded set of
+-- E-variants, as the trace-theory applyPartialEvaluation caller does. The
+-- legacy applyPartialEvaluationDiff caller supplies original E-rules instead;
+-- this precondition does not establish soundness for that path.
+partialEvaluation :: (Eq i, Show i, HasFrees i, Apply LNSubst i)
+                  => EvaluationStyle
+                  -> [Rule i] -> WithMaude (S.Set LNFact, [Rule i])
 partialEvaluation evalStyle rules = reader $ \hnd ->
     consumeEvaluation $ interpretAbstractly
         ((`runReader` hnd) . unifyLNFactEqs)
