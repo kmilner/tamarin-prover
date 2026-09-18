@@ -1,0 +1,58 @@
+theory SoundnessInductionEmptyEquality
+
+begin
+
+// Function signature and definition of the equational theory E
+
+functions: fst/1, pair/2, snd/1
+equations: fst(<x.1, x.2>) = x.1, snd(<x.1, x.2>) = x.2
+
+rule (modulo E) Impossible:
+   [ In( ~x ) ] --[ A( ) ]-> [ ]
+
+  /* has exactly the trivial AC variant */
+
+lemma false_direct:
+  all-traces "(∀ x. (x = 'a') ⇒ (⊥)) ∧ (∀ #i. (A( ) @ #i) ⇒ (⊤))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ x. (x = 'a')"
+*/
+simplify
+SOLVED // trace found
+
+lemma false_induction [use_induction]:
+  all-traces "(∀ x. (x = 'a') ⇒ (⊥)) ∧ (∀ #i. (A( ) @ #i) ⇒ (⊤))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ x. (x = 'a')"
+*/
+simplify
+SOLVED // trace found
+
+/* All wellformedness checks were successful. */
+
+/*
+Generated from:
+Tamarin version 1.13.0
+Maude version 3.5.1
+Git revision: 0747ae4c354d0d228eeb70b09c2bd6a508da3337 (with uncommited changes), branch: fix/msr-soundness
+Compiled at: 2026-09-17 08:23:33.560370004 UTC
+*/
+
+end
+/* Output
+
+==============================================================================
+summary of summaries:
+
+analyzed: examples/regression/trace/soundness-induction-empty-equality.spthy
+
+  output:          examples/regression/trace/soundness-induction-empty-equality.spthy.tmp
+  processing time: 0.03s
+  
+  false_direct (all-traces): falsified - found trace (2 steps)
+  false_induction (all-traces): falsified - found trace (2 steps)
+
+==============================================================================
+*/
