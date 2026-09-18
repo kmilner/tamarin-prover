@@ -316,15 +316,21 @@ getDiffSource RHS True  RefinedSource = L.get (crcRefinedSources . diffThyDiffCa
 -- | Close a protocol rule; i.e., compute AC variant and source assertion
 -- soundness sequent, if required.
 closeEitherProtoRule :: MaudeHandle -> (Side, OpenProtoRule) -> (Side, [ClosedProtoRule])
-closeEitherProtoRule hnd (s, ruE) = (s, closeProtoRule hnd [] ruE)
+closeEitherProtoRule hnd (s, rule) =
+    (s, closeProtoRule hnd [] prepared)
+  where
+    (prepared, _, _) = prepareDiffRule hnd rule
 
 -- | Apply macro to a diff protocol rule.
 applyMacroInDiffProtoRule :: [LNMacro]-> DiffProtoRule -> DiffProtoRule
 applyMacroInDiffProtoRule mcs (DiffProtoRule ruE sides) =
-    DiffProtoRule (applyMacroInRule mcs ruE) (applySides <$> sides)
+    DiffProtoRule expanded (applySides <$> sides)
   where
+    expanded = applyMacroInRule mcs ruE
+    align projection = L.set (rNewVars . oprRuleE) (L.get rNewVars (projection expanded))
+                     . applyMacroInProtoRule mcs
     applySides (leftRule, rightRule) =
-      (applyMacroInProtoRule mcs leftRule, applyMacroInProtoRule mcs rightRule)
+      (align getLeftRule leftRule, align getRightRule rightRule)
 
 -- | Apply macro to an open protocol rule.
 applyMacroInProtoRule :: [LNMacro]-> OpenProtoRule -> OpenProtoRule

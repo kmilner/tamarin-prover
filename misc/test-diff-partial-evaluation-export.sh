@@ -45,7 +45,7 @@ analyze() {
   check_verdicts "$tmp_dir/$1.log"
 }
 
-for model in explicit asymmetric singleton families; do
+for model in explicit asymmetric singleton families auto-sources; do
   input="$examples/soundness-diff-partial-evaluation-$model.spthy"
   case "$model" in
     explicit)
@@ -96,6 +96,14 @@ RHS :  reduced_reachable (exists-trace): verified
 LHS :  variant_action_reachable (exists-trace): verified
 RHS :  variant_action_reachable (exists-trace): verified
 DiffLemma:  Observational_equivalence : verified
+VERDICTS
+      ;;
+    auto-sources)
+      input="$examples/diff-auto-source-variable-alignment.spthy"
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+LHS :  AUTO_typing_LHS (all-traces): analysis incomplete
+RHS :  AUTO_typing_RHS (all-traces): analysis incomplete
+DiffLemma:  Observational_equivalence : analysis incomplete
 VERDICTS
       ;;
   esac

@@ -37,6 +37,7 @@ tests maudePath = TestList <$> sequence
     , roundTripTests maudePath
     , diffFamilyLifecycleTests maudePath
     , autoSourceFamilyTests maudePath
+    , pure diffVariableAlignmentTests
     , assumptionTests maudePath
     , conditionalRestrictionTests maudePath
     , alternativeConditionalRestrictionTests maudePath
@@ -169,7 +170,10 @@ roundTripTests maudePath = do
             rules t = (sort (leftTheoryRules t), sort (rightTheoryRules t))
             caches t = [L.get label t | label <- [diffThyCacheLeft,diffThyCacheRight,diffThyDiffCacheLeft,diffThyDiffCacheRight]]
             nonRules t = [item | item <- L.get diffThyItems (openDiffTheory t),
-                                case item of EitherRuleItem _ -> False; _ -> True]
+                                case item of
+                                  EitherRuleItem _ -> False
+                                  DiffRuleItem _ -> False
+                                  _ -> True]
         pure $ TestCase $ mapM_ (\t -> do
             assertEqual "side rules, variants and new variables" (rules first) (rules t)
             assertEqual "lemmas, restrictions and proof skeletons" (nonRules first) (nonRules t)
@@ -177,21 +181,29 @@ roundTripTests maudePath = do
 
 diffFamilyLifecycleTests :: FilePath -> IO Test
 diffFamilyLifecycleTests maudePath = do
+    -- Each shape crosses all three boundaries once. Explicit members exercise
+    -- annotations and alignment; one-sided declarations and a real cycle have
+    -- their own cases. Actual auto-source generation is tested separately.
     cases <- sequence
-      [ makeCase shape cyclic leftExplicit rightExplicit auto
-      | shape <- ["trivial", "normalized", "multiple", "empty", "left-empty", "right-empty"]
-      , cyclic <- [False, True]
-      , (leftExplicit, rightExplicit) <-
-          if shape `elem` ["empty", "left-empty", "right-empty"]
-            then [(False, False)]
-            else [(l, r) | l <- [False, True], r <- [False, True]]
-      , auto <- [False, True] ]
+      [ makeCase shape cyclic leftExplicit rightExplicit False
+      | (shape, cyclic, leftExplicit, rightExplicit) <-
+          [(shape, False, explicit, explicit)
+          | shape <- ["trivial", "normalized", "multiple", "asymmetric-public",
+                      "asymmetric-multiple", "asymmetric-indexed", "asymmetric-local"]
+          , explicit <- [False, True]] ++
+          [("multiple", True, True, True),
+           ("asymmetric-multiple", False, True, False),
+           ("asymmetric-multiple", False, False, True)] ++
+          [(shape, False, False, False) | shape <- ["empty", "left-empty", "right-empty"]] ]
     pure $ TestLabel "Diff family lifecycle" $ TestList cases
   where
     makeCase :: String -> Bool -> Bool -> Bool -> Bool -> IO Test
     makeCase shape cyclic leftExplicit rightExplicit auto = do
       let inputs = case shape of
             "multiple" -> ["In(x)", "In(k)"]
+            "asymmetric-multiple" -> ["In(x)", "In(k)"]
+            "asymmetric-indexed" -> ["In(x)", "In(k)"]
+            "asymmetric-local" -> ["In(x)", "In(k)"]
             "empty" -> ["Fr(~n)", "In(~n)"]
             "left-empty" -> ["Fr(~n)", "In(diff(~n,'known'))"]
             "right-empty" -> ["Fr(~n)", "In(diff('known',~n))"]
@@ -201,6 +213,10 @@ diffFamilyLifecycleTests maudePath = do
             "trivial" -> "'a'"
             "normalized" -> "sdec(senc('a','k'),'k')"
             "multiple" -> "sdec(x,k)"
+            "asymmetric-public" -> "diff($x,<$x,$y>)"
+            "asymmetric-multiple" -> "<sdec(x,k),diff($p,$q)>"
+            "asymmetric-indexed" -> "<sdec(x,k),diff(<$p,$p.1,$p.2>,$q)>"
+            "asymmetric-local" -> "<sdec(x,k),diff(<$p,$p.1,$p.2>,$q)>"
             _ -> "'a'"
           commaList = foldr1 (\a b -> a ++ "," ++ b)
           list xs = "[" ++ (if null xs then "" else commaList xs) ++ "]"
@@ -218,8 +234,12 @@ diffFamilyLifecycleTests maudePath = do
             if explicit then map (\ru -> addAction (addAction
                         (addAction (L.set (pracAttributes C.. rInfo) mempty ru) (protoFact Linear "Extra" []))
                         (protoFact Linear "DiffProtoR___VARIANT_1" [])) (protoFact Linear "DiffProtoR" []))
-                                   (recomputeRuleVariants hnd [] ruE)
+                                   (map (L.get cprRuleAC) $ concatMap unfoldRuleVariants $
+                                      closeProtoRule hnd [] (OpenProtoRule (local ruE) []))
                         else []
+          local ruE | shape == "asymmetric-local" = L.set rNewVars
+                        (newVariables (L.get rPrems ruE) (L.get rConcs ruE ++ L.get rActs ruE)) ruE
+                    | otherwise = ruE
           declare (DiffRuleItem (DiffProtoRule ruE _))
             | getRuleName ruE == "R", leftExplicit || rightExplicit =
             DiffRuleItem (DiffProtoRule ruE
@@ -251,20 +271,21 @@ diffFamilyLifecycleTests maudePath = do
         assertBool "canonical opening has no duplicate side items" $
           null [() | EitherRuleItem _ <- L.get diffThyItems (openDiffTheory first)]
         check (reclose first)
-        check (reclose (reclose first))
+        let repeated = cyclic || shape `elem` ["asymmetric-indexed", "asymmetric-local"]
+        if repeated then check (reclose (reclose first)) else pure ()
         printed <- reload prettyClosedDiffTheory first
         check printed
-        reload prettyClosedDiffTheory printed >>= check
+        if repeated then reload prettyClosedDiffTheory printed >>= check else pure ()
         saved <- reload (prettyOpenDiffTheory . exportDiffTheory) first
         check saved
-        reload (prettyOpenDiffTheory . exportDiffTheory) saved >>= check
+        if repeated then reload (prettyOpenDiffTheory . exportDiffTheory) saved >>= check else pure ()
 
 autoSourceFamilyTests :: FilePath -> IO Test
 autoSourceFamilyTests maudePath = do
     input <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
       [ "theory AutoSourceFamilies begin", "builtins: asymmetric-encryption"
       , "rule Keys: [Fr(~k)] --> [!Key($A,~k), !Pub($A,pk(~k)), Out(pk(~k))]"
-      , "rule Send: [Fr(~n), !Pub($B,p)] --> [Out(aenc(<~n,'tag'>,p))]"
+      , "rule Send: [Fr(~n), !Pub($B,p)] --> [Out(aenc(<~n,'tag'>,p)), Out(diff($x,<$x,$y>))]"
       , "rule Forward: [!Key($A,k), !Pub($B,p), In(aenc(<x,'tag'>,pk(k)))] --[Seen(x)]-> [Out(aenc(x,p))]"
       , "diffLemma D:", "end" ]
     sig <- toSignatureWithMaude maudePath (L.get diffThySignature input)
@@ -294,6 +315,58 @@ autoSourceFamilyTests maudePath = do
       second <- reload first
       check second
       reload second >>= check
+
+diffVariableAlignmentTests :: Test
+diffVariableAlignmentTests = TestLabel "Diff variable alignment" $ TestList
+    [ TestCase $ case diffVariantNewVars annotated canonical of
+        Just [visible,hidden] -> do
+          assertEqual "visible slot follows its original action" (p 4) visible
+          assertBool "hidden slot cannot capture any supplied variable" (hidden `notElem` map varTerm (frees annotated))
+          assertBool "hidden and visible slots stay distinct" (hidden /= visible)
+          assertEqual "reopening preserves transported hidden slots"
+            (Just [visible,hidden])
+            (diffVariantNewVars (L.set rNewVars [visible,hidden] annotated) canonical)
+        result -> assertFailure ("expected two aligned slots, got " ++ show result)
+    , TestCase $ assertEqual "exact names retain intentional hidden-variable annotations"
+        (Just [p 1,p 2]) (diffVariantNewVars exactAnnotation canonical)
+    , TestCase $ assertEqual "duplicate original labels retain their order"
+        (Just [p 4]) (diffVariantNewVars duplicates ordered)
+    , TestCase $ assertEqual "reordering original labels is not an added action"
+        Nothing (diffVariantNewVars reversed ordered)
+    , TestCase $ assertEqual "ambiguous action-only slot is rejected"
+        Nothing (diffVariantNewVars ambiguous canonical)
+    , TestCase $ assertEqual "distinct variables cannot be merged"
+        Nothing (diffVariantNewVars merged canonical)
+    , TestCase $ assertEqual "different constants cannot be renamed"
+        Nothing (matchTerms [fAppPair (p 3, pubTerm "b")] [fAppPair (p 0, pubTerm "a")])
+    , TestCase $ assertEqual "repeated variables retain equality"
+        Nothing (matchTerms [p 3,p 4] [p 0,p 0])
+    , TestCase $ assertEqual "variable sorts cannot change"
+        Nothing (matchTerms [varTerm (LVar "x" LSortMsg 3)] [p 0])
+    , TestCase $ assertEqual "AC arguments allow syntactic renaming"
+        (Just []) (matchTerms [fAppUnion (p 3,p 4)] [fAppUnion (p 0,p 1)])
+    , TestCase $ assertEqual "AC reordering cannot evade a fixed correspondence"
+        Nothing (matchTerms [p 4,p 3,fAppUnion (p 3,p 4)] [p 0,p 1,fAppUnion (p 0,p 1)])
+    , TestCase $ assertEqual "premises cannot become conclusions"
+        Nothing (diffVariantNewVars moved direction)
+    ]
+  where
+    p i = varTerm (LVar "p" LSortPub i)
+    fact name ts = protoFact Linear name ts
+    rule ps cs acts nvs = Rule (ProtoRuleACInfo (StandRule "R") mempty (Disj [emptySubstVFresh]) []) ps cs acts nvs
+    matchTerms actual expected = diffVariantNewVars
+      (rule [fact "F" actual] [] [] []) (rule [fact "F" expected] [] [] [])
+    canonical = rule [fact "F" [p 0]] [] [fact "A" [p 1]] [p 1,p 2]
+    annotated = rule [fact "F" [p 3]] [] [fact "Extra" [p 2],fact "A" [p 4]] []
+    exactAnnotation = rule [fact "F" [p 0]] [] [fact "Extra" [p 2],fact "A" [p 1]] [p 1,p 2]
+    ambiguous = rule [fact "F" [p 3]] [] [fact "A" [p 4],fact "A" [p 5]] []
+    merged = rule [fact "F" [p 3]] [] [fact "A" [p 3]] []
+    ordered = rule [fact "F" [p 0,p 1]] [] [fact "A" [p 0],fact "A" [p 1]] [p 1]
+    duplicates = rule [fact "F" [p 3,p 4]] []
+      [fact "Extra" [],fact "A" [p 3],fact "A" [p 3],fact "A" [p 4]] []
+    reversed = rule [fact "F" [p 3,p 4]] [] [fact "A" [p 4],fact "A" [p 3]] []
+    direction = rule [fact "F" [p 0]] [] [] []
+    moved = rule [] [fact "F" [p 3]] [] []
 
 assumptionTests :: FilePath -> IO Test
 assumptionTests maudePath = do

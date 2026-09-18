@@ -71,6 +71,7 @@ module Theory.Tools.Wellformedness (
   ) where
 
 import Rule
+import ClosedTheory (applyMacroInDiffProtoRule)
 
 import           Prelude                     hiding (id, (.))
 
@@ -95,7 +96,6 @@ import           Term.Maude.Signature
 import           Theory
 import           Theory.Text.Pretty
 import           Theory.Sapic
-import           Theory.Tools.RuleVariants
 import           Safe                        (lastMay)
 import           Items.OptionItem            (lemmasToProve)
 import           TheoryObject                (diffThyOptions, prettyVarList, theoryMacros, diffTheoryMacros)
@@ -353,8 +353,14 @@ natWellSortedReportDiff thy = natSortErrors itemsTerms
 
 --- | Check that the protocol rule variants are correct.
 variantsCheck :: MaudeHandle -> [LNMacro] -> String -> OpenProtoRule -> WfErrorReport
-variantsCheck hnd macros info (OpenProtoRule ruE ruAC) = catMaybes
-  [ guard (not (null ruAC) && not (sameVariantsUpToActions ruAC recomputedVariants)) $>
+variantsCheck hnd macros info rule@(OpenProtoRule ruE ruAC) =
+    variantsReport info rule recomputedVariants (sameVariantsUpToActions ruAC recomputedVariants)
+  where
+    recomputedVariants = recomputeRuleVariants hnd macros ruE
+
+variantsReport :: String -> OpenProtoRule -> [ProtoRuleAC] -> Bool -> WfErrorReport
+variantsReport info (OpenProtoRule ruE ruAC) recomputedVariants valid = catMaybes
+  [ guard (not (null ruAC) && not valid) $>
       ( underlineTopic "Variants"
       , text info $-$ nest 2 (numbered' (map prettyProtoRuleAC ruAC))
         $--$ text "Recomputed variants: " $--$
@@ -365,16 +371,6 @@ variantsCheck hnd macros info (OpenProtoRule ruE ruAC) = catMaybes
       ,       text "Rule " <> prettyRuleName ruE <> text " has no variants."
         $--$  text "Most likely, this means that the rule's use of fresh variables is contradictory. "
         <>    text "For exaple, a rule with the premises In(~x) and Fr(~x) has no variants because ~x cannot be sent before it is generated." )]
-  where
-    recomputedVariants =
-      map (get cprRuleAC) $
-      concatMap (unfoldRuleVariants . ClosedProtoRule ruE) $
-      maybeToList (variantsProtoRule hnd (applyMacroInRule macros ruE))
-    sameVariantsUpToActions parsed computed =
-      all (\p -> any (equalUpToAddedActions p) computed) parsed &&
-      -- Every computed case must be present, too. Keep the parsed variant
-      -- first in both comparisons: it may contain added source-lemma actions.
-      all (\c -> any (`equalUpToAddedActions` c) parsed) computed
 
 -- | Report on missing or different variants.
 ruleVariantsReport :: SignatureWithMaude -> OpenTranslatedTheory -> WfErrorReport
@@ -388,15 +384,19 @@ ruleVariantsReport sig thy = do
 -- | Report on missing or different variants in case of diff rules.
 ruleVariantsReportDiff :: SignatureWithMaude -> OpenDiffTheory -> WfErrorReport
 ruleVariantsReportDiff sig thy = do
-    lrRu <- [ get dprLeftRight ru | DiffRuleItem ru <- get diffThyItems thy ]
+    lrRu <- [ get dprLeftRight (applyMacroInDiffProtoRule (diffTheoryMacros thy) ru)
+            | DiffRuleItem ru <- get diffThyItems thy ]
     case lrRu of
-      Just (lr, rr) -> (variantsCheck hnd (diffTheoryMacros thy) ("Left rule " ++ quote (showRuleCaseName (get oprRuleE lr)) ++
+      Just (lr, rr) -> (check ("Left rule " ++ quote (showRuleCaseName (get oprRuleE lr)) ++
                      " cannot confirm manual variants:") lr) ++
-                      (variantsCheck hnd (diffTheoryMacros thy) ("Right rule " ++ quote (showRuleCaseName (get oprRuleE rr)) ++
+                      (check ("Right rule " ++ quote (showRuleCaseName (get oprRuleE rr)) ++
                       " cannot confirm manual variants:") rr)
       Nothing -> []
   where
     hnd = get sigmMaudeHandle sig
+    check info rule =
+      let (_, canonical, valid) = prepareDiffRule hnd rule
+      in variantsReport info rule canonical valid
 
 -- | Report on inconsistent left/right rules. This does not check the variants (done by ruleVariantsReportDiff).
 leftRightRuleReportDiff :: OpenDiffTheory -> WfErrorReport
