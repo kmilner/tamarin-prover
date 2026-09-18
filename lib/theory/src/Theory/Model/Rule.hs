@@ -112,6 +112,7 @@ module Theory.Model.Rule (
   , equalUpToAddedActions
   , equalUpToTerms
   , alignRuleUpToRenaming
+  , normalizeDiffSideRule
 
   -- ** Conversion
   , ruleACToIntrRuleAC
@@ -171,6 +172,8 @@ module Theory.Model.Rule (
 
   , prettyIntruderVariants)  where
 
+import Control.Monad.Trans.Maybe (MaybeT(..), runMaybeT)
+
 import           Prelude              hiding (id, (.))
 
 import           GHC.Generics (Generic)
@@ -178,6 +181,7 @@ import           Data.Binary
 import qualified Data.ByteString.Char8 as BC
 -- import           Data.Foldable        (foldMap)
 import           Data.Data
+import           Data.Functor.Identity (runIdentity)
 import           Data.List
 import qualified Data.Set              as S
 import qualified Data.Map              as M
@@ -1019,6 +1023,67 @@ alignRuleUpToRenaming member computed
     factEqs (Fact tag _ ts) (Fact tag' _ ts')
       | tag == tag' && length ts == length ts' = Just (zipWith Equal ts ts')
       | otherwise                              = Nothing
+
+-- | @normalizeDiffSideRule side projection@ renames the explicit
+-- diff side rule @side@ into the variable names of the parent's projection
+-- @projection@ and gives it the parent's positional new-variable slots.
+-- The side must match the projection up to renaming and added actions. Mirroring pairs the new variables of a rule instance with
+-- those of the opposite rule by position, so a side rule must use the
+-- parent's slots: its own are ordered by its variable names and omit
+-- variables that occur only on the other side. Variables that occur only in
+-- actions the side rule adds are renamed apart from the parent's. Within the
+-- first inherited-action embedding selected by 'alignRuleUpToRenaming', every
+-- renaming of the facts must give the same result; otherwise the result is
+-- 'Nothing'. Alternative action embeddings are not compared. Macros must
+-- already be expanded.
+normalizeDiffSideRule :: ProtoRuleE -> ProtoRuleE -> WithMaude (Maybe ProtoRuleE)
+normalizeDiffSideRule originalSide originalProjection = runMaybeT $ do
+    -- The parser appends parent restriction actions in the parent's names.
+    -- Align the side's own facts first, then restore these actions in that
+    -- same namespace. Including them in the alignment mixes variable names
+    -- when an explicit side alpha-renames the parent.
+    guard $ sideGenerated == generated
+    inherited <- MaybeT (alignRuleUpToRenaming side projection)
+    normalized <- MaybeT (normalize inherited)
+    return $ L.modify rActs (++ generated) normalized
+  where
+    count = length (L.get (preRestriction . rInfo) originalProjection)
+    splitActions rule = splitAt (length (L.get rActs rule) - count) (L.get rActs rule)
+    (sideActions, sideGenerated) = splitActions originalSide
+    (projectionActions, generated) = splitActions originalProjection
+    side = L.set rActs sideActions originalSide
+    projection = L.set rActs projectionActions originalProjection
+    normalize inherited
+      | equalUpToAddedActions side projection =
+          return (Just (L.set rNewVars (L.get rNewVars projection) side))
+      | otherwise = reader $ \hnd -> case nub (map normalizedRule (renamings hnd)) of
+          [ru] -> Just ru
+          _    -> Nothing
+      where
+        (side', inherited') = (side, inherited) `renameAvoiding` projection
+        sideFacts = L.get rPrems side' ++ L.get rConcs side' ++ inherited'
+        projFacts = L.get rPrems projection ++ L.get rConcs projection ++ L.get rActs projection
+        renamings hnd = case concat <$> sequence (zipWith factEqs sideFacts projFacts) of
+          Just eqs | length sideFacts == length projFacts ->
+            [ subst | subst <- unifyLNTerm eqs `runReader` hnd
+                    , isRenaming (restrictVFresh (frees sideFacts) subst)
+                    , isRenaming (restrictVFresh (frees projFacts) subst) ]
+          _ -> []
+        -- Map each side variable to the projection variable with the same image.
+        normalizedRule subst =
+            L.set rNewVars (L.get rNewVars projection) $
+              runIdentity $ mapFrees (Arbitrary $ pure . rename) side'
+          where
+            image v = imageOfVFresh subst v >>= getVar
+            back = M.fromList [ (i, v) | v <- frees projFacts, Just i <- [image v] ]
+            -- Map metadata too: ordinary substitution leaves ProtoRuleEInfo
+            -- unchanged, including the variables of side-local annotations.
+            rename w = M.findWithDefault w w renaming
+            renaming = M.fromList [ (w, v) | w <- frees sideFacts
+                                          , Just v <- [image w >>= (`M.lookup` back)] ]
+        factEqs (Fact tag _ ts) (Fact tag' _ ts')
+          | tag == tag' && length ts == length ts' = Just (zipWith Equal ts ts')
+          | otherwise                              = Nothing
 
 -- | returns true if the first Rule has the same name, premise, conclusion and
 -- action facts, ignoring terms
