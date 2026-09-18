@@ -44,6 +44,7 @@ tests maudePath = TestList <$> sequence
     , jointConditionalRestrictionTests maudePath
     , specializedMirrorTests maudePath
     , mixedRestrictionFilterTests maudePath
+    , partialEvaluationDiffTests maudePath
     ]
 
 mirrorTests :: FilePath -> IO Test
@@ -642,3 +643,52 @@ mixedRestrictionFilterTests maudePath = do
     pure $ TestLabel "Mixed restriction filtering" $ TestCase $
       assertEqual "action-free Boolean cases keep their complete restrictions"
         restrictions (filterRestrictions rightCtxt sys restrictions)
+
+partialEvaluationDiffTests :: FilePath -> IO Test
+partialEvaluationDiffTests maudePath = do
+    let models =
+          [ ["builtins: symmetric-encryption",
+             "rule Dec: [In(x),In(k)] --> [Out(diff(sdec(x,k),x))]"]
+          , ["rule SeedA: [] --> [State('a')]",
+             "rule SeedB: [] --> [State('b')]",
+             "rule Use: [State(x)] --[Used(x)]-> [Out(x)]"]
+          , ["rule Seed: [] --> [State(diff('a','b'))]",
+             "rule Use: [State('a')] --> [Out('ok')]"]
+          ]
+    cases <- sequence [makeCase model auto | model <- models, auto <- [False, True]]
+    pure $ TestLabel "Diff partial evaluation families" $ TestList cases
+  where
+    makeCase model auto = do
+        open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $
+            unlines (["theory PartialEvaluation begin"] ++ model ++ ["diffLemma D:", "end"])
+        original <- closeDiffTheory maudePath open auto
+        let refined = applyPartialEvaluationDiff Silent auto original
+            reopened = closeDiffTheoryWithMaude (L.get diffThySignature refined)
+                         (openDiffTheory refined) auto
+            rules t = (sort (leftTheoryRules t), sort (rightTheoryRules t))
+            names side t = S.fromList
+              [getRuleName (L.get cprRuleE r) | r <- diffTheorySideRules side t]
+        pure $ TestCase $ do
+            assertEqual "analysis preserves complete compiled families" (rules original) (rules refined)
+            mapM_ (\cache -> assertEqual "analysis preserves cached sources"
+              (L.get cache original) (L.get cache refined))
+              [diffThyCacheLeft,diffThyCacheRight,diffThyDiffCacheLeft,diffThyDiffCacheRight]
+            assertEqual "analysis preserves all existing items and proofs"
+              (L.get diffThyItems original) (tail (L.get diffThyItems refined))
+            mapM_ (\side -> assertEqual "original family identities"
+              (names side original) (names side refined)) [LHS, RHS]
+            assertEqual "unchanged compiled families survive reopening" (rules refined) (rules reopened)
+            printed <- either (assertFailure . show) pure $
+              parseOpenDiffTheoryString [] (render (prettyClosedDiffTheory refined))
+            let warnings = checkWellformednessDiff printed (L.get diffThySignature refined)
+            assertBool (render (prettyWfErrorReport warnings)) (null warnings)
+            reparsed <- closeDiffTheory maudePath printed auto
+            -- Compare compiled behavior, including all action annotations,
+            -- across export and reload.
+            mapM_ (\side -> do
+              let before = map (L.get cprRuleAC) (diffTheorySideRules side refined)
+                  after = map (L.get cprRuleAC) (diffTheorySideRules side reparsed)
+                  covered xs ys = all (\x -> any (eqModuloFreshnessNoAC x) ys) xs
+              assertEqual "printed variant count" (length before) (length after)
+              assertBool "unchanged compiled families survive printing and parsing up to renaming"
+                (covered before after && covered after before)) [LHS, RHS]

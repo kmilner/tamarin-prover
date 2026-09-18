@@ -366,46 +366,44 @@ applyPartialEvaluation evalStyle autosources thy0 =
               "Note that the original number of multiset rewriting rules was "
               ++ show originalRuleCount ++ ".\n\n")
 
--- | Apply partial evaluation.
+-- | Analyze reachability for diagnostics. Diff correspondence requires complete
+-- equation-variant families, so reachable refinements must not replace them.
 applyPartialEvaluationDiff :: EvaluationStyle -> Bool -> ClosedDiffTheory -> ClosedDiffTheory
-applyPartialEvaluationDiff evalStyle autoSources thy0 =
-    closeDiffTheoryWithMaude sig
-      (L.modify diffThyItems replaceProtoRules (openDiffTheory thy0)) autoSources
+applyPartialEvaluationDiff evalStyle _autoSources thy0 =
+    L.modify diffThyItems (DiffTextItem ("text", render ppAbsState) :) thy0
   where
     sig            = L.get diffThySignature thy0
-    ruEs s         = getProtoRuleEsDiff s thy0
-    (stL', ruEsL') = (`runReader` L.get sigmMaudeHandle sig) $
-                     partialEvaluation evalStyle (ruEs LHS)
-    (stR', ruEsR') = (`runReader` L.get sigmMaudeHandle sig) $
-                     partialEvaluation evalStyle (ruEs RHS)
-
-    replaceProtoRules [] = []
-    replaceProtoRules (item:items)
-      | isEitherRuleItem item  =
-          [ DiffTextItem ("text", render ppAbsState)
-       -- Here we loose imported variants!
-          ] ++ map (\x -> EitherRuleItem (LHS, OpenProtoRule x [])) ruEsL' ++ map (\x -> EitherRuleItem (RHS, OpenProtoRule x [])) ruEsR' ++ filter (not . isEitherRuleItem) items
-      | otherwise        = item : replaceProtoRules items
-
-    isEitherRuleItem (EitherRuleItem _) = True
-    isEitherRuleItem _                  = False
+    -- Group diagnostic refinements by their original family name: generated
+    -- variant numbers are side-local and would prevent deduplication here.
+    -- These renamed rules are never consumed by diff proof search.
+    rules s        = concatMap familyVariants (diffTheorySideRules s thy0)
+    familyVariants cru =
+      map (L.set (preName . rInfo) (L.get (preName . rInfo . cprRuleE) cru)
+           . removeGeneratedDiffLabel ("DiffProto" ++ getRuleName (L.get cprRuleE cru)))
+          (map compiledRule (unfoldRuleVariants cru))
+    originalRuleCount s = length (getProtoRuleEsDiff s thy0)
+    (stL', rulesL') = (`runReader` L.get sigmMaudeHandle sig) $
+                      partialEvaluation evalStyle (rules LHS)
+    (stR', rulesR') = (`runReader` L.get sigmMaudeHandle sig) $
+                      partialEvaluation evalStyle (rules RHS)
 
     ppAbsState =
       (text $ " the abstract state after partial evaluation"
               ++ " contains " ++ show (S.size stL') ++ " left facts:") $--$
       (numbered' $ map prettyLNFact $ S.toList stL') $--$
-      (text $ "This abstract state results in " ++ show (length ruEsL') ++
+      (text $ "Partial evaluation proposed " ++ show (length rulesL') ++
               " left refined multiset rewriting rules.\n" ++
               "Note that the original number of multiset rewriting rules was "
-              ++ show (length (ruEs LHS)) ++ ".\n\n") $--$
+              ++ show (originalRuleCount LHS) ++ ".\n\n") $--$
       (text $ " the abstract state after partial evaluation"
               ++ " contains " ++ show (S.size stR') ++ " right facts:") $--$
       (numbered' $ map prettyLNFact $ S.toList stR') $--$
-      (text $ "This abstract state results in " ++ show (length ruEsR') ++
+      (text $ "Partial evaluation proposed " ++ show (length rulesR') ++
               " right refined multiset rewriting rules.\n" ++
               "Note that the original number of multiset rewriting rules was "
-              ++ show (length (ruEs RHS)) ++ ".\n\n")
-
+              ++ show (originalRuleCount RHS) ++ ".\n\n" ++
+              "Diff partial evaluation is analysis-only; original equation-variant " ++
+              "families are retained.\n")
 
 -- Partial evaluation only needs unification modulo AC when it starts from the
 -- already computed E-variants. Representing each compiled variant as an E-rule

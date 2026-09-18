@@ -396,6 +396,13 @@ which can result in long proof times or even non-termination. If possible it
 tries not to resolve parts of the execution that are irrelevant, but this is
 not always sufficient.
 
+In diff mode, `--partial-evaluation=summary` (or `verbose`) performs a
+reachability analysis and adds its results as a comment in the generated
+theory. This is analysis-only: it preserves the complete rule families,
+annotations, source caches and proofs. It does not specialize the rules or
+reduce the subsequent equivalence proof search. Printed theories and saved
+proofs therefore use the same families as an ordinary diff analysis.
+
 
 Restrictions{#sec:restrictions}
 ------

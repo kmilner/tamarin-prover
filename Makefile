@@ -485,6 +485,7 @@ accountability-case-studies:	$(ACCOUNTABILITY_CS_TARGETS)
 FAST_REGRESSION_CASE_STUDIES=issue446-1.spthy issue446-2.spthy issue753-4.spthy issue753-5.spthy issue753-6.spthy issue834.spthy issue777.spthy issue770.spthy issue914.spthy
 COMMON_REGRESSION_CASE_STUDIES=msr-macro-injectivity.spthy msr-injective-last.spthy msr-source-premise-index.spthy nat-subterm-sorts.spthy soundness-subterm-witness.spthy soundness-manual-variants-complete.spthy soundness-safety-false.spthy soundness-partial-evaluation-variants.spthy partial-evaluation-export.spthy partial-evaluation-collision.spthy soundness-induction-empty-equality.spthy
 DIFF_REGRESSION_CASE_STUDIES=soundness-diff-macros.spthy soundness-diff-source-side.spthy soundness-diff-mirror-restriction.spthy soundness-diff-mirror-false-restriction.spthy soundness-diff-mirror-unifiers.spthy soundness-diff-roundtrip.spthy soundness-diff-hidden-reuse.spthy soundness-diff-conditional-restriction.spthy soundness-diff-mixed-restriction.spthy soundness-diff-unreachable-trivial-goal.spthy
+DIFF_REGRESSION_CASE_STUDIES+=soundness-diff-partial-evaluation-variants.spthy soundness-diff-partial-evaluation-refinement.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-alternative-conditional-restrictions.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-joint-conditional-attack.spthy diff-joint-conditional-restrictions.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-explicit-variant-export.spthy diff-asymmetric-explicit-variants.spthy diff-singleton-trivial-variants.spthy
@@ -507,6 +508,8 @@ case-studies$(SUBDIR)regression/trace/diff-auto-source-variable-alignment_analyz
 
 case-studies$(SUBDIR)regression/trace/soundness-partial-evaluation-variants_analyzed.spthy: TRACE_EXTRA_ARGS=--partial-evaluation=summary
 case-studies$(SUBDIR)regression/trace/partial-evaluation-export_analyzed.spthy: TRACE_EXTRA_ARGS=--partial-evaluation=summary
+case-studies$(SUBDIR)regression/trace/soundness-diff-partial-evaluation-variants_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--partial-evaluation=summary
+case-studies$(SUBDIR)regression/trace/soundness-diff-partial-evaluation-refinement_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--partial-evaluation=summary
 case-studies$(SUBDIR)regression/trace/partial-evaluation-collision_analyzed.spthy: TRACE_EXTRA_ARGS=--partial-evaluation=summary
 
 REGRESSION_CASE_STUDIES=issue216.spthy issue193.spthy issue310.spthy issue519.spthy issue527.spthy issue515.spthy

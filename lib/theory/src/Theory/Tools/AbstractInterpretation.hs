@@ -90,9 +90,9 @@ data EvaluationStyle = Silent | Summary | Tracing
 -- | Concrete partial evaluator activated with flag: --partial-evaluation.
 -- Refinement uses the AC unifier used by the constraint solver. To preserve
 -- reachability modulo E, callers must supply a complete, unfolded set of
--- E-variants, as the trace-theory applyPartialEvaluation caller does. The
--- legacy applyPartialEvaluationDiff caller supplies original E-rules instead;
--- this precondition does not establish soundness for that path.
+-- E-variants, as the trace-theory applyPartialEvaluation caller does. Diff
+-- evaluation also starts from compiled variants, but uses the results only
+-- for diagnostics and retains its original rule families.
 partialEvaluation :: (Eq i, Show i, HasFrees i, Apply LNSubst i)
                   => EvaluationStyle
                   -> [Rule i] -> WithMaude (S.Set LNFact, [Rule i])

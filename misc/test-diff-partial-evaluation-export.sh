@@ -45,9 +45,18 @@ analyze() {
   check_verdicts "$tmp_dir/$1.log"
 }
 
-for model in explicit asymmetric singleton families auto-sources; do
+for model in refinement variants explicit asymmetric singleton families auto-sources; do
   input="$examples/soundness-diff-partial-evaluation-$model.spthy"
   case "$model" in
+    refinement)
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+LHS :  both (exists-trace): verified
+RHS :  both (exists-trace): verified
+LHS :  annotations (exists-trace): verified
+RHS :  annotations (exists-trace): verified
+DiffLemma:  Observational_equivalence : verified
+VERDICTS
+      ;;
     explicit)
       input="$examples/diff-explicit-variant-export.spthy"
       cat >"$tmp_dir/expected" <<'VERDICTS'
@@ -69,6 +78,9 @@ LHS :  unreduced_reachable (exists-trace): verified
 RHS :  echo_reachable (exists-trace): verified
 DiffLemma:  Observational_equivalence : falsified - found trace
 VERDICTS
+      ;;
+    variants)
+      echo 'DiffLemma:  Observational_equivalence : falsified - found trace' >"$tmp_dir/expected"
       ;;
     singleton)
       input="$examples/diff-singleton-trivial-variants.spthy"
@@ -112,7 +124,18 @@ VERDICTS
   run_tamarin printed "$input"
   analyze printed-reloaded "$tmp_dir/printed.spthy" --prove
   analyze printed-replay "$tmp_dir/original.spthy"
-
+  # Force analysis rendering on every shape. It preserves all compiled rules;
+  # representative family and actual auto-source cases cover the full extra
+  # proof/export/reload/replay sequence.
+  run_tamarin unproved "$input" --partial-evaluation=summary
+  case "$model" in
+    families|auto-sources)
+      analyze evaluated "$input" --partial-evaluation=summary --prove
+      analyze reloaded "$tmp_dir/unproved.spthy" --prove
+      analyze replay "$tmp_dir/evaluated.spthy"
+      analyze reevaluated "$tmp_dir/unproved.spthy" --partial-evaluation=summary --prove
+      ;;
+  esac
 done
 
 echo 'Diff partial-evaluation export preserves all expected verdicts.'
