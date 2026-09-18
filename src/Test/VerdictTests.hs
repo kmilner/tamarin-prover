@@ -34,8 +34,9 @@ tests :: FilePath -> IO Test
 tests maudePath = TestList <$> sequence
     [ mirrorTests maudePath
     , explicitVariantMirrorTests maudePath
-    , diffAnnotationTests
     , roundTripTests maudePath
+    , diffFamilyLifecycleTests maudePath
+    , autoSourceFamilyTests maudePath
     , assumptionTests maudePath
     , conditionalRestrictionTests maudePath
     , alternativeConditionalRestrictionTests maudePath
@@ -127,36 +128,6 @@ explicitVariantMirrorTests maudePath = do
             (sort (map actions (family (opposite side))))
             (sort (map actions (mirrored side ru)))) (family side)) [LHS, RHS]
 
-diffAnnotationTests :: IO Test
-diffAnnotationTests = do
-    open <- either (fail . show) pure $ parseOpenTheoryString [] $ unlines
-      [ "theory DiffAnnotations begin"
-      , "builtins: symmetric-encryption"
-      , "rule Dec: [In(x), In(k)] --> [Out(sdec(x,k))]"
-      , "variants rule (modulo AC) Dec___VARIANT_1: [In(x.2), In(k.1)] --[GenericResult(sdec(x.2,k.1))]-> [Out(sdec(x.2,k.1))],"
-      , "rule (modulo AC) Dec___VARIANT_2: [In(senc(z.2,k.1)), In(k.1)] --[Cancelled(z.2)]-> [Out(z.2)]"
-      , "end"
-      ]
-    let original@(OpenProtoRule ruE variants) = head (theoryRules open)
-        labelled = addProtoDiffLabel original "DiffProtoDec"
-        changeFirst f = OpenProtoRule ruE (f (head variants) : tail variants)
-        changedAction = changeFirst (\ru -> addAction ru (protoFact Linear "Other" []))
-        variantLabel = changeFirst (`addDiffLabel` "DiffProtoDec___VARIANT_1")
-        changedConclusion = changeFirst (L.modify rConcs (const []))
-        missingVariant = OpenProtoRule ruE (tail variants)
-        compareCase name expected a b = TestLabel name $ TestCase $ do
-          assertEqual "forward comparison" expected (equalOpenRuleUpToDiffAnnotation a b)
-          assertEqual "reverse comparison" expected (equalOpenRuleUpToDiffAnnotation b a)
-    pure $ TestLabel "Diff family annotations" $ TestList
-      [ compareCase "unlabelled families" True original original
-      , compareCase "parent label on every variant" True original labelled
-      , compareCase "already labelled families" True labelled labelled
-      , compareCase "added user action" False labelled changedAction
-      , compareCase "variant-name label is not the parent label" False labelled variantLabel
-      , compareCase "changed conclusion" False labelled changedConclusion
-      , compareCase "missing variant" False labelled missingVariant
-      ]
-
 roundTripTests :: FilePath -> IO Test
 roundTripTests maudePath = do
     let models =
@@ -203,6 +174,126 @@ roundTripTests maudePath = do
             assertEqual "side rules, variants and new variables" (rules first) (rules t)
             assertEqual "lemmas, restrictions and proof skeletons" (nonRules first) (nonRules t)
             assertEqual "all four rule/source caches" (caches first) (caches t)) [second,third]
+
+diffFamilyLifecycleTests :: FilePath -> IO Test
+diffFamilyLifecycleTests maudePath = do
+    cases <- sequence
+      [ makeCase shape cyclic leftExplicit rightExplicit auto
+      | shape <- ["trivial", "normalized", "multiple", "empty", "left-empty", "right-empty"]
+      , cyclic <- [False, True]
+      , (leftExplicit, rightExplicit) <-
+          if shape `elem` ["empty", "left-empty", "right-empty"]
+            then [(False, False)]
+            else [(l, r) | l <- [False, True], r <- [False, True]]
+      , auto <- [False, True] ]
+    pure $ TestLabel "Diff family lifecycle" $ TestList cases
+  where
+    makeCase :: String -> Bool -> Bool -> Bool -> Bool -> IO Test
+    makeCase shape cyclic leftExplicit rightExplicit auto = do
+      let inputs = case shape of
+            "multiple" -> ["In(x)", "In(k)"]
+            "empty" -> ["Fr(~n)", "In(~n)"]
+            "left-empty" -> ["Fr(~n)", "In(diff(~n,'known'))"]
+            "right-empty" -> ["Fr(~n)", "In(diff('known',~n))"]
+            _ -> []
+          state = ["State('s')" | cyclic]
+          output = case shape of
+            "trivial" -> "'a'"
+            "normalized" -> "sdec(senc('a','k'),'k')"
+            "multiple" -> "sdec(x,k)"
+            _ -> "'a'"
+          commaList = foldr1 (\a b -> a ++ "," ++ b)
+          list xs = "[" ++ (if null xs then "" else commaList xs) ++ "]"
+          source = unlines
+            [ "theory FamilyLifecycle begin", "builtins: symmetric-encryption"
+            , "rule Init: [] --> [State('s')]"
+            , "rule R[color=#123456]: " ++ list (inputs ++ state)
+                ++ " --[Seen($p)]-> " ++ list (["Out(" ++ output ++ ")"] ++ state)
+            , "diffLemma D:", "end" ]
+      parsed <- either (fail . show) pure (parseOpenDiffTheoryString [] source)
+      computed <- closeDiffTheory maudePath parsed False
+      let sig = L.get diffThySignature computed
+          hnd = L.get sigmMaudeHandle sig
+          side explicit ruE = OpenProtoRule ruE $
+            if explicit then map (\ru -> addAction (addAction
+                        (addAction (L.set (pracAttributes C.. rInfo) mempty ru) (protoFact Linear "Extra" []))
+                        (protoFact Linear "DiffProtoR___VARIANT_1" [])) (protoFact Linear "DiffProtoR" []))
+                                   (recomputeRuleVariants hnd [] ruE)
+                        else []
+          declare (DiffRuleItem (DiffProtoRule ruE _))
+            | getRuleName ruE == "R", leftExplicit || rightExplicit =
+            DiffRuleItem (DiffProtoRule ruE
+              (Just (side leftExplicit (getLeftRule ruE), side rightExplicit (getRightRule ruE))))
+          declare item = item
+          input = L.modify diffThyItems (map declare) parsed
+          first = closeDiffTheoryWithMaude sig input auto
+          rules t = (sort (leftTheoryRules t), sort (rightTheoryRules t))
+          caches t = [L.get label t | label <-
+            [diffThyCacheLeft,diffThyCacheRight,diffThyDiffCacheLeft,diffThyDiffCacheRight]]
+          check t = do
+            assertEqual "complete families, metadata and new-variable vectors" (rules first) (rules t)
+            assertEqual "all four rule/source caches" (caches first) (caches t)
+          reclose t = closeDiffTheoryWithMaude sig (openDiffTheory t) auto
+          reload printer t = do
+            open <- either (assertFailure . show) pure $
+              parseOpenDiffTheoryString [] (render (printer t))
+            let warnings = checkWellformednessDiff open sig
+            assertBool (render (prettyWfErrorReport warnings)) (null warnings)
+            pure $ closeDiffTheoryWithMaude sig open auto
+      pure $ TestLabel (show (shape, cyclic, leftExplicit, rightExplicit, auto)) $ TestCase $ do
+        let warnings = checkWellformednessDiff input sig
+        assertBool (render (prettyWfErrorReport warnings)) (null warnings)
+        mapM_ (\s -> assertEqual "empty family only on the expected sides"
+          (shape == "empty" || (shape == "left-empty" && s == LHS)
+                            || (shape == "right-empty" && s == RHS))
+          (null [r | r <- diffTheorySideRules s first,
+                     getRuleName (L.get cprRuleE r) == "R"])) [LHS, RHS]
+        assertBool "canonical opening has no duplicate side items" $
+          null [() | EitherRuleItem _ <- L.get diffThyItems (openDiffTheory first)]
+        check (reclose first)
+        check (reclose (reclose first))
+        printed <- reload prettyClosedDiffTheory first
+        check printed
+        reload prettyClosedDiffTheory printed >>= check
+        saved <- reload (prettyOpenDiffTheory . exportDiffTheory) first
+        check saved
+        reload (prettyOpenDiffTheory . exportDiffTheory) saved >>= check
+
+autoSourceFamilyTests :: FilePath -> IO Test
+autoSourceFamilyTests maudePath = do
+    input <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+      [ "theory AutoSourceFamilies begin", "builtins: asymmetric-encryption"
+      , "rule Keys: [Fr(~k)] --> [!Key($A,~k), !Pub($A,pk(~k)), Out(pk(~k))]"
+      , "rule Send: [Fr(~n), !Pub($B,p)] --> [Out(aenc(<~n,'tag'>,p))]"
+      , "rule Forward: [!Key($A,k), !Pub($B,p), In(aenc(<x,'tag'>,pk(k)))] --[Seen(x)]-> [Out(aenc(x,p))]"
+      , "diffLemma D:", "end" ]
+    sig <- toSignatureWithMaude maudePath (L.get diffThySignature input)
+    let hnd = L.get sigmMaudeHandle sig
+        msig = _sigMaudeInfo (L.get diffThySignature input)
+        deduction diff = subtermConstructorRules diff hnd msig ++ specialIntruderRules diff
+                      ++ runReader (destructionRulesNoEq diff (noEqFunSyms msig)) hnd
+        withDeduction = addIntrRuleLabels . addIntrRuleACsDiffBoth (deduction False)
+                                         . addIntrRuleACsDiffBothDiff (deduction True)
+        first = closeDiffTheoryWithMaude sig (withDeduction input) True
+        rules t = (sort (leftTheoryRules t), sort (rightTheoryRules t))
+        sources t = [(s, L.get lName l, L.get lFormula l)
+                    | (s, l) <- diffTheoryLemmas t, isSourceLemma l]
+        check t = do
+          assertEqual "generated actions and all rule metadata" (rules first) (rules t)
+          assertEqual "generated source lemmas" (sources first) (sources t)
+        reload t = do
+          parsed <- either (assertFailure . show) pure $ parseOpenDiffTheoryString [] $
+            render (prettyClosedDiffTheory t)
+          let warnings = checkWellformednessDiff parsed sig
+          assertBool (render (prettyWfErrorReport warnings)) (null warnings)
+          pure $ closeDiffTheoryWithMaude sig (withDeduction parsed) True
+    pure $ TestLabel "Generated source family round trip" $ TestCase $ do
+      assertBool "real generated source actions" ("AUTO_IN_" `isInfixOf` show (rules first))
+      assertEqual "one source lemma on each side" 2 (length (sources first))
+      check (closeDiffTheoryWithMaude sig (openDiffTheory first) True)
+      second <- reload first
+      check second
+      reload second >>= check
 
 assumptionTests :: FilePath -> IO Test
 assumptionTests maudePath = do

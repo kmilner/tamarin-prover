@@ -487,7 +487,8 @@ COMMON_REGRESSION_CASE_STUDIES=msr-macro-injectivity.spthy msr-injective-last.sp
 DIFF_REGRESSION_CASE_STUDIES=soundness-diff-macros.spthy soundness-diff-source-side.spthy soundness-diff-mirror-restriction.spthy soundness-diff-mirror-false-restriction.spthy soundness-diff-mirror-unifiers.spthy soundness-diff-roundtrip.spthy soundness-diff-hidden-reuse.spthy soundness-diff-conditional-restriction.spthy soundness-diff-mixed-restriction.spthy soundness-diff-unreachable-trivial-goal.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-alternative-conditional-restrictions.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-joint-conditional-attack.spthy diff-joint-conditional-restrictions.spthy
-DIFF_REGRESSION_CASE_STUDIES+=diff-explicit-variant-export.spthy diff-asymmetric-explicit-variants.spthy
+DIFF_REGRESSION_CASE_STUDIES+=diff-explicit-variant-export.spthy diff-asymmetric-explicit-variants.spthy diff-singleton-trivial-variants.spthy
+DIFF_REGRESSION_CASE_STUDIES+=diff-variant-family-roundtrip.spthy
 FAST_REGRESSION_CASE_STUDIES+=$(COMMON_REGRESSION_CASE_STUDIES)
 FAST_REGRESSION_TARGETS=$(subst .spthy,_analyzed.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(FAST_REGRESSION_CASE_STUDIES)))
 DIFF_REGRESSION_TARGETS=$(subst .spthy,_analyzed-diff.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(DIFF_REGRESSION_CASE_STUDIES)))
@@ -499,6 +500,8 @@ DIFF_REGRESSION_TARGETS=$(subst .spthy,_analyzed-diff.spthy,$(addprefix case-stu
 # This example checks explicit-variant export and its side lemmas. Bound the
 # diff search, which remains incomplete for this family.
 case-studies$(SUBDIR)regression/trace/diff-explicit-variant-export_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--bound=6
+case-studies$(SUBDIR)regression/trace/diff-singleton-trivial-variants_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--quit-on-warning
+case-studies$(SUBDIR)regression/trace/diff-variant-family-roundtrip_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--quit-on-warning
 
 case-studies$(SUBDIR)regression/trace/soundness-partial-evaluation-variants_analyzed.spthy: TRACE_EXTRA_ARGS=--partial-evaluation=summary
 case-studies$(SUBDIR)regression/trace/partial-evaluation-export_analyzed.spthy: TRACE_EXTRA_ARGS=--partial-evaluation=summary

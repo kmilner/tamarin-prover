@@ -101,9 +101,9 @@ closeDiffTheoryWithMaude sig thy0 autoSources =
     theoryItems = map expandRuleItem (L.get diffThyItems thy0)
                ++ missingSideRules LHS leftOpenRules
                ++ missingSideRules RHS rightOpenRules
-    -- Reopened theories already contain the compiled side rules, including
-    -- explicit variants and generated source actions. Do not append another
-    -- copy derived from the diff rule, or replace that preserved information.
+    -- Also accept detached side rules from existing callers. These take
+    -- precedence over declarations; canonical reopening stores its current
+    -- families directly in the DiffRuleItems instead.
     missingSideRules side rules =
       [ EitherRuleItem (side, ru)
       | ru <- rules
@@ -448,10 +448,19 @@ openTheory  (Theory n f h t sig c items opts sapic) = openTranslatedTheory(
 -- | Open a theory by dropping the closed world assumption and values whose
 -- soundness depends on it.
 openDiffTheory :: ClosedDiffTheory -> OpenDiffTheory
-openDiffTheory  (DiffTheory n f h t sig c1 c2 c3 c4 items opts sapic) =
-    -- We merge duplicate rules if they were split into variants
+openDiffTheory = openDiffTheoryWith openDiffRuleFamily
+
+-- | Reopen for text export, encoding complete explicit families where the
+-- original E-rule alone would lose compiled behavior or annotations.
+exportDiffTheory :: ClosedDiffTheory -> OpenDiffTheory
+exportDiffTheory thy = openDiffTheoryWith
+    (exportDiffRuleFamily (L.get (sigmMaudeHandle . diffThySignature) thy)) thy
+
+openDiffTheoryWith :: ([ClosedProtoRule] -> OpenProtoRule) -> ClosedDiffTheory -> OpenDiffTheory
+openDiffTheoryWith reopen (DiffTheory n f h t sig c1 c2 c3 c4 items opts sapic) =
     DiffTheory n f h t (toSignaturePure sig) (openRuleCache c1) (openRuleCache c2) (openRuleCache c3) (openRuleCache c4)
-      (mergeOpenProtoRulesDiff $ map (mapDiffTheoryItem id (\(x, y) -> (x, (openProtoRule y))) (\(DiffLemma s a p) -> (DiffLemma s a (incrementalToSkeletonDiffProof p))) (\(x, Lemma a p m b c c' d e) -> (x, Lemma a p m b c c' d (incrementalToSkeletonProof e)))) items)
+      (map (mapDiffTheoryItem id id (\(DiffLemma s a p) -> (DiffLemma s a (incrementalToSkeletonDiffProof p))) (\(x, Lemma a p m b c c' d e) -> (x, Lemma a p m b c c' d (incrementalToSkeletonProof e))))
+           (reconstructDiffRuleFamilies reopen items))
       opts sapic
 
 ------------------------------------------------------------------------------

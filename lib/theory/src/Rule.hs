@@ -30,14 +30,16 @@ getOpenProtoRuleName (OpenProtoRule ruE _) = getRuleName ruE
 addProtoDiffLabel :: OpenProtoRule -> String -> OpenProtoRule
 addProtoDiffLabel (OpenProtoRule ruE ruAC) label = OpenProtoRule (addDiffLabel ruE label) (fmap ((flip addDiffLabel) label) ruAC)
 
-equalOpenRuleUpToDiffAnnotation :: OpenProtoRule -> OpenProtoRule -> Bool
-equalOpenRuleUpToDiffAnnotation ru1 ru2 = withoutLabel ru1 == withoutLabel ru2
+-- | Closing appends one parent-owned label. Remove that final occurrence when
+-- reopening, retaining any identically named actions supplied by the user.
+removeGeneratedDiffLabel :: String -> Rule i -> Rule i
+removeGeneratedDiffLabel label = L.modify rActs (reverse . removeFirst . reverse)
   where
-    -- Every variant carries its parent E-rule's label, even when its own name
-    -- differs. Ignore only that label; retain all other actions and rule data.
-    withoutLabel (OpenProtoRule ruE ruAC) =
-      let strip ru = removeDiffLabel ru ("DiffProto" ++ getRuleName ruE)
-      in OpenProtoRule (strip ruE) (map strip ruAC)
+    marker = protoFact Linear label []
+    removeFirst [] = []
+    removeFirst (fact:rest)
+      | fact == marker = rest
+      | otherwise = fact : removeFirst rest
 
 -- Relation between open and closed rule sets
 ---------------------------------------------

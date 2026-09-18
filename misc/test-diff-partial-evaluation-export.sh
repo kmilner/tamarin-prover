@@ -45,7 +45,7 @@ analyze() {
   check_verdicts "$tmp_dir/$1.log"
 }
 
-for model in explicit asymmetric; do
+for model in explicit asymmetric singleton families; do
   input="$examples/soundness-diff-partial-evaluation-$model.spthy"
   case "$model" in
     explicit)
@@ -68,6 +68,34 @@ LHS :  decrypted_reachable (exists-trace): verified
 LHS :  unreduced_reachable (exists-trace): verified
 RHS :  echo_reachable (exists-trace): verified
 DiffLemma:  Observational_equivalence : falsified - found trace
+VERDICTS
+      ;;
+    singleton)
+      input="$examples/diff-singleton-trivial-variants.spthy"
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+LHS :  both_reachable (exists-trace): verified
+RHS :  both_reachable (exists-trace): verified
+LHS :  left_reachable (exists-trace): verified
+RHS :  left_reachable (exists-trace): verified
+LHS :  right_reachable (exists-trace): verified
+RHS :  right_reachable (exists-trace): verified
+LHS :  automatic_reachable (exists-trace): verified
+RHS :  automatic_reachable (exists-trace): verified
+DiffLemma:  Observational_equivalence : verified
+VERDICTS
+      ;;
+    families)
+      input="$examples/diff-variant-family-roundtrip.spthy"
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+LHS :  loop_reachable (exists-trace): verified
+RHS :  loop_reachable (exists-trace): verified
+LHS :  impossible_unreachable (all-traces): verified
+RHS :  impossible_unreachable (all-traces): verified
+LHS :  reduced_reachable (exists-trace): verified
+RHS :  reduced_reachable (exists-trace): verified
+LHS :  variant_action_reachable (exists-trace): verified
+RHS :  variant_action_reachable (exists-trace): verified
+DiffLemma:  Observational_equivalence : verified
 VERDICTS
       ;;
   esac
