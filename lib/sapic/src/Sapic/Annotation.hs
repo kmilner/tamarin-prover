@@ -14,7 +14,7 @@ module Sapic.Annotation
   , AnnotatedSapicException
   , annLock
   , annSecretChannel
-  , annDestructorEquation
+  , LetStage(..)
   , annUnlock
   , toAnProcess
   , toProcess
@@ -26,6 +26,8 @@ module Sapic.Annotation
   , annElse
   ) where
 
+import Data.List.NonEmpty (NonEmpty)
+import Data.Set (Set)
 import Data.Binary
 import Data.Data
 import GHC.Generics (Generic)
@@ -43,6 +45,11 @@ newtype AnVar v = AnVar v
 instance Semigroup (AnVar v) where  -- override annotations if necessary
     (<>) _ b = b
 
+-- | One strict evaluation/matching step. Only result bindings survive to the
+-- next step; variables local to equation alternatives never enter the state.
+data LetStage = LetStage LNTerm (NonEmpty LNTerm) (Set LVar)
+    deriving (Show, Typeable)
+
 -- | Annotations used in the translation
 -- Reuses ProcessParsedAnnotation
 data ProcessAnnotation v = ProcessAnnotation
@@ -51,7 +58,7 @@ data ProcessAnnotation v = ProcessAnnotation
   , lock          :: Maybe (AnVar v)   -- Fresh variables annotating locking action and unlocking actions.
   , unlock        :: Maybe (AnVar v)   -- Matching actions should have the same variables.
   , secretChannel :: Maybe (AnVar v)   -- If a channel is secret, we can perform a silent transition.
-  , destructorEquations :: [(LNTerm, LNTerm)] -- matching alternatives for a destructor let; empty for an ordinary let.
+  , letPlan :: [LetStage] -- ordered internal stages, sharing the source continuations.
   , elseBranch         :: Bool --- do we have a non-zero else branch? Used for let translation
   , pureState :: Bool -- anotates locks, inserts and lookup that correspond to a Pure state, so that they are optimized.
                       -- A pure state corresponds to a process of form `insert k,v` or `lock k; lookup k; .. ; insert k,v; unlock k` or similar (see States.hs)
@@ -79,7 +86,7 @@ instance Semigroup (ProcessAnnotation v) where
         (p1.lock <> p2.lock)
         (p1.unlock <> p2.unlock)
         (p1.secretChannel <> p2.secretChannel)
-        (if null p1.destructorEquations then p2.destructorEquations else p1.destructorEquations)
+        (if null p1.letPlan then p2.letPlan else p1.letPlan)
         p2.elseBranch
         (p1.pureState || p2.pureState)
         (p1.stateChannel <> p2.stateChannel)
@@ -125,10 +132,6 @@ annUnlock v = mempty {unlock = Just v}
 
 annSecretChannel :: AnVar v -> ProcessAnnotation v
 annSecretChannel v = mempty { secretChannel = Just v}
-
-annDestructorEquation :: [(LNTerm, LNTerm)] -> Bool -> ProcessAnnotation v
-annDestructorEquation equations b =
-    mempty { destructorEquations = equations, elseBranch = b }
 
 annElse ::  Bool -> ProcessAnnotation v
 annElse b = mempty {elseBranch = b}

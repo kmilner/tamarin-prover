@@ -31,6 +31,8 @@ module Sapic.Basetranslation (
    , TransFComb
 ) where
 
+import qualified Data.List.NonEmpty as NE
+
 import Control.Exception
 import Control.Monad.Catch
 import Data.Set hiding (map, (\\))
@@ -249,38 +251,44 @@ baseTransComb c an p tildex
                      , tildex, Just tildex )
                 else
                     throw $ WFUnbound (vars_f `difference` tildex)
-    | Let t1' t2' _ <- c,  -- match vars are ignored in the translation, as they are bound in the def_state
-      elsBranch <- an.elseBranch
-      =
-        let t1or = toLNTerm t1' in
-        let (inputTerm, equations) =
-              case an.destructorEquations of
-                [] -> (toLNTerm t2', [(t1or, toLNTerm t2', freeset t1or `difference` tildex)])
-                eqs@((_, input):_) ->
-                  (input, [(t1, t2, freeset t1 `difference` tildex) | (t1, t2) <- eqs])
-        in
-        let failureFormula (t1, t2, freeVars) =
-              let fa = Conn Imp
-                         (Ato (EqE (fmapTerm (fmap Free) t1)
-                                   (fmapTerm (fmap Free) t2)))
-                         (TF False)
-              in fold (hinted forAll) fa freeVars
-        in
-        let tildexl =  freeset t1or `union` tildex in
-        let pos = p++[1] in
-        let startRule = ([def_state], [], [FLet pos inputTerm tildex], []) in
-        let successRules =
-              [ ([FLet pos t1 tildex], [], [def_state1 tildexl], [])
-              | (t1, _, _) <- equations
-              ] in
-        if elsBranch then
-          (startRule : successRules ++
-              [([FLet pos inputTerm tildex], [],
-                [def_state2 tildex], map failureFormula equations)],
-            tildexl, Just tildex)
-        else
-          (startRule : successRules,
-            tildexl, Nothing)
+    | Let lhs rhs _ <- c =
+        let resultVars = freeset (toLNTerm lhs) `union` tildex
+            stages = case an.letPlan of
+              [] -> [LetStage (toLNTerm rhs) (toLNTerm lhs NE.:| []) resultVars]
+              plan -> plan
+            -- The one-stage case keeps the original fact name. Internal
+            -- positions contain 0, which source process positions never use.
+            stagePos i = if i == 0 then p++[1] else p++[0,i]
+            -- Backwards liveness removes only generated stage results. Caller
+            -- variables survive every boundary, including failure/progress.
+            -- Keep the current input live too: failure restrictions refer to it.
+            liveBefore (LetStage input patterns bound) liveAfter =
+              freeset input `union`
+                ((unions (map freeset (NE.toList patterns)) `union` liveAfter)
+                  `difference` bound)
+            liveSets = scanr liveBefore resultVars stages
+            liveStages = zip stages (tail liveSets)
+            emit _ _ [] = []
+            emit i vars ((LetStage input patterns bound, liveAfter) : rest) =
+              let nextVars = tildex `union` ((vars `union` bound) `intersection` liveAfter)
+                  destination = case rest of
+                    [] -> def_state1 resultVars
+                    (LetStage nextInput _ _, _) : _ -> FLet (stagePos (i+1)) nextInput nextVars
+                  failureFormula patternTerm =
+                    fold (hinted forAll)
+                      (Conn Imp (Ato (EqE (fmapTerm (fmap Free) patternTerm)
+                                         (fmapTerm (fmap Free) input))) (TF False))
+                      (freeset patternTerm `difference` vars)
+                  successes = [([FLet (stagePos i) patternTerm vars], [], [destination], [])
+                              | patternTerm <- NE.toList patterns]
+                  failures = [([FLet (stagePos i) input vars], [], [def_state2 tildex],
+                               map failureFormula $ NE.toList patterns) | an.elseBranch]
+              in successes ++ failures ++ emit (i+1) nextVars rest
+            start = case stages of
+              LetStage input _ _ : _ -> [([def_state], [], [FLet (stagePos 0) input tildex], [])]
+              [] -> []
+        in (start ++ emit 0 tildex liveStages, resultVars,
+            if an.elseBranch then Just tildex else Nothing)
 
     -- Pure cell translation
     | Lookup t' v' <- c,  True <- an.pureState,  (Just (AnVar vs)) <- an.unlock,
