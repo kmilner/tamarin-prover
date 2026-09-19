@@ -255,8 +255,8 @@ renameUnique' ::
   Subst Name LVar -> Process ann SapicLVar -> m (Process ann SapicLVar)
 renameUnique' initSubst p = do
         -- Apply the accumulated renaming only at this node. As in the eager
-        -- traversal, null annotations are untouched and new binder renamings
-        -- affect whole actions/combinators and both combinator children.
+        -- traversal, null annotations are untouched. Newly allocated names
+        -- affect only the binding region and its scoped continuation.
         case p of
             ProcessNull _ -> return p
             ProcessAction ac0 ann0 pl -> do
@@ -264,7 +264,7 @@ renameUnique' initSubst p = do
                     ann = apply initSubst ann0
                 (subst,inv) <- mkSubst $ bindingsAct ann ac
                 let ann' = mappendProcessParsedAnnotation (mempty {backSubstitution = inv}) ann
-                let ac' = apply subst ac -- use apply instead of applyM because we want to ignore capturing, i.e., rename bound names...
+                let ac' = renameActionBinders subst ac
                 pl' <- renameUnique' (subst `compose` initSubst) pl
                 return $ ProcessAction ac' ann' pl'
             ProcessComb comb0 ann0 pl pr -> do
@@ -272,9 +272,9 @@ renameUnique' initSubst p = do
                     ann = apply initSubst ann0
                 (subst,inv) <- mkSubst $ bindingsComb ann comb
                 let ann' = mappendProcessParsedAnnotation (mempty {backSubstitution = inv}) ann
-                let comb' = apply subst comb
+                let comb' = renameCombinatorBinders subst comb
                 pl' <- renameUnique' (subst `compose` initSubst) pl
-                pr' <- renameUnique' (subst `compose` initSubst) pr
+                pr' <- renameUnique' initSubst pr
                 return $ ProcessComb comb' ann' pl' pr'
     where
         substFromVarList = substFromList . map (second varTerm)

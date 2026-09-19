@@ -117,3 +117,36 @@ for construct in input msr; do
   fi
   grep -Fq 'Invalid pattern' "$tmp_dir/collision.log" || { cat "$tmp_dir/collision.log" >&2; exit 1; }
 done
+
+# A binder must not make an otherwise unbound channel, lookup key, let RHS,
+# or failure continuation well formed during uniqueness renaming. Check both
+# exports: typed source runs the same binding/typing pipeline as translation.
+for process in \
+  'in(x,x); out(x)' \
+  'lookup x as x in out(x)' \
+  "lookup 'key' as x in out(x) else out(x)" \
+  'let x = x in out(x)' \
+  "let x = 'ok' in out(x) else out(x)"; do
+  printf 'theory BinderScope\nbegin\nprocess: %s\nend\n' "$process" >"$tmp_dir/scope.spthy"
+  for mode in spthytyped msr; do
+    if "$tamarin" "$tmp_dir/scope.spthy" --output-module="$mode" --quit-on-warning -d=0 >"$tmp_dir/scope.log" 2>&1; then
+      echo "accepted out-of-scope occurrence: $process ($mode)" >&2
+      exit 1
+    fi
+    grep -Fq 'not bound' "$tmp_dir/scope.log" || { cat "$tmp_dir/scope.log" >&2; exit 1; }
+  done
+done
+
+# Independent success/failure binders may reuse a spelling and have different
+# types. Matching occurrences remain references to the outer typed variable.
+for process in \
+  'in(y); let x:alpha = y in out(x) else in(x:beta); out(x)' \
+  "in(y); lookup 'key' as x in out(<x,y>) else in(x); out(<x,y>)" \
+  "in(y:alpha); let <x,=y> = <'ok',y> in out(<x,y>) else in(x); out(<x,y>)" \
+  "in(y:alpha); in(<x,=y>); out(<x,y>)"; do
+  printf 'theory IndependentBinders\nbegin\nprocess: %s\nend\n' "$process" >"$tmp_dir/scoped.spthy"
+  for mode in spthytyped msr; do
+    "$tamarin" "$tmp_dir/scoped.spthy" --output-module="$mode" --quit-on-warning -d=0 >"$tmp_dir/scoped.log" 2>&1
+  done
+done
+echo 'SAPIC uniqueness renaming preserves binder scope and independent branch types.'

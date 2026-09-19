@@ -39,6 +39,8 @@ module Theory.Sapic.Process (
     , actionBinderDeclarations
     , combinatorBinderDeclarations
     , combinatorBinders
+    , renameActionBinders
+    , renameCombinatorBinders
     , applyProcessSubstAvoiding
     , processAddAnnotation
     , varsProc
@@ -425,6 +427,22 @@ actionBinders = uniqueBinderIdentities . actionBinderDeclarations
 combinatorBinders :: ProcessCombinator SapicLVar -> [SapicLVar]
 combinatorBinders = uniqueBinderIdentities . combinatorBinderDeclarations
 
+-- | Apply a variable renaming only within an action's binding region.
+-- The substitution maps only binder identities to fresh variables; matching
+-- variables are references and are therefore left alone.
+-- The caller carries the same renaming into the action continuation.
+renameActionBinders :: Subst Name LVar -> SapicAction SapicLVar -> SapicAction SapicLVar
+renameActionBinders ren (ChIn channel t matches) = ChIn channel (apply ren t) matches
+renameActionBinders ren ac = apply ren ac
+
+-- | Rename the local binding region of a combinator. Keys and right-hand
+-- sides are evaluated before the binding. The caller carries the renaming
+-- into the left continuation only, retaining its old environment on the right.
+renameCombinatorBinders :: Subst Name LVar -> ProcessCombinator SapicLVar -> ProcessCombinator SapicLVar
+renameCombinatorBinders ren (Lookup key v) = Lookup key (apply ren v)
+renameCombinatorBinders ren (Let t rhs matches) = Let (apply ren t) rhs matches
+renameCombinatorBinders _ comb = comb
+
 -- | Preserve every annotation variant until typing has merged its constraints.
 -- Scope consumers instead use the identity projections above.
 actionBinderDeclarations :: SapicAction SapicLVar -> [SapicLVar]
@@ -482,10 +500,7 @@ applyProcessSubstAvoiding reserved subst proc =
             ann0 = applyAnn env ann
             bound = map toLVar $ actionBinders ac0
         ren <- freshening used ann0 bound
-        let ac1 = case ac0 of
-              -- The channel is evaluated outside the input binder's scope.
-              ChIn channel t matches -> ChIn channel (apply ren t) matches
-              _ -> apply ren ac0
+        let ac1 = renameActionBinders ren ac0
         ac' <- applyM subst ac1
         ann' <- applyM subst (markGenerated ren ann0)
         rest' <- go (Set.union (fromList $ map toLVar $ F.toList ac') used) (ren `compose` env) rest
@@ -495,10 +510,7 @@ applyProcessSubstAvoiding reserved subst proc =
             ann0 = applyAnn env ann
             bound = map toLVar $ combinatorBinders comb0
         ren <- freshening used ann0 bound
-        let comb1 = case comb0 of
-              Lookup t v -> Lookup t (apply ren v)
-              Let t rhs matches -> Let (apply ren t) rhs matches
-              _ -> comb0
+        let comb1 = renameCombinatorBinders ren comb0
         comb' <- applyM subst comb1
         ann' <- applyM subst (markGenerated ren ann0)
         left' <- go (Set.union (fromList $ map toLVar $ F.toList comb') used) (ren `compose` env) left
