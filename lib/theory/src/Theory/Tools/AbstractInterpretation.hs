@@ -25,6 +25,7 @@ import           Control.Basics
 import           Control.Monad.Bind
 import           Control.Monad.Reader
 
+import           Data.Function        (on)
 import           Data.Label
 import           Data.List
 import qualified Data.Set             as S
@@ -109,7 +110,10 @@ partialEvaluation evalStyle rules = reader $ \hnd ->
       where
         go _ st rus [] =
           ( st
-          , nubBy eqModuloFreshnessNoAC $                 -- remove duplicates
+          , map fst $ nubBy ((==) `on` snd) $
+            -- Share one comparison key per candidate; retain original hints
+            -- and the first representative. Equality comparisons remain quadratic.
+            map (\ru -> (ru, canonicalizeFreshnessNoAC ru)) $
             map ((`evalFresh` nothingUsed) . rename) rus
           )
         go i st _   ((st', rus') : rest) =
