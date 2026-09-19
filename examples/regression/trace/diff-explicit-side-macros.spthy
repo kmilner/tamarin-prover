@@ -1,0 +1,11 @@
+theory ExplicitSideMacros begin
+
+macros: m(x) = x
+
+rule Emit: [] --[Emitted(m('a'))]-> [Out(m('a'))]
+left rule Emit: [] --[Emitted(m('a'))]-> [Out(m('a'))]
+right rule Emit: [] --[Emitted(m('a'))]-> [Out(m('a'))]
+
+lemma emitted: exists-trace "Ex #i. Emitted('a')@i"
+diffLemma Observational_equivalence:
+end

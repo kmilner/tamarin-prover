@@ -496,7 +496,7 @@ DIFF_REGRESSION_CASE_STUDIES+=diff-joint-conditional-attack.spthy diff-joint-con
 DIFF_REGRESSION_CASE_STUDIES+=diff-multisession-observable-restriction.spthy diff-explicit-variant-export.spthy diff-asymmetric-explicit-variants.spthy diff-singleton-trivial-variants.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-variant-family-roundtrip.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-auto-source-variable-alignment.spthy
-DIFF_REGRESSION_CASE_STUDIES+=diff-empty-left-family.spthy diff-empty-right-family.spthy diff-empty-both-families.spthy
+DIFF_REGRESSION_CASE_STUDIES+=diff-empty-left-family.spthy diff-empty-right-family.spthy diff-empty-both-families.spthy diff-explicit-side-macros.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-unrelated-empty-left.spthy diff-unrelated-empty-right.spthy diff-unrelated-empty-both.spthy
 FAST_REGRESSION_CASE_STUDIES+=$(COMMON_REGRESSION_CASE_STUDIES)
 FAST_REGRESSION_TARGETS=$(subst .spthy,_analyzed.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(FAST_REGRESSION_CASE_STUDIES)))
@@ -518,6 +518,7 @@ case-studies$(SUBDIR)regression/trace/diff-explicit-variant-export_analyzed-diff
 case-studies$(SUBDIR)regression/trace/diff-singleton-trivial-variants_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--quit-on-warning
 case-studies$(SUBDIR)regression/trace/diff-variant-family-roundtrip_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--quit-on-warning
 case-studies$(SUBDIR)regression/trace/diff-auto-source-variable-alignment_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--auto-sources --bound=6 --quit-on-warning
+case-studies$(SUBDIR)regression/trace/diff-explicit-side-macros_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--quit-on-warning
 
 case-studies$(SUBDIR)regression/trace/soundness-partial-evaluation-variants_analyzed.spthy: TRACE_EXTRA_ARGS=--partial-evaluation=summary
 case-studies$(SUBDIR)regression/trace/partial-evaluation-export_analyzed.spthy: TRACE_EXTRA_ARGS=--partial-evaluation=summary

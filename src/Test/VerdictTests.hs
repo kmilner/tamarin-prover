@@ -37,6 +37,7 @@ tests maudePath = TestList <$> sequence
     , roundTripTests maudePath
     , diffFamilyLifecycleTests maudePath
     , emptyDiffFamilyTests maudePath
+    , detachedDiffFamilyTests maudePath
     , autoSourceFamilyTests maudePath
     , pure diffVariableAlignmentTests
     , assumptionTests maudePath
@@ -137,6 +138,11 @@ roundTripTests :: FilePath -> IO Test
 roundTripTests maudePath = do
     let models =
           [ ["rule Emit: [] --[ A(diff('a','b')) ]-> [Out('hello')]"]
+          , [ "macros: m(x) = x"
+            , "rule Emit: [] --> [Out(m('a'))]"
+            , "left rule Emit: [] --> [Out(m('a'))]"
+            , "right rule Emit: [] --> [Out(m('a'))]"
+            ]
           , [ "builtins: symmetric-encryption"
             , "macros: m(x) = x"
             , "rule Dec: [ Fr(~n), In(x), In(k) ] --[ A(m(~n)) ]-> [ Out(sdec(x,k)), Out(diff(m(~n),k)) ]"
@@ -305,6 +311,55 @@ emptyDiffFamilyTests maudePath = TestList <$> mapM makeCase
               sys = L.set sNodes (M.singleton node inst) $ emptySystem RawSource True
           assertEqual "no mirror graph" [] (getMirrorDG ctxt side sys))
           (diffTheorySideRules side thy)) liveSides
+
+detachedDiffFamilyTests :: FilePath -> IO Test
+detachedDiffFamilyTests maudePath = do
+    parsed <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+      [ "theory DetachedFamilies begin", "builtins: symmetric-encryption"
+      , "macros: m(x) = x"
+      , "rule R[color=#123456]: [In(x),In(k)] --> [Out(m(sdec(x,k))),Out(diff($p,<$p,$q>))]"
+      , "diffLemma D:", "end" ]
+    computed <- closeDiffTheory maudePath parsed False
+    let sig = L.get diffThySignature computed
+        parent = head (diffTheoryDiffRules parsed)
+        annotate side (OpenProtoRule ruE members) = OpenProtoRule ruE
+          [addAction (addAction ru (protoFact Linear (if side == LHS then "LeftExtra" else "RightExtra") []))
+                     (protoFact Linear "DiffProtoR" []) | ru <- members]
+        reopened = head (diffTheoryDiffRules (openDiffTheory computed))
+        (left, right) = fromJust (L.get dprLeftRight reopened)
+        owned = (annotate LHS left, annotate RHS right)
+        canonical = L.modify diffThyItems (map (\item -> case item of
+          DiffRuleItem _ -> DiffRuleItem (L.set dprLeftRight (Just owned) parent)
+          _ -> item)) parsed
+        expected = closeDiffTheoryWithMaude sig canonical False
+        rules t = (sort (leftTheoryRules t), sort (rightTheoryRules t))
+        caches t = [L.get label t | label <-
+          [diffThyCacheLeft,diffThyCacheRight,diffThyDiffCacheLeft,diffThyDiffCacheRight]]
+        makeCase sides split labelled = TestLabel (show (sides, split, labelled)) $ TestCase $ do
+          let stale side ru = if side `elem` sides then L.set oprRuleAC [] ru else ru
+              staleParent = L.set dprLeftRight (Just (stale LHS (fst owned), stale RHS (snd owned))) parent
+              detached side ru = [EitherRuleItem (side, if labelled then addProtoRuleLabel family else family)
+                | family <- if split then [OpenProtoRule (L.get oprRuleE ru) [r] | r <- L.get oprRuleAC ru] else [ru]]
+              legacy = L.modify diffThyItems (\items ->
+                map (\item -> case item of DiffRuleItem _ -> DiffRuleItem staleParent; _ -> item) items
+                ++ concat [detached side ru | (side, ru) <- [(LHS, fst owned), (RHS, snd owned)], side `elem` sides]) parsed
+              normalized = normalizeOpenDiffTheory legacy
+              actual = closeDiffTheoryWithMaude sig legacy False
+              warnings = checkWellformednessDiff legacy sig
+          assertBool (render (prettyWfErrorReport warnings)) (null warnings)
+          assertEqual "normalization is idempotent" normalized (normalizeOpenDiffTheory normalized)
+          assertEqual "detached member order matches owned declarations"
+            (diffTheoryDiffRules (normalizeOpenDiffTheory canonical))
+            (diffTheoryDiffRules normalized)
+          assertBool "normalized families have one owner" $
+            null [() | EitherRuleItem _ <- L.get diffThyItems normalized]
+          assertEqual "detached precedence, substitutions, attributes, slots and actions" (rules expected) (rules actual)
+          assertEqual "all four caches" (caches expected) (caches actual)
+          assertEqual "reopening preserves adapted families" (rules actual)
+            (rules (closeDiffTheoryWithMaude sig (openDiffTheory actual) False))
+    pure $ TestLabel "Legacy detached diff families" $ TestList
+      [makeCase sides split labelled | sides <- [[LHS], [RHS], [LHS,RHS]],
+                                      split <- [False,True], labelled <- [False,True]]
 
 autoSourceFamilyTests :: FilePath -> IO Test
 autoSourceFamilyTests maudePath = do

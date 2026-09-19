@@ -322,7 +322,63 @@ closeEitherProtoRule hnd (s, rule) =
   where
     (prepared, _, _) = prepareDiffRule hnd rule
 
--- | Apply macro to a diff protocol rule.
+-- | Group side members in declaration order for both the public compatibility
+-- adapter and compiled-family reconstruction.
+orderedSideFamilies :: Ord name
+    => (rule -> name) -> [DiffTheoryItem diffRule rule p p2]
+    -> M.Map (Side, name) [rule]
+orderedSideFamilies name items = foldr insert M.empty items
+  where
+    insert (EitherRuleItem (side, ru)) = M.insertWith (++) (side, name ru) [ru]
+    insert _ = id
+
+-- | Adapt public detached side declarations to parent-owned families before
+-- normalization. Detached declarations override owned sides, retaining member
+-- order and metadata; unattached declarations keep the legacy closing path.
+adaptDetachedDiffFamilies :: OpenDiffTheory -> OpenDiffTheory
+adaptDetachedDiffFamilies thy = L.set diffThyItems (concatMap adapt items) thy
+  where
+    items = L.get diffThyItems thy
+    families = orderedSideFamilies ruleName items
+    parents = S.fromList [ruleName ru | DiffRuleItem ru <- items]
+    detached side declaration =
+      case M.findWithDefault [] (side, ruleName declaration) families of
+        [] -> declaration
+        rules@(OpenProtoRule ruE _ : _)
+          | all ((== ruE) . L.get oprRuleE) rules ->
+              stripLegacyLabel (OpenProtoRule ruE (concatMap (L.get oprRuleAC) rules))
+          | otherwise -> error $ "Inconsistent detached E-rules in diff family " ++ getRuleName ruE
+    -- Detached rules were already labelled by the old open/close pipeline.
+    -- Remove its final generated label before the common closing path adds
+    -- it again; any preceding identically named user actions remain intact.
+    stripLegacyLabel family@(OpenProtoRule ruE variants)
+      | protoFact Linear label [] `elem` L.get rActs ruE =
+          OpenProtoRule (strip ruE) (map strip variants)
+      | otherwise = family
+      where
+        label = "DiffProto" ++ getRuleName ruE
+        strip = removeGeneratedDiffLabel label
+    adapt (DiffRuleItem ru@(DiffProtoRule parent sides)) =
+      let left = detached LHS (getLeftProtoRule ru)
+          right = detached RHS (getRightProtoRule ru)
+          owned | sides == Nothing && left == getLeftProtoRule ru && right == getRightProtoRule ru = Nothing
+                | otherwise = Just (left, right)
+      in [DiffRuleItem (DiffProtoRule parent owned)]
+    adapt item@(EitherRuleItem (_, ru))
+      | ruleName ru `S.member` parents = []
+      | otherwise = [item]
+    adapt item = [item]
+
+-- | Validation and closing share the parent-owned normalization boundary.
+normalizeOpenDiffTheory :: OpenDiffTheory -> OpenDiffTheory
+normalizeOpenDiffTheory thy = L.modify diffThyItems
+    (map (mapDiffTheoryItem (applyMacroInDiffProtoRule macros)
+                           (fmap (applyMacroInProtoRule macros)) id id))
+    (adaptDetachedDiffFamilies thy)
+  where
+    macros = diffTheoryMacros thy
+
+-- | Expand macros and align side declarations to the parent's new-variable slots.
 applyMacroInDiffProtoRule :: [LNMacro]-> DiffProtoRule -> DiffProtoRule
 applyMacroInDiffProtoRule mcs (DiffProtoRule ruE sides) =
     DiffProtoRule expanded (applySides <$> sides)
@@ -452,9 +508,7 @@ reconstructDiffRuleFamilies reopen items
   | otherwise = concatMap reconstruct items
   where
     parents = S.fromList [ruleName ru | DiffRuleItem ru <- items]
-    families = M.fromListWith (flip (++))
-      [ ((side, ruleName (L.get cprRuleE ru)), [ru])
-      | EitherRuleItem (side, ru) <- items ]
+    families = orderedSideFamilies (ruleName . L.get cprRuleE) items
     sideFamily :: Side -> OpenProtoRule -> OpenProtoRule
     sideFamily side declaration@(OpenProtoRule parent _) = case M.lookup (side, ruleName parent) families of
       -- Compilation can discard every variant of an unreachable rule, for

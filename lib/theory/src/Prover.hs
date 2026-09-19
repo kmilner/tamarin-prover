@@ -91,38 +91,24 @@ closeDiffTheoryWithMaude sig thy0 autoSources =
 
     checkProofM = checkAndExtendProver (sorryProver Nothing)
     checkDiffProof = checkAndExtendDiffProver (sorryDiffProver Nothing)
-    diffRules  = map (applyMacroInDiffProtoRule (diffTheoryMacros thy0)) $ diffTheoryDiffRules thy0
-    leftOpenRules  = map (addProtoRuleLabel . getLeftProtoRule)  diffRules
-    rightOpenRules = map (addProtoRuleLabel . getRightProtoRule) diffRules
-
     -- Maude / Signature handle
     hnd = L.get sigmMaudeHandle sig
 
-    theoryItems = map expandRuleItem (L.get diffThyItems thy0)
-               ++ missingSideRules LHS leftOpenRules
-               ++ missingSideRules RHS rightOpenRules
-    -- Also accept detached side rules from existing callers. These take
-    -- precedence over declarations; canonical reopening stores its current
-    -- families directly in the DiffRuleItems instead.
-    missingSideRules side rules =
-      [ EitherRuleItem (side, ru)
-      | ru <- rules
-      , not $ any (sameSideRule side ru) (L.get diffThyItems thy0)
-      ]
-    sameSideRule side ru (EitherRuleItem (side', ru')) =
-      side == side' && getOpenProtoRuleName ru == getOpenProtoRuleName ru'
-    sameSideRule _ _ _ = False
-    expandRuleItem (DiffRuleItem ru) =
-      DiffRuleItem (applyMacroInDiffProtoRule (diffTheoryMacros thy0) ru)
-    expandRuleItem (EitherRuleItem (side, ru)) =
-      EitherRuleItem (side, applyMacroInProtoRule (diffTheoryMacros thy0) ru)
-    expandRuleItem item = item
+    theoryItems = L.get diffThyItems (normalizeOpenDiffTheory thy0)
     -- Close all theory items: in parallel (especially useful for variants)
     --
     -- NOTE that 'rdeepseq' is OK here, as the proof has not yet been checked
     -- and therefore no constraint systems will be unnecessarily cached.
     (items, _solveRel, _breakers) = (`runReader` hnd) $ addSolvingLoopBreakers $ unfoldClosedRules
-       ((closeDiffTheoryItem <$> theoryItems) `using` parList rdeepseq)
+       (concat ((closeFamily <$> theoryItems) `using` parList rdeepseq))
+
+    -- Each normalized parent owns its two authoritative side declarations.
+    -- Only the closed representation needs separate compiled side members.
+    closeFamily (DiffRuleItem ru) =
+      DiffRuleItem ru :
+      [ EitherRuleItem (closeEitherProtoRule hnd (side, addProtoRuleLabel (project ru)))
+      | (side, project) <- [(LHS, getLeftProtoRule), (RHS, getRightProtoRule)] ]
+    closeFamily item = [closeDiffTheoryItem item]
 
     closeDiffTheoryItem :: DiffTheoryItem DiffProtoRule OpenProtoRule DiffProofSkeleton ProofSkeleton -> DiffTheoryItem DiffProtoRule [ClosedProtoRule] IncrementalDiffProof IncrementalProof
     closeDiffTheoryItem = foldDiffTheoryItem

@@ -645,8 +645,8 @@ addOpenProtoDiffRule ru@(DiffProtoRule _ (Just (lr, rr))) thy = do
     nameNotUsedForDifferentRule =
       maybe True (ru ==) $ lookupOpenDiffProtoDiffRule (L.get (preName . rInfo . dprRule) ru) thy
     validVariantNames (OpenProtoRule ruE ruAC) =
-      -- Partial evaluation groups refinements under the original family name
-      -- for diff mirroring. Other explicitly named variants must be distinct.
+      -- Imported and canonical compiled families may retain the parent name
+      -- on multiple annotated members. Other explicit names must be distinct.
       all ((== ruleName ruE) . ruleName) ruAC ||
       S.size (S.fromList (ruleName ruE : map ruleName ruAC)) == length ruAC + 1
     leftAndRightHaveSameName = ruleName ru == ruleName lr && ruleName lr == ruleName rr

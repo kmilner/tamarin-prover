@@ -71,7 +71,7 @@ module Theory.Tools.Wellformedness (
   ) where
 
 import Rule
-import ClosedTheory (applyMacroInDiffProtoRule)
+import ClosedTheory (normalizeOpenDiffTheory)
 
 import           Prelude                     hiding (id, (.))
 
@@ -136,7 +136,7 @@ thyProtoRules thy = [ applyMacroInRule (theoryMacros thy) (get oprRuleE ru) | Ru
 -- | All protocol rules of a theory.
 -- thyProtoRules :: OpenTranslatedTheory ->
 diffThyProtoRules :: OpenDiffTheory -> [ProtoRuleE]
-diffThyProtoRules thy = [ applyMacroInRule (diffTheoryMacros thy) (get dprRule ru) | DiffRuleItem ru <- get diffThyItems thy ]
+diffThyProtoRules thy = [ get dprRule ru | DiffRuleItem ru <- get diffThyItems thy ]
 
 -- | Lower-case a string.
 lowerCase :: String -> String
@@ -384,7 +384,7 @@ ruleVariantsReport sig thy = do
 -- | Report on missing or different variants in case of diff rules.
 ruleVariantsReportDiff :: SignatureWithMaude -> OpenDiffTheory -> WfErrorReport
 ruleVariantsReportDiff sig thy = do
-    lrRu <- [ get dprLeftRight (applyMacroInDiffProtoRule (diffTheoryMacros thy) ru)
+    lrRu <- [ get dprLeftRight ru
             | DiffRuleItem ru <- get diffThyItems thy ]
     case lrRu of
       Just (lr, rr) -> (check ("Left rule " ++ quote (showRuleCaseName (get oprRuleE lr)) ++
@@ -403,13 +403,13 @@ leftRightRuleReportDiff :: OpenDiffTheory -> WfErrorReport
 leftRightRuleReportDiff thy = do
     ru <- [ ru | DiffRuleItem ru <- get diffThyItems thy ]
     case get dprLeftRight ru of
-      Just ((OpenProtoRule lr _), _) | not (equalUpToAddedActions lr (getLeftRule (applyMacroInRule (diffTheoryMacros thy) (get dprRule ru)))) -> return $
+      Just ((OpenProtoRule lr _), _) | not (equalUpToAddedActions lr (getLeftRule (get dprRule ru))) -> return $
               ( (underlineTopic "Left rule")
               , text "Inconsistent left rule" $-$ (nest 2 $ prettyProtoRuleE lr)
                 $--$ text "w.r.t." $--$
                 (nest 2 $ prettyProtoRuleE (get dprRule ru))
               )
-      Just (_, (OpenProtoRule rr _)) | not (equalUpToAddedActions rr (getRightRule (applyMacroInRule (diffTheoryMacros thy) (get dprRule ru)))) -> return $
+      Just (_, (OpenProtoRule rr _)) | not (equalUpToAddedActions rr (getRightRule (get dprRule ru))) -> return $
               ( (underlineTopic "Right rule")
               , text "Inconsistent right rule" $-$ (nest 2 $ prettyProtoRuleE rr)
                 $--$ text "w.r.t." $--$
@@ -1255,7 +1255,7 @@ checkDiffEquationsSubtermConvergence thy
 -- | Returns a list of errors, if there are any.
 checkWellformednessDiff :: OpenDiffTheory -> SignatureWithMaude
                     -> WfErrorReport
-checkWellformednessDiff thy sig = -- trace ("checkWellformednessDiff: " ++ show thy) $
+checkWellformednessDiff thy0 sig =
   concatMap ($ thy)
     [ checkIfLemmasInDiffTheory
     , unboundReportDiff
@@ -1271,6 +1271,8 @@ checkWellformednessDiff thy sig = -- trace ("checkWellformednessDiff: " ++ show 
     , multRestrictedReportDiff
     , natWellSortedReportDiff
     ] ++ (if not (isUserMarkedConvergentDiff thy) then checkDiffEquationsSubtermConvergence thy else [])
+  where
+    thy = normalizeOpenDiffTheory thy0
 
 -- | Returns a list of errors, if there are any. `incompleteMSR`, if true, indicates
 -- that the MSRs are incomplete (e.g., when we export to ProVerif) and that
