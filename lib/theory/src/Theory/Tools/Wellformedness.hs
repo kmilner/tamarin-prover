@@ -62,6 +62,7 @@ module Theory.Tools.Wellformedness (
     WfErrorReport
   , checkWellformedness
   , checkWellformednessDiff
+  , checkPreparedWellformednessDiff
 
   , prettyWfErrorReport
   , underlineTopic
@@ -71,7 +72,7 @@ module Theory.Tools.Wellformedness (
   ) where
 
 import Rule
-import ClosedTheory (normalizeOpenDiffTheory)
+import PreparedDiffTheory
 
 import           Prelude                     hiding (id, (.))
 
@@ -381,24 +382,7 @@ ruleVariantsReport sig thy = do
   where
     hnd = get sigmMaudeHandle sig
 
--- | Report on missing or different variants in case of diff rules.
-ruleVariantsReportDiff :: SignatureWithMaude -> OpenDiffTheory -> WfErrorReport
-ruleVariantsReportDiff sig thy = do
-    lrRu <- [ get dprLeftRight ru
-            | DiffRuleItem ru <- get diffThyItems thy ]
-    case lrRu of
-      Just (lr, rr) -> (check ("Left rule " ++ quote (showRuleCaseName (get oprRuleE lr)) ++
-                     " cannot confirm manual variants:") lr) ++
-                      (check ("Right rule " ++ quote (showRuleCaseName (get oprRuleE rr)) ++
-                      " cannot confirm manual variants:") rr)
-      Nothing -> []
-  where
-    hnd = get sigmMaudeHandle sig
-    check info rule =
-      let (_, canonical, valid) = prepareDiffRule hnd rule
-      in variantsReport info rule canonical valid
-
--- | Report on inconsistent left/right rules. This does not check the variants (done by ruleVariantsReportDiff).
+-- | Report on inconsistent left/right rules. Variant coverage is checked by the prepared variant report.
 leftRightRuleReportDiff :: OpenDiffTheory -> WfErrorReport
 leftRightRuleReportDiff thy = do
     ru <- [ ru | DiffRuleItem ru <- get diffThyItems thy ]
@@ -1255,7 +1239,11 @@ checkDiffEquationsSubtermConvergence thy
 -- | Returns a list of errors, if there are any.
 checkWellformednessDiff :: OpenDiffTheory -> SignatureWithMaude
                     -> WfErrorReport
-checkWellformednessDiff thy0 sig =
+checkWellformednessDiff thy0 sig = checkPreparedWellformednessDiff (prepareDiffTheory sig thy0)
+
+-- | Consume the same family evidence that closing will use.
+checkPreparedWellformednessDiff :: PreparedDiffTheory -> WfErrorReport
+checkPreparedWellformednessDiff prepared =
   concatMap ($ thy)
     [ checkIfLemmasInDiffTheory
     , unboundReportDiff
@@ -1263,7 +1251,7 @@ checkWellformednessDiff thy0 sig =
     , publicNamesReportDiff
     , ruleSortsReportDiff
     , factReportsDiff
-    , ruleVariantsReportDiff sig
+    , const variantReport
     , leftRightRuleReportDiff
 --     , ruleNameReportDiff
     , formulaReportsDiff
@@ -1272,7 +1260,13 @@ checkWellformednessDiff thy0 sig =
     , natWellSortedReportDiff
     ] ++ (if not (isUserMarkedConvergentDiff thy) then checkDiffEquationsSubtermConvergence thy else [])
   where
-    thy = normalizeOpenDiffTheory thy0
+    thy = preparedDiffTheory prepared
+    variantReport = concat
+      [ variantsReport (sideName side ++ " rule " ++ quote (showRuleCaseName (get oprRuleE ru)) ++
+                        " cannot confirm manual variants:") ru canonical valid
+      | (side, ru, canonical, valid) <- preparedDiffVariantReports prepared ]
+    sideName LHS = "Left"
+    sideName RHS = "Right"
 
 -- | Returns a list of errors, if there are any. `incompleteMSR`, if true, indicates
 -- that the MSRs are incomplete (e.g., when we export to ProVerif) and that

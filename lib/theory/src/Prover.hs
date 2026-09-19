@@ -30,6 +30,7 @@ import           Theory.Tools.AbstractInterpretation
 import           Theory.Tools.LoopBreakers
 import           Theory.Tools.RuleVariants           (variantsProtoRule)
 import           Lemma
+import           PreparedDiffTheory
 import           ClosedTheory
 import           TheoryObject
 import           OpenTheory
@@ -71,7 +72,11 @@ closeDiffTheory maudePath thy0 autoSources = do
 -- | Close a diff theory given a maude signature. This signature must be valid for
 -- the given theory.
 closeDiffTheoryWithMaude :: SignatureWithMaude -> OpenDiffTheory -> Bool -> ClosedDiffTheory
-closeDiffTheoryWithMaude sig thy0 autoSources =
+closeDiffTheoryWithMaude sig thy0 = closePreparedDiffTheory (prepareDiffTheory sig thy0)
+
+-- | Close using the exact preparation consumed by wellformedness checking.
+closePreparedDiffTheory :: PreparedDiffTheory -> Bool -> ClosedDiffTheory
+closePreparedDiffTheory prepared autoSources =
   if autoSources && (containsPartialDeconstructions (cacheLeft items) || containsPartialDeconstructions (cacheRight items))
     then
       proveDiffTheory (const True) checkProofM checkDiffProof
@@ -81,6 +86,8 @@ closeDiffTheoryWithMaude sig thy0 autoSources =
         (DiffTheory (L.get diffThyName thy0) (L.get diffThyInFile thy0) h t sig (cacheLeft items) (cacheRight items) (diffCacheLeft items) (diffCacheRight items) items (L.get diffThyOptions thy0) (_diffThyIsSapic thy0))
 
   where
+    thy0 = preparedDiffTheory prepared
+    sig = preparedDiffSignature prepared
     parameters = Sources.IntegerParameters (L.get (openChainsLimit . diffThyOptions) thy0) (L.get (saturationLimit . diffThyOptions) thy0) True
     h              = L.get diffThyHeuristic thy0
     t              = L.get diffThyTactic thy0
@@ -94,26 +101,18 @@ closeDiffTheoryWithMaude sig thy0 autoSources =
     -- Maude / Signature handle
     hnd = L.get sigmMaudeHandle sig
 
-    theoryItems = L.get diffThyItems (normalizeOpenDiffTheory thy0)
+    theoryItems = preparedDiffItems prepared
     -- Close all theory items: in parallel (especially useful for variants)
     --
     -- NOTE that 'rdeepseq' is OK here, as the proof has not yet been checked
     -- and therefore no constraint systems will be unnecessarily cached.
     (items, _solveRel, _breakers) = (`runReader` hnd) $ addSolvingLoopBreakers $ unfoldClosedRules
-       (concat ((closeFamily <$> theoryItems) `using` parList rdeepseq))
+       ((closeDiffTheoryItem <$> theoryItems) `using` parList rdeepseq)
 
-    -- Each normalized parent owns its two authoritative side declarations.
-    -- Only the closed representation needs separate compiled side members.
-    closeFamily (DiffRuleItem ru) =
-      DiffRuleItem ru :
-      [ EitherRuleItem (closeEitherProtoRule hnd (side, addProtoRuleLabel (project ru)))
-      | (side, project) <- [(LHS, getLeftProtoRule), (RHS, getRightProtoRule)] ]
-    closeFamily item = [closeDiffTheoryItem item]
-
-    closeDiffTheoryItem :: DiffTheoryItem DiffProtoRule OpenProtoRule DiffProofSkeleton ProofSkeleton -> DiffTheoryItem DiffProtoRule [ClosedProtoRule] IncrementalDiffProof IncrementalProof
+    closeDiffTheoryItem :: DiffTheoryItem DiffProtoRule [ClosedProtoRule] DiffProofSkeleton ProofSkeleton -> DiffTheoryItem DiffProtoRule [ClosedProtoRule] IncrementalDiffProof IncrementalProof
     closeDiffTheoryItem = foldDiffTheoryItem
       DiffRuleItem
-      (EitherRuleItem . closeEitherProtoRule hnd)
+      EitherRuleItem
       (DiffLemmaItem . fmap skeletonToIncrementalDiffProof)
       (\(s, l) -> EitherLemmaItem
           (s, fmap skeletonToIncrementalProof $ applyMacroInLemma (diffTheoryMacros thy0) l))

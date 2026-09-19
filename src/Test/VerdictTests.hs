@@ -14,6 +14,7 @@ import Test.HUnit
 
 import ClosedTheory
 import Prover
+import PreparedDiffTheory
 import OpenTheory (prettyOpenDiffTheory, addIntrRuleLabels, getLeftProtoRule, getRightProtoRule,
                    addIntrRuleACsDiffBoth, addIntrRuleACsDiffBothDiff, addProtoRuleLabel, addDefaultDiffLemma)
 import Rule
@@ -24,7 +25,7 @@ import Theory.Text.Parser
 import Theory.Text.Pretty (render)
 import Theory.Tools.AbstractInterpretation (EvaluationStyle(Silent))
 import Theory.Tools.IntruderRules (subtermConstructorRules, specialIntruderRules, destructionRulesNoEq)
-import Theory.Tools.Wellformedness (checkWellformednessDiff, prettyWfErrorReport)
+import Theory.Tools.Wellformedness (checkWellformednessDiff, checkPreparedWellformednessDiff, prettyWfErrorReport)
 import TheoryObject
 
 -- Exercise the real mirror enumerator, including Maude AC unification and
@@ -39,6 +40,7 @@ tests maudePath = TestList <$> sequence
     , emptyDiffFamilyTests maudePath
     , detachedDiffFamilyTests maudePath
     , autoSourceFamilyTests maudePath
+    , sharedPreparationTests maudePath
     , pure diffVariableAlignmentTests
     , pure diffLemmaAttributeTests
     , assumptionTests maudePath
@@ -52,6 +54,8 @@ tests maudePath = TestList <$> sequence
     , partialEvaluationDiffTests maudePath
     ]
 
+-- Diff lemmas accept the same attribute grammar as trace lemmas. Preserve
+-- every accepted attribute through printing, including hidden assumptions.
 diffLemmaAttributeTests :: Test
 diffLemmaAttributeTests = TestLabel "Diff lemma attribute serialization" $ TestCase $ do
     original <- either (assertFailure . show) pure $ parseOpenDiffTheoryString [] $ unlines
@@ -102,6 +106,8 @@ mirrorTests maudePath = do
   where
     appendTests a b = TestList [a,b]
 
+-- The parent identity is shared across asymmetric variant families. Exercise
+-- both directions and ensure a similarly named, unrelated rule is excluded.
 explicitVariantMirrorTests :: FilePath -> IO Test
 explicitVariantMirrorTests maudePath = do
     cases <- sequence [makeCase swapped auto | swapped <- [False, True], auto <- [False, True]]
@@ -147,6 +153,8 @@ explicitVariantMirrorTests maudePath = do
             (sort (map actions (family (opposite side))))
             (sort (map actions (mirrored side ru)))) (family side)) [LHS, RHS]
 
+-- Closing an already compiled side must preserve its complete variant family,
+-- new-variable vectors, source assumptions, restrictions and proof skeletons.
 roundTripTests :: FilePath -> IO Test
 roundTripTests maudePath = do
     let models =
@@ -202,6 +210,9 @@ roundTripTests maudePath = do
             assertEqual "lemmas, restrictions and proof skeletons" (nonRules first) (nonRules t)
             assertEqual "all four rule/source caches" (caches first) (caches t)) [second,third]
 
+-- Exercise the family boundary across automatic/manual variants, cycles,
+-- normalization, asymmetric declarations and repeated opening/export. Compare
+-- rule metadata and all caches, not just whether the printer accepts a model.
 diffFamilyLifecycleTests :: FilePath -> IO Test
 diffFamilyLifecycleTests maudePath = do
     -- Each shape crosses all three boundaries once. Explicit members exercise
@@ -284,7 +295,17 @@ diffFamilyLifecycleTests maudePath = do
             assertBool (render (prettyWfErrorReport warnings)) (null warnings)
             pure $ closeDiffTheoryWithMaude sig open auto
       pure $ TestLabel (show (shape, cyclic, leftExplicit, rightExplicit, auto)) $ TestCase $ do
-        let warnings = checkWellformednessDiff input sig
+        let prepared = prepareDiffTheory sig input
+            warnings = checkWellformednessDiff input sig
+            normalized = preparedDiffTheory prepared
+            oldRules = [closeEitherProtoRule hnd (whichSide, addProtoRuleLabel (project ru))
+              | DiffRuleItem ru <- L.get diffThyItems normalized
+              , (whichSide, project) <- [(LHS, getLeftProtoRule), (RHS, getRightProtoRule)]]
+            sharedRules = [pair | EitherRuleItem pair <- preparedDiffItems prepared]
+        assertEqual "preparation commutes with generated labels; all metadata and order" oldRules sharedRules
+        assertEqual "shared preparation preserves the warning report"
+          (render (prettyWfErrorReport warnings))
+          (render (prettyWfErrorReport (checkPreparedWellformednessDiff prepared)))
         assertBool (render (prettyWfErrorReport warnings)) (null warnings)
         mapM_ (\s -> assertEqual "empty family only on the expected sides"
           (shape == "empty" || (shape == "left-empty" && s == LHS)
@@ -303,6 +324,9 @@ diffFamilyLifecycleTests maudePath = do
         check saved
         if repeated then reload (prettyOpenDiffTheory . exportDiffTheory) saved >>= check else pure ()
 
+-- An absent compiled family gives zero mirrors, and a family existing only on
+-- the right still appears in the rule-equivalence cases. CLI regressions also
+-- exercise complete proof search and check the resulting verdicts.
 emptyDiffFamilyTests :: FilePath -> IO Test
 emptyDiffFamilyTests maudePath = TestList <$> mapM makeCase
     [("diff(~n,'known')", [RHS]), ("diff('known',~n)", [LHS]), ("~n", [])]
@@ -325,6 +349,9 @@ emptyDiffFamilyTests maudePath = TestList <$> mapM makeCase
           assertEqual "no mirror graph" [] (getMirrorDG ctxt side sys))
           (diffTheorySideRules side thy)) liveSides
 
+-- Legacy detached items override parent-owned declarations. Preserve compact
+-- variants and all annotations, including user actions named like generated
+-- labels, while sharing normalization with warning checks and closing.
 detachedDiffFamilyTests :: FilePath -> IO Test
 detachedDiffFamilyTests maudePath = do
     parsed <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
@@ -360,6 +387,13 @@ detachedDiffFamilyTests maudePath = do
               actual = closeDiffTheoryWithMaude sig legacy False
               warnings = checkWellformednessDiff legacy sig
           assertBool (render (prettyWfErrorReport warnings)) (null warnings)
+          let prepared = prepareDiffTheory sig legacy
+              updated = addDefaultDiffLemma legacy
+              reused = reusePreparedDiffTheory sig updated prepared
+          assertEqual "detached compatibility survives shared preparation and inserted lemma"
+            (normalizeOpenDiffTheory updated) (preparedDiffTheory reused)
+          assertEqual "reused detached compiled blocks preserve order and metadata"
+            (preparedDiffItems (prepareDiffTheory sig updated)) (preparedDiffItems reused)
           assertEqual "normalization is idempotent" normalized (normalizeOpenDiffTheory normalized)
           assertEqual "detached member order matches owned declarations"
             (diffTheoryDiffRules (normalizeOpenDiffTheory canonical))
@@ -374,6 +408,8 @@ detachedDiffFamilyTests maudePath = do
       [makeCase sides split labelled | sides <- [[LHS], [RHS], [LHS,RHS]],
                                       split <- [False,True], labelled <- [False,True]]
 
+-- Unlike an auto-sources flag on a fully resolved theory, this model actually
+-- has partial deconstructions and acquires generated source actions/lemmas.
 autoSourceFamilyTests :: FilePath -> IO Test
 autoSourceFamilyTests maudePath = do
     input <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
@@ -410,6 +446,87 @@ autoSourceFamilyTests maudePath = do
       check second
       reload second >>= check
 
+-- Preparation is shared without treating rejected manual families as validated.
+-- Include compact substitutions and edits after checking (auto-source actions
+-- are one such edit), which must invalidate the old evidence.
+sharedPreparationTests :: FilePath -> IO Test
+sharedPreparationTests maudePath = do
+    input <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+      [ "theory SharedPreparation begin", "builtins: symmetric-encryption"
+      , "rule R[color=#123456]: [In(x),In(k)] --[A($p),DiffProtoR()]-> [Out(sdec(x,k))]"
+      , "diffLemma D:", "end" ]
+    sig <- toSignatureWithMaude maudePath (L.get diffThySignature input)
+    extra <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+      ["theory Extra begin", "builtins: symmetric-encryption, multiset", "rule S: [] --> []", "end"]
+    otherSig <- toSignatureWithMaude maudePath (L.get diffThySignature extra)
+    let hnd = L.get sigmMaudeHandle sig
+        parent = head (diffTheoryDiffRules input)
+        e = L.get oprRuleE (getLeftProtoRule parent)
+        compact = map (L.get cprRuleAC) (closeProtoRule hnd [] (OpenProtoRule e []))
+        unfolded = recomputeRuleVariants hnd [] e
+        alter ru = addAction ru (protoFact Linear "Source" [varTerm (LVar "p" LSortPub 99)])
+        inputs =
+          [ ("automatic", [])
+          , ("compact", compact)
+          , ("unfolded", unfolded)
+          , ("added actions", map alter unfolded)
+          , ("incomplete", take 1 unfolded)
+          , ("changed body", map (L.set rConcs []) unfolded)
+          ]
+        withMembers members = L.modify diffThyItems (map replace) input
+          where
+            side = OpenProtoRule e members
+            replace (DiffRuleItem (DiffProtoRule ru _)) = DiffRuleItem (DiffProtoRule ru (Just (side,side)))
+            replace item = item
+        check (name, members) = TestLabel name $ TestCase $ do
+          let thy = withMembers members
+              prep = prepareDiffTheory sig thy
+              side = OpenProtoRule e members
+              (_, canonical, valid) = prepareDiffRule hnd side
+              (labelled, labelledCanonical, labelledValid) = prepareDiffRule hnd (addProtoRuleLabel side)
+              label ru = addDiffLabel ru "DiffProtoR"
+              expected = [(s, closeProtoRule hnd [] labelled) | s <- [LHS,RHS]]
+          assertEqual "label equivariance of canonical variants" (map label canonical) labelledCanonical
+          assertEqual "label equivariance of acceptance" valid labelledValid
+          assertEqual "shared closing preserves warning-tolerant supplied members"
+            expected [r | EitherRuleItem r <- preparedDiffItems prep]
+          if name `elem` ["incomplete", "changed body"] then
+            assertBool "invalid family still produces a manual-variant warning"
+              ("cannot confirm manual variants" `isInfixOf`
+                render (prettyWfErrorReport (checkPreparedWellformednessDiff prep)))
+          else pure ()
+        invalidate = TestLabel "changed actions invalidate preparation" $ TestCase $ do
+          let before = withMembers compact
+              after = withMembers (map alter compact)
+              prep = prepareDiffTheory sig before
+              reused = reusePreparedDiffTheory sig after prep
+          assertEqual "changed inputs receive fresh preparation"
+            (preparedDiffItems (prepareDiffTheory sig after)) (preparedDiffItems reused)
+          assertBool "the old family is not reused"
+            (preparedDiffItems prep /= preparedDiffItems reused)
+        detached = TestLabel "multiple parents and detached compatibility" $ TestCase $ do
+          let original = L.modify diffThyItems (++
+                [EitherRuleItem (LHS, OpenProtoRule e compact),
+                 DiffRuleItem (head (diffTheoryDiffRules extra)),
+                 EitherRuleItem (RHS, OpenProtoRule e unfolded)]) input
+              updated = addDefaultDiffLemma original
+              reused = reusePreparedDiffTheory sig updated (prepareDiffTheory sig original)
+          assertEqual "adapter removes detached declarations before block reuse"
+            (normalizeOpenDiffTheory updated) (preparedDiffTheory reused)
+          assertEqual "multiple parent blocks stay aligned"
+            (preparedDiffItems (prepareDiffTheory sig updated)) (preparedDiffItems reused)
+        changedSignature = TestLabel "changed signature invalidates preparation" $ TestCase $ do
+          let thy = withMembers compact
+              reused = reusePreparedDiffTheory otherSig thy (prepareDiffTheory sig thy)
+          assertEqual "replacement signature owns the preparation"
+            (toSignaturePure otherSig) (toSignaturePure (preparedDiffSignature reused))
+          assertEqual "replacement signature receives freshly prepared families"
+            (preparedDiffItems (prepareDiffTheory otherSig thy)) (preparedDiffItems reused)
+    pure $ TestLabel "Shared diff preparation" (TestList (map check inputs ++ [invalidate, detached, changedSignature]))
+
+-- Renaming is limited to explicit diff members and must preserve slot
+-- identity even with duplicate labels and variables appearing only in added
+-- actions. It must never admit specializations or change rule direction.
 diffVariableAlignmentTests :: Test
 diffVariableAlignmentTests = TestLabel "Diff variable alignment" $ TestList
     [ TestCase $ case diffVariantNewVars annotated canonical of
@@ -443,8 +560,15 @@ diffVariableAlignmentTests = TestLabel "Diff variable alignment" $ TestList
         Nothing (matchTerms [p 4,p 3,fAppUnion (p 3,p 4)] [p 0,p 1,fAppUnion (p 0,p 1)])
     , TestCase $ assertEqual "premises cannot become conclusions"
         Nothing (diffVariantNewVars moved direction)
+    , TestList [TestCase $ assertEqual "generated label preserves all slot matches"
+        (diffVariantNewVars supplied expected)
+        (diffVariantNewVars (label supplied) (label expected))
+        | (supplied, expected) <- [(annotated, canonical), (exactAnnotation, canonical),
+            (ambiguous, canonical), (merged, canonical), (duplicates, ordered),
+            (reversed, ordered), (moved, direction)] ]
     ]
   where
+    label ru = addDiffLabel ru "DiffProtoR"
     p i = varTerm (LVar "p" LSortPub i)
     fact name ts = protoFact Linear name ts
     rule ps cs acts nvs = Rule (ProtoRuleACInfo (StandRule "R") mempty (Disj [emptySubstVFresh]) []) ps cs acts nvs
@@ -462,6 +586,8 @@ diffVariableAlignmentTests = TestLabel "Diff variable alignment" $ TestList
     direction = rule [fact "F" [p 0]] [] [] []
     moved = rule [] [fact "F" [p 3]] [] []
 
+-- Check eligibility before proof search, including same-named opposite-side
+-- assumptions, declaration order for ordinary reuse, and both hide forms.
 assumptionTests :: FilePath -> IO Test
 assumptionTests maudePath = do
     open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
@@ -763,6 +889,9 @@ diffRestrictionLocalityTests maudePath = do
            (not local) (("RHS: " ++ name) `isInfixOf` notice)
       | (name, local) <- expected]
 
+-- Multi-event restrictions transfer only when all of their observations do.
+-- In particular, identical action syntax with independently chosen inputs
+-- does not establish preservation of the action arguments.
 diffRestrictionPreservationTests :: FilePath -> IO Test
 diffRestrictionPreservationTests maudePath = do
     cases <- sequence [check name rules restrictions expected | (name, rules, restrictions, expected) <- models]
@@ -822,6 +951,8 @@ diffRestrictionPreservationTests maudePath = do
         assertEqual "notice agrees with proof applicability" (not expected)
           ("RHS: R" `isInfixOf` render (prettyDiffRestrictionLimit thy))
 
+-- Diff partial evaluation is analysis-only: every existing compiled family,
+-- cache, annotation and proof remains unchanged, including across export.
 partialEvaluationDiffTests :: FilePath -> IO Test
 partialEvaluationDiffTests maudePath = do
     let models =

@@ -74,6 +74,7 @@ library
   hs-source-dirs: src
   exposed-modules:
     ClosedTheory
+    PreparedDiffTheory
     CloseRule
     Items.AccLemmaItem
     Items.CaseTestItem

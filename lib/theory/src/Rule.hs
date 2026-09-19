@@ -181,8 +181,15 @@ diffVariantNewVars supplied canonical
 -- unique positional alignment use the same matches; invalid input retains its
 -- members so the usual wellformedness warning policy can report it.
 prepareDiffRule :: MaudeHandle -> OpenProtoRule -> (OpenProtoRule, [ProtoRuleAC], Bool)
-prepareDiffRule hnd (OpenProtoRule ruE supplied) =
-    (OpenProtoRule ruE aligned, unfolded, null supplied || complete)
+prepareDiffRule hnd = fst . prepareDiffRuleWithAutomatic hnd
+
+-- | Keep the automatic compact family available to the validation/closing
+-- boundary. In particular, an empty automatic family must not be mistaken for
+-- an instruction to recompute variants.
+prepareDiffRuleWithAutomatic :: MaudeHandle -> OpenProtoRule
+    -> ((OpenProtoRule, [ProtoRuleAC], Bool), [ClosedProtoRule])
+prepareDiffRuleWithAutomatic hnd (OpenProtoRule ruE supplied) =
+    ((OpenProtoRule ruE aligned, unfolded, null supplied || complete), automatic)
   where
     automatic = closeProtoRule hnd [] (OpenProtoRule ruE [])
     compact = map (L.get cprRuleAC) automatic

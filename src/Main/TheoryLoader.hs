@@ -33,6 +33,8 @@ where
 import Accountability qualified as Acc
 import Accountability.Generation qualified as Acc
 import ClosedTheory (prettyDiffRestrictionLimit)
+import PreparedDiffTheory
+import Prover (closePreparedDiffTheory)
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
 import Control.Monad
@@ -559,11 +561,19 @@ checkTranslatedTheory ::
   SignatureWithMaude ->
   Either OpenTranslatedTheory OpenDiffTheory ->
   m (WfErrorReport, SignatureWithMaude, Either OpenTranslatedTheory OpenDiffTheory)
-checkTranslatedTheory thyOpts sign thy = do
+checkTranslatedTheory thyOpts sign thy = checkTranslatedTheoryWithPreparation thyOpts sign thy Nothing
+
+-- The ordinary CLI supplies one lazy artifact to both checking and closing.
+checkTranslatedTheoryWithPreparation ::
+  (MonadIO m, MonadError TheoryLoadError m) =>
+  TheoryLoadOptions -> SignatureWithMaude ->
+  Either OpenTranslatedTheory OpenDiffTheory -> Maybe PreparedDiffTheory ->
+  m (WfErrorReport, SignatureWithMaude, Either OpenTranslatedTheory OpenDiffTheory)
+checkTranslatedTheoryWithPreparation thyOpts sign thy prepared = do
   let transReport =
         either
           (\openThy -> checkWellformedness incompleteMSRs openThy sign)
-          (`checkWellformednessDiff` sign)
+          (\t -> maybe (checkWellformednessDiff t sign) checkPreparedWellformednessDiff prepared)
           thy
 
   deducThy0 <- bitraverse (\x -> return ((addMessageDeductionRuleVariants x) `runReader` (mh)))
@@ -668,19 +678,19 @@ withVersionAndReport version thyOpts report thy = do
               prettyWfErrorReport rep
             ]
 
--- | Close a translated theory.
+-- | Close a translated theory, reusing the CLI's preparation when present.
 closeTranslatedTheory
   :: (MonadError TheoryLoadError m)
-  => TheoryLoadOptions
-  -> SignatureWithMaude
-  -> Either OpenTranslatedTheory OpenDiffTheory
+  => TheoryLoadOptions -> SignatureWithMaude
+  -> Either OpenTranslatedTheory OpenDiffTheory -> Maybe PreparedDiffTheory
   -> m (Either ClosedTheory ClosedDiffTheory)
-closeTranslatedTheory thyOpts sign srcThy = do
+closeTranslatedTheory thyOpts sign srcThy prepared = do
   diffLemThy <- withDiffTheory (pure . addDefaultDiffLemma) srcThy
   let closedThy =
         bimap
           (\t -> closeTheoryWithMaude sign t autoSources True)
-          (\t -> closeDiffTheoryWithMaude sign t autoSources)
+          (\t -> closePreparedDiffTheory
+            (maybe (prepareDiffTheory sign t) (reusePreparedDiffTheory sign t) prepared) autoSources)
           diffLemThy
       partialThy =
         case thyOpts.partialEvaluation of
@@ -737,8 +747,9 @@ closeTheory ::
 closeTheory version loadedThyOpts sign srcThy = do
   (preReport, transThy) <- translateTheory thyOpts srcThy
   let removedThy = first removeTranslationItems transThy
-  (postReport, sign', checkedThy) <- checkTranslatedTheory thyOpts sign removedThy
-  closedThy <- closeTranslatedTheory thyOpts sign' checkedThy
+      prepared = either (const Nothing) (Just . prepareDiffTheory sign) removedThy
+  (postReport, sign', checkedThy) <- checkTranslatedTheoryWithPreparation thyOpts sign removedThy prepared
+  closedThy <- closeTranslatedTheory thyOpts sign' checkedThy prepared
   finalThy <- withVersionAndReport version thyOpts (preReport ++ postReport) closedThy
 
   pure (preReport ++ postReport, finalThy)
