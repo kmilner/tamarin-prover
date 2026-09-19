@@ -429,9 +429,11 @@ execDiffProofMethod ctxt method sys =
 
     -- Not checking construction rules is sound, as they are 'trivial' !
     -- Note that we use the protoRulesAC, as we also want to include the ISEND rule as it is labelled with an action that might show up in restrictions.
-    -- LHS or RHS is not important in this case as we only need the names of the rules.
+    -- Either compiled family can be empty, so collect parent identities from
+    -- both sides. The map deduplicates families present on both sides.
     ruleEquivalence :: M.Map CaseName DiffSystem
-    ruleEquivalence = foldl ruleEquivalenceCase (foldl ruleEquivalenceCase {-(foldl ruleEquivalenceCase-} M.empty {-constrRules)-} destrRules) (protoRulesAC LHS)
+    ruleEquivalence = foldl ruleEquivalenceCase (foldl ruleEquivalenceCase M.empty destrRules)
+                       (protoRulesAC LHS ++ protoRulesAC RHS)
 
     trivial :: System -> Bool
     trivial sys' = (dgIsNotEmpty sys') && (allOpenGoalsAreSimpleFacts ctxt sys') && (allOpenFactGoalsAreIndependent sys')

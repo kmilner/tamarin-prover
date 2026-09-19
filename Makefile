@@ -491,6 +491,7 @@ DIFF_REGRESSION_CASE_STUDIES+=diff-joint-conditional-attack.spthy diff-joint-con
 DIFF_REGRESSION_CASE_STUDIES+=diff-explicit-variant-export.spthy diff-asymmetric-explicit-variants.spthy diff-singleton-trivial-variants.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-variant-family-roundtrip.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-auto-source-variable-alignment.spthy
+DIFF_REGRESSION_CASE_STUDIES+=diff-empty-left-family.spthy diff-empty-right-family.spthy diff-empty-both-families.spthy
 FAST_REGRESSION_CASE_STUDIES+=$(COMMON_REGRESSION_CASE_STUDIES)
 FAST_REGRESSION_TARGETS=$(subst .spthy,_analyzed.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(FAST_REGRESSION_CASE_STUDIES)))
 DIFF_REGRESSION_TARGETS=$(subst .spthy,_analyzed-diff.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(DIFF_REGRESSION_CASE_STUDIES)))

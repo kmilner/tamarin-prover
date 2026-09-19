@@ -45,9 +45,33 @@ analyze() {
   check_verdicts "$tmp_dir/$1.log"
 }
 
-for model in refinement variants explicit asymmetric singleton families auto-sources; do
+for model in refinement variants explicit asymmetric singleton families auto-sources empty-left empty-right empty-both; do
   input="$examples/soundness-diff-partial-evaluation-$model.spthy"
   case "$model" in
+    empty-left)
+      input="$examples/diff-empty-left-family.spthy"
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+RHS :  output (exists-trace): verified
+LHS :  no_output (all-traces): verified
+DiffLemma:  Observational_equivalence : falsified - found trace
+VERDICTS
+      ;;
+    empty-right)
+      input="$examples/diff-empty-right-family.spthy"
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+LHS :  output (exists-trace): verified
+RHS :  no_output (all-traces): verified
+DiffLemma:  Observational_equivalence : falsified - found trace
+VERDICTS
+      ;;
+    empty-both)
+      input="$examples/diff-empty-both-families.spthy"
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+LHS :  no_output (all-traces): verified
+RHS :  no_output (all-traces): verified
+DiffLemma:  Observational_equivalence : verified
+VERDICTS
+      ;;
     refinement)
       cat >"$tmp_dir/expected" <<'VERDICTS'
 LHS :  both (exists-trace): verified

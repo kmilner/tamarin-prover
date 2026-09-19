@@ -36,6 +36,7 @@ tests maudePath = TestList <$> sequence
     , explicitVariantMirrorTests maudePath
     , roundTripTests maudePath
     , diffFamilyLifecycleTests maudePath
+    , emptyDiffFamilyTests maudePath
     , autoSourceFamilyTests maudePath
     , pure diffVariableAlignmentTests
     , assumptionTests maudePath
@@ -280,6 +281,28 @@ diffFamilyLifecycleTests maudePath = do
         saved <- reload (prettyOpenDiffTheory . exportDiffTheory) first
         check saved
         if repeated then reload (prettyOpenDiffTheory . exportDiffTheory) saved >>= check else pure ()
+
+emptyDiffFamilyTests :: FilePath -> IO Test
+emptyDiffFamilyTests maudePath = TestList <$> mapM makeCase
+    [("diff(~n,'known')", [RHS]), ("diff('known',~n)", [LHS]), ("~n", [])]
+  where
+    makeCase (input, liveSides) = do
+      open <- either (fail . show) pure $ parseOpenDiffTheoryString [] $ unlines
+        [ "theory EmptyFamily begin"
+        , "rule Emit: [Fr(~n), In(" ++ input ++ ")] --> [Out(~n)]"
+        , "diffLemma D:", "end" ]
+      thy <- closeDiffTheory maudePath open False
+      let ctxt = getDiffProofContext (head (diffTheoryDiffLemmas thy)) thy
+          cases = fromJust (execDiffProofMethod ctxt DiffRuleEquivalence emptyDiffSystem)
+          node = LVar "n" LSortNode 0
+      pure $ TestLabel ("Empty diff family: " ++ input) $ TestCase $ do
+        assertEqual "case enumeration includes either live parent"
+          (not (null liveSides)) (M.member "Rule_Emit" cases)
+        mapM_ (\side -> mapM_ (\ru -> do
+          let inst = fst $ someRuleACInstAvoiding (fmap ProtoInfo (L.get cprRuleAC ru)) ([] :: [LVar])
+              sys = L.set sNodes (M.singleton node inst) $ emptySystem RawSource True
+          assertEqual "no mirror graph" [] (getMirrorDG ctxt side sys))
+          (diffTheorySideRules side thy)) liveSides
 
 autoSourceFamilyTests :: FilePath -> IO Test
 autoSourceFamilyTests maudePath = do
