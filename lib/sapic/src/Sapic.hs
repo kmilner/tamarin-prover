@@ -147,8 +147,8 @@ gen (trans_null, trans_action, trans_comb) anP p tildex = do
       -- convert prems, acts and concls generated for current process
       -- into annotated rule
       toAnnotatedRule proc (l,a,r,res) = AnnotatedRule Nothing proc (Left p) l a r res
-      mapToAnnotatedRule proc l = -- distinguishes rules by  adding the index of each element to it
-            snd $ foldl (\(i,l') r -> (i+1,l' ++ [toAnnotatedRule proc r i] )) (0,[]) l
+      mapToAnnotatedRule proc rules =
+            zipWith (toAnnotatedRule proc) rules [0..]
       handler:: (Typeable ann, Show ann) => LProcess ann ->  WFerror -> a
       handler anp (WFUnbound vs) = throw $ ProcessNotWellformed (WFUnbound vs) (Just anp)
       handler _ e = throw e
