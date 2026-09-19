@@ -254,21 +254,27 @@ renameUnique' ::
   (MonadFresh m, Apply (Subst Name LVar) ann, GoodAnnotation ann) =>
   Subst Name LVar -> Process ann SapicLVar -> m (Process ann SapicLVar)
 renameUnique' initSubst p = do
-        let p' = apply initSubst p -- apply outstanding substitution subst, ignore capturing and hope for the best
-        case p' of
-            ProcessNull _ -> return p'
-            ProcessAction ac ann pl -> do
+        -- Apply the accumulated renaming only at this node. As in the eager
+        -- traversal, null annotations are untouched and new binder renamings
+        -- affect whole actions/combinators and both combinator children.
+        case p of
+            ProcessNull _ -> return p
+            ProcessAction ac0 ann0 pl -> do
+                let ac = apply initSubst ac0
+                    ann = apply initSubst ann0
                 (subst,inv) <- mkSubst $ bindingsAct ann ac
                 let ann' = mappendProcessParsedAnnotation (mempty {backSubstitution = inv}) ann
                 let ac' = apply subst ac -- use apply instead of applyM because we want to ignore capturing, i.e., rename bound names...
-                pl' <- renameUnique' subst pl
+                pl' <- renameUnique' (subst `compose` initSubst) pl
                 return $ ProcessAction ac' ann' pl'
-            ProcessComb comb ann pl pr -> do
+            ProcessComb comb0 ann0 pl pr -> do
+                let comb = apply initSubst comb0
+                    ann = apply initSubst ann0
                 (subst,inv) <- mkSubst $ bindingsComb ann comb
                 let ann' = mappendProcessParsedAnnotation (mempty {backSubstitution = inv}) ann
                 let comb' = apply subst comb
-                pl' <- renameUnique' subst pl
-                pr' <- renameUnique' subst pr
+                pl' <- renameUnique' (subst `compose` initSubst) pl
+                pr' <- renameUnique' (subst `compose` initSubst) pr
                 return $ ProcessComb comb' ann' pl' pr'
     where
         substFromVarList = substFromList . map (second varTerm)
