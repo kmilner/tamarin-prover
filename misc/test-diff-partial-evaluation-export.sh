@@ -45,7 +45,7 @@ analyze() {
   check_verdicts "$tmp_dir/$1.log"
 }
 
-for model in refinement variants explicit asymmetric singleton families auto-sources explicit-macros empty-left empty-right empty-both unrelated-empty-left unrelated-empty-right unrelated-empty-both; do
+for model in refinement variants explicit asymmetric singleton families auto-sources explicit-macros empty-left empty-right empty-both unrelated-empty-left unrelated-empty-right unrelated-empty-both hidden-reuse; do
   input="$examples/soundness-diff-partial-evaluation-$model.spthy"
   case "$model" in
     unrelated-empty-*)
@@ -58,6 +58,23 @@ RHS :  finish (exists-trace): verified
 LHS :  dead (all-traces): verified
 RHS :  dead (all-traces): verified
 DiffLemma:  D : verified
+DiffLemma:  Observational_equivalence : verified
+VERDICTS
+      ;;
+    hidden-reuse)
+      input="$examples/soundness-diff-hidden-reuse.spthy"
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+LHS :  assumed (all-traces): falsified - found trace
+RHS :  assumed (all-traces): falsified - found trace
+LHS :  hidden (all-traces): falsified - found trace
+RHS :  hidden (all-traces): falsified - found trace
+LHS :  hidden_all (exists-trace): verified
+RHS :  hidden_all (exists-trace): verified
+LHS :  visible (all-traces): verified
+RHS :  visible (all-traces): verified
+DiffLemma:  Hidden : falsified - found trace
+DiffLemma:  HiddenAll : falsified - found trace
+DiffLemma:  Visible : verified
 DiffLemma:  Observational_equivalence : verified
 VERDICTS
       ;;

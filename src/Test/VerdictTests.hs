@@ -40,6 +40,7 @@ tests maudePath = TestList <$> sequence
     , detachedDiffFamilyTests maudePath
     , autoSourceFamilyTests maudePath
     , pure diffVariableAlignmentTests
+    , pure diffLemmaAttributeTests
     , assumptionTests maudePath
     , conditionalRestrictionTests maudePath
     , alternativeConditionalRestrictionTests maudePath
@@ -50,6 +51,18 @@ tests maudePath = TestList <$> sequence
     , diffRestrictionPreservationTests maudePath
     , partialEvaluationDiffTests maudePath
     ]
+
+diffLemmaAttributeTests :: Test
+diffLemmaAttributeTests = TestLabel "Diff lemma attribute serialization" $ TestCase $ do
+    original <- either (assertFailure . show) pure $ parseOpenDiffTheoryString [] $ unlines
+      [ "theory DiffAttributes begin"
+      , "diffLemma D [sources,reuse,diff_reuse,use_induction,hide_lemma=assumed,hide_lemma=ALL,heuristic=s,output=[spthy],left,right]:"
+      , "end" ]
+    reloaded <- either (assertFailure . show) pure $
+      parseOpenDiffTheoryString [] (render (prettyOpenDiffTheory original))
+    assertEqual "all parser-supported attributes survive"
+      (map (L.get lDiffAttributes) (diffTheoryDiffLemmas original))
+      (map (L.get lDiffAttributes) (diffTheoryDiffLemmas reloaded))
 
 mirrorTests :: FilePath -> IO Test
 mirrorTests maudePath = do
