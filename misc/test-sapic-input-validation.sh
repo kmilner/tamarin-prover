@@ -30,6 +30,7 @@ expect_rejection soundness-sapic-destructor-nonvariable-result \
   'SAPIC destructor equations with non-variable right-hand sides'
 expect_rejection sapic-typed-binding-reuse 'Variable bound twice: y.'
 expect_rejection sapic-nested-call-binding-reuse 'Variable bound twice: y.'
+expect_rejection sapic-location-only-variable 'Unbound variables'
 
 echo 'SAPIC input validation rejects the invalid examples with the expected diagnostics.'
 
@@ -150,3 +151,13 @@ for process in \
   done
 done
 echo 'SAPIC uniqueness renaming preserves binder scope and independent branch types.'
+
+# Locations may refer to an ordinary or indexed outer binder. Reserving names
+# found only in annotations must not prevent either valid use from translating.
+for process in \
+  "new x; (event At(report('message')))@x" \
+  "new x; new x.1; (event At(report('message')))@x.1"; do
+  printf 'theory BoundLocation\nbegin\nbuiltins: locations-report\npredicates: Report(x,l) <=> T\nprocess: %s\nend\n' "$process" >"$tmp_dir/location.spthy"
+  "$tamarin" "$tmp_dir/location.spthy" --quit-on-warning -d=0 >"$tmp_dir/location.log" 2>&1
+done
+echo 'SAPIC locations retain their bound variables without capturing unbound ones.'

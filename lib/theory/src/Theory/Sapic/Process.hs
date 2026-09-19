@@ -44,6 +44,7 @@ module Theory.Sapic.Process (
     , applyProcessSubstAvoiding
     , processAddAnnotation
     , varsProc
+    , varsProcWithAnnotations
     -- pretty printing
     , prettySapic'
     , prettySapicAction'
@@ -369,6 +370,16 @@ instance {-# OVERLAPPABLE #-} (Ord v, Apply s v, Apply s ann) => Apply s (Proces
 varsProc :: (Ord v, Show v) => Process ann v -> Set v
 varsProc = foldMap Data.Set.singleton -- foldProcess fNull fAct fComb gAct gComb empty p
 
+-- | Variables to reserve when freshening a process. Locations can contain
+-- variables absent from its actions, and earlier expansions record generated
+-- binders in annotations. Back-substitutions only affect diagnostic names.
+varsProcWithAnnotations :: GoodAnnotation ann => LProcess ann -> Set SapicLVar
+varsProcWithAnnotations p = varsProc p `Set.union` pfoldMap annotationVars p
+  where
+    annotationVars node =
+      let ann = getProcessParsedAnnotation (processGetAnnotation node)
+      in fromList $ maybe [] freesSapicTerm (location ann) ++ generatedBinders ann
+
 -------------------------
 -- Applying substitutions ( with error messages )
 -------------------------
@@ -478,10 +489,8 @@ applyProcessSubstAvoiding reserved subst proc =
     evalFreshTAvoiding (go (fromList reserved) (substFromList [] :: Subst Name LVar) proc) avoidVars
   where
     incoming = fromList $ map toLVar $ varsRange subst
-    avoidVars = reserved ++ map toLVar (dom subst ++ varsRange subst ++ toList (varsProc proc))
-             ++ pfoldMap (\p -> let ann = getProcessParsedAnnotation (processGetAnnotation p)
-                                in maybe [] (frees . toLNTerm) (location ann)
-                                   ++ map toLVar (generatedBinders ann)) proc
+    avoidVars = reserved ++ map toLVar
+      (dom subst ++ varsRange subst ++ toList (varsProcWithAnnotations proc))
     freshening used ann bound = do
       let generated = fromList $ map toLVar $ generatedBinders $ getProcessParsedAnnotation ann
           -- Preserve user rebinding for validation; only generated collisions

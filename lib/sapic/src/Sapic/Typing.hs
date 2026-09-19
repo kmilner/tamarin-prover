@@ -248,7 +248,7 @@ renameUnique :: (Monad m, Apply (Subst Name LVar) ann, GoodAnnotation ann, HasCa
 renameUnique p = Precise.evalFreshT actualCall initState
     where
         actualCall = renameUnique' emptySubst p
-        initState = avoidPreciseVars . map (\(SapicLVar lvar _) -> lvar) $ S.toList $ varsProc p
+        initState = avoidPreciseVars . map toLVar $ S.toList $ varsProcWithAnnotations p
 
 renameUnique' ::
   (MonadFresh m, Apply (Subst Name LVar) ann, GoodAnnotation ann) =>
