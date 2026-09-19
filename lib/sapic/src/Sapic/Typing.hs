@@ -139,8 +139,8 @@ typeProcess = traverseProcess fNull fAct fComb gAct gComb
      where
         -- fNull/fAcc/fComb collect variables that are bound when going downwards
         fNull ann  = return (ProcessNull ann)
-        fAct ann ac       = F.traverse_ insertVar (bindingsAct ann ac)
-        fComb ann c        = F.traverse_ insertVar (bindingsComb ann c)
+        fAct _ ac         = insertDeclarations (actionBinderDeclarations ac)
+        fComb _ c         = insertDeclarations (combinatorBinderDeclarations c)
         -- gAct/gComb reconstruct process tree assigning types to the terms
         gAct ac@(Event (Fact tag _ ts)) ann r = do -- r is typed subprocess
             ac' <- traverseTermsAction (typeWith' $ ProcessAction ac ann r) typeWithFact typeWithVar ac
@@ -158,7 +158,18 @@ typeProcess = traverseProcess fNull fAct fComb gAct gComb
         typeWithVar  v -- variables are correctly typed, as we just inserted them
             | Nothing <- stype v = return $ SapicLVar (slvar v) defaultSapicType
             | otherwise = return v
-        typeWithFact = return -- typing facts is hard because of quantified variables. We skip for now.
+        typeWithFact = return -- Formula variables can be quantified; leave their annotations unchanged.
+        -- Merge only declarations from this node. Inserting the merged map
+        -- afterwards preserves rejection of rebinding across process nodes.
+        insertDeclarations declarations = do
+            merged <- foldM mergeDeclaration Map.empty declarations
+            F.traverse_ insertVar (Map.elems merged)
+        mergeDeclaration local v = do
+            ty <- case Map.lookup (slvar v) local of
+                Nothing -> return (stype v)
+                Just previous -> catch (sqcap (stype previous) (stype v))
+                    (\(CannotMerge a b) -> throwM $ TypingError (varTerm v) a b)
+            return $ Map.insert (slvar v) (SapicLVar (slvar v) ty) local
         insertVar v = do
             te <- get
             case Map.lookup (slvar v) te.vars of

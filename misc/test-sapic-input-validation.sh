@@ -47,3 +47,73 @@ if ! grep -Fq 'L_PureState(' "$tmp_dir/supported-state-rules.log"; then
   exit 1
 fi
 echo 'Supported SAPIC state emits L_PureState.'
+
+# Scope identity is shared by all occurrences, but every explicit annotation
+# contributes to its type. Exercise all three pattern-binding constructs.
+for construct in input let msr; do
+  for pattern in 'x,x:alpha' 'x:alpha,x' 'x:alpha,x:alpha' 'x:alpha,x:beta' 'x:beta,x:alpha'; do
+    model="$tmp_dir/annotations.spthy"
+    case "$construct" in
+      input) process="in(<$pattern>); out(x)" ;;
+      let) process="in(y); let <$pattern> = y in out(x)" ;;
+      msr) process="[In(<$pattern>)] --> [Out(x)]" ;;
+    esac
+    printf 'theory PatternAnnotations\nbegin\nprocess: %s\nend\n' "$process" >"$model"
+    log_file="$tmp_dir/annotations.log"
+    if [ "$construct" = input ]; then
+      if "$tamarin" "$model" --output-module=spthytyped --quit-on-warning >"$log_file" 2>&1; then
+        echo "accepted repeated input binder: $pattern" >&2
+        exit 1
+      fi
+      grep -Fq 'Invalid pattern:' "$log_file" || { cat "$log_file" >&2; exit 1; }
+      continue
+    fi
+    case "$pattern" in
+      *beta*)
+        if "$tamarin" "$model" --output-module=spthytyped --quit-on-warning >"$log_file" 2>&1; then
+          echo "accepted incompatible $construct annotations: $pattern" >&2
+          exit 1
+        fi
+        if ! grep -Fq 'Typing error: expected term ' "$log_file"; then
+          cat "$log_file" >&2
+          exit 1
+        fi
+        ;;
+      *)
+        "$tamarin" "$model" --output-module=spthytyped --quit-on-warning >"$log_file" 2>&1
+        # All three x occurrences (two pattern positions and the output) must
+        # carry alpha. Count occurrences, not lines, since pairs share a line.
+        count=$(grep -o 'x\.[0-9][0-9]*:alpha' "$log_file" | wc -l)
+        if [ "$count" -ne 3 ]; then
+          echo "lost compatible $construct annotations: $pattern" >&2
+          cat "$log_file" >&2
+          exit 1
+        fi
+        ;;
+    esac
+  done
+done
+echo 'SAPIC pattern declarations preserve compatible types and reject conflicts.'
+
+# Inputs retain their existing linear-pattern requirement. A distinct typed
+# binder and untyped sibling remain supported in either order.
+for pattern in 'x:alpha,y' 'y,x:alpha'; do
+  printf 'theory LinearInput\nbegin\nprocess: in(<%s>); out(x)\nend\n' "$pattern" >"$tmp_dir/linear.spthy"
+  "$tamarin" "$tmp_dir/linear.spthy" --output-module=spthytyped --quit-on-warning >"$tmp_dir/linear.log" 2>&1
+  count=$(grep -o 'x\.[0-9][0-9]*:alpha' "$tmp_dir/linear.log" | wc -l)
+  [ "$count" -eq 2 ] || { cat "$tmp_dir/linear.log" >&2; exit 1; }
+done
+
+# An annotation change must not disguise a match/bind collision.
+for construct in input msr; do
+  case "$construct" in
+    input) process='in(<x:alpha,=x:beta>); out(x)' ;;
+    msr) process='[In(<x:alpha,=x:beta>)] --> [Out(x)]' ;;
+  esac
+  printf 'theory MatchBindCollision\nbegin\nprocess: %s\nend\n' "$process" >"$tmp_dir/collision.spthy"
+  if "$tamarin" "$tmp_dir/collision.spthy" --output-module=spthytyped --quit-on-warning >"$tmp_dir/collision.log" 2>&1; then
+    echo "accepted $construct match/bind collision" >&2
+    exit 1
+  fi
+  grep -Fq 'Invalid pattern' "$tmp_dir/collision.log" || { cat "$tmp_dir/collision.log" >&2; exit 1; }
+done

@@ -36,6 +36,8 @@ module Theory.Sapic.Process (
     , mapTermsComb
     , applyM
     , actionBinders
+    , actionBinderDeclarations
+    , combinatorBinderDeclarations
     , combinatorBinders
     , applyProcessSubstAvoiding
     , processAddAnnotation
@@ -414,28 +416,40 @@ instance ApplyM SapicSubst (SapicAction SapicLVar)
 
 -- | Binders introduced by an action scope over its continuation, not its
 -- channel expression. Pattern matching variables are references, not binders.
--- Type annotations share one LVar namespace; retain the first typed occurrence
--- for diagnostics and consumers that need the original declaration.
+-- Type annotations share one LVar namespace for scope and capture checks.
 actionBinders :: SapicAction SapicLVar -> [SapicLVar]
-actionBinders (New v) = [v]
-actionBinders (ChIn _ t matches) = patternBinders (freesSapicTerm t) matches
-actionBinders (MSR ls _ _ _ matches) = patternBinders (concatMap freesSapicFact ls) matches
-actionBinders _ = []
+actionBinders = uniqueBinderIdentities . actionBinderDeclarations
 
 -- | Combinator binders scope over the left (success) continuation only.
 -- The lookup key, let RHS, and right (failure) continuation are outside scope.
 combinatorBinders :: ProcessCombinator SapicLVar -> [SapicLVar]
-combinatorBinders (Lookup _ v) = [v]
-combinatorBinders (Let t _ matches) = patternBinders (freesSapicTerm t) matches
-combinatorBinders _ = []
+combinatorBinders = uniqueBinderIdentities . combinatorBinderDeclarations
 
-patternBinders :: [SapicLVar] -> Set SapicLVar -> [SapicLVar]
-patternBinders vars matches = unique (Set.map toLVar matches) vars
+-- | Preserve every annotation variant until typing has merged its constraints.
+-- Scope consumers instead use the identity projections above.
+actionBinderDeclarations :: SapicAction SapicLVar -> [SapicLVar]
+actionBinderDeclarations (New v) = [v]
+actionBinderDeclarations (ChIn _ t matches) = patternDeclarations (freesSapicTerm t) matches
+actionBinderDeclarations (MSR ls _ _ _ matches) = patternDeclarations (concatMap freesSapicFact ls) matches
+actionBinderDeclarations _ = []
+
+combinatorBinderDeclarations :: ProcessCombinator SapicLVar -> [SapicLVar]
+combinatorBinderDeclarations (Lookup _ v) = [v]
+combinatorBinderDeclarations (Let t _ matches) = patternDeclarations (freesSapicTerm t) matches
+combinatorBinderDeclarations _ = []
+
+uniqueBinderIdentities :: [SapicLVar] -> [SapicLVar]
+uniqueBinderIdentities = unique Set.empty
   where
     unique _ [] = []
     unique seen (v:vs)
       | toLVar v `member` seen = unique seen vs
       | otherwise = v : unique (Set.insert (toLVar v) seen) vs
+
+patternDeclarations :: [SapicLVar] -> Set SapicLVar -> [SapicLVar]
+patternDeclarations vars matches =
+  Data.List.filter (\v -> toLVar v `Set.notMember` identities) vars
+  where identities = Set.map toLVar matches
 
 -- | Apply a process substitution with a scoped alpha-renaming environment.
 -- Reserve the whole process once, including location metadata. A single fresh
