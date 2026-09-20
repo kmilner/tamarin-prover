@@ -840,22 +840,12 @@ restriction single_session:
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 34ddc313cff97401bbeefeb9a018a4723e8aa462, branch: fix/sapic-soundness
-Compiled at: 2026-09-18 16:22:46.836197733 UTC
+Git revision: 152a5cf4dea9016eec044fb1ea6190265b82ae23, branch: HEAD
+Compiled at: 2026-09-20 17:17:54.242756807 UTC
 */
 
 end
 /* Output
-maude tool: 'maude'
- checking version: 3.5.1. OK.
- checking installation: OK.
-[Theory SoundnessSapicStatePhases] Theory loaded
-[Theory SoundnessSapicStatePhases] Theory translated
-[Theory SoundnessSapicStatePhases] No Deconstruction Chain checks started
-[Theory SoundnessSapicStatePhases] No Deconstruction Chain checks ended
-[Theory SoundnessSapicStatePhases] Theory closed
-[Saturating Sources] Step 1 (Max 5)
-[Saturating Sources] Done
 
 ==============================================================================
 summary of summaries:
@@ -863,7 +853,7 @@ summary of summaries:
 analyzed: examples/regression/trace/soundness-sapic-state-phases.spthy
 
   output:          examples/regression/trace/soundness-sapic-state-phases.spthy.tmp
-  processing time: 4.30s
+  processing time: 0.89s
 
   left_branch (exists-trace): verified (4 steps)
   right_branch (exists-trace): verified (4 steps)
