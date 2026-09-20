@@ -664,29 +664,29 @@ rule (modulo E) Bindy_0_111111121[color=#ffffff, process="Bind(y.12);",
      [ State_111111121( y ) ] --> [ State_1111111211( y ) ]
   */
 
-rule (modulo E) letybitstringzbitstringy_0_1111111211[color=#ffffff,
+rule (modulo E) letybitstringzbitstringy_0_1111111211[color=#805640,
                                                       process="let <y.13:bitstring, z.2:bitstring>=y.12",
-                                                      issapicrule, role='Process']:
+                                                      issapicrule, role='Bind']:
    [ State_1111111211( y.12 ) ] --> [ Let_11111112111( y.12, y.12 ) ]
 
   /*
-  rule (modulo AC) letybitstringzbitstringy_0_1111111211[color=#ffffff,
+  rule (modulo AC) letybitstringzbitstringy_0_1111111211[color=#805640,
                                                          process="let <y.13:bitstring, z.2:bitstring>=y.12",
-                                                         issapicrule, role='Process']:
+                                                         issapicrule, role='Bind']:
      [ State_1111111211( y ) ] --> [ Let_11111112111( y, y ) ]
   */
 
-rule (modulo E) letybitstringzbitstringy_1_1111111211[color=#ffffff,
+rule (modulo E) letybitstringzbitstringy_1_1111111211[color=#805640,
                                                       process="let <y.13:bitstring, z.2:bitstring>=y.12",
-                                                      issapicrule, role='Process']:
+                                                      issapicrule, role='Bind']:
    [ Let_11111112111( <y.13, z.2>, y.12 ) ]
   -->
    [ State_11111112111( z.2, y.12, y.13 ) ]
 
   /*
-  rule (modulo AC) letybitstringzbitstringy_1_1111111211[color=#ffffff,
+  rule (modulo AC) letybitstringzbitstringy_1_1111111211[color=#805640,
                                                          process="let <y.13:bitstring, z.2:bitstring>=y.12",
-                                                         issapicrule, role='Process']:
+                                                         issapicrule, role='Bind']:
      [ Let_11111112111( <y, z>, y.1 ) ] --> [ State_11111112111( z, y.1, y ) ]
   */
 
@@ -974,29 +974,29 @@ rule (modulo E) ElseScopey_0_111121[color=#ffffff,
      [ State_111121( y ) ] --> [ State_1111211( y ) ]
   */
 
-rule (modulo E) letybitstringzbitstringnotpair_0_1111211[color=#ffffff,
+rule (modulo E) letybitstringzbitstringnotpair_0_1111211[color=#4f4080,
                                                          process="let <y.19:bitstring, z.3:bitstring>='not_pair'",
-                                                         issapicrule, role='Process']:
+                                                         issapicrule, role='ElseScope']:
    [ State_1111211( y.18 ) ] --> [ Let_11112111( 'not_pair', y.18 ) ]
 
   /*
-  rule (modulo AC) letybitstringzbitstringnotpair_0_1111211[color=#ffffff,
+  rule (modulo AC) letybitstringzbitstringnotpair_0_1111211[color=#4f4080,
                                                             process="let <y.19:bitstring, z.3:bitstring>='not_pair'",
-                                                            issapicrule, role='Process']:
+                                                            issapicrule, role='ElseScope']:
      [ State_1111211( y ) ] --> [ Let_11112111( 'not_pair', y ) ]
   */
 
-rule (modulo E) letybitstringzbitstringnotpair_1_1111211[color=#ffffff,
+rule (modulo E) letybitstringzbitstringnotpair_1_1111211[color=#4f4080,
                                                          process="let <y.19:bitstring, z.3:bitstring>='not_pair'",
-                                                         issapicrule, role='Process']:
+                                                         issapicrule, role='ElseScope']:
    [ Let_11112111( <y.19, z.3>, y.18 ) ]
   -->
    [ State_11112111( z.3, y.18, y.19 ) ]
 
   /*
-  rule (modulo AC) letybitstringzbitstringnotpair_1_1111211[color=#ffffff,
+  rule (modulo AC) letybitstringzbitstringnotpair_1_1111211[color=#4f4080,
                                                             process="let <y.19:bitstring, z.3:bitstring>='not_pair'",
-                                                            issapicrule, role='Process']:
+                                                            issapicrule, role='ElseScope']:
      [ Let_11112111( <y, z>, y.1 ) ] --> [ State_11112111( z, y.1, y ) ]
   */
 
@@ -1013,17 +1013,17 @@ restriction Restr_letybitstringzbitstringnotpair_2_1111211_1:
     (∀ z y. (<y, z> = 'not_pair') ⇒ (⊥))"
   */
 
-rule (modulo E) letybitstringzbitstringnotpair_2_1111211[color=#ffffff,
+rule (modulo E) letybitstringzbitstringnotpair_2_1111211[color=#4f4080,
                                                          process="let <y.19:bitstring, z.3:bitstring>='not_pair'",
-                                                         issapicrule, role='Process']:
+                                                         issapicrule, role='ElseScope']:
    [ Let_11112111( 'not_pair', y.18 ) ]
   --[ Restr_letybitstringzbitstringnotpair_2_1111211_1( ) ]->
    [ State_11112112( y.18 ) ]
 
   /*
-  rule (modulo AC) letybitstringzbitstringnotpair_2_1111211[color=#ffffff,
+  rule (modulo AC) letybitstringzbitstringnotpair_2_1111211[color=#4f4080,
                                                             process="let <y.19:bitstring, z.3:bitstring>='not_pair'",
-                                                            issapicrule, role='Process']:
+                                                            issapicrule, role='ElseScope']:
      [ Let_11112111( 'not_pair', y ) ]
     --[ Restr_letybitstringzbitstringnotpair_2_1111211_1( ) ]->
      [ State_11112112( y ) ]
@@ -1474,8 +1474,8 @@ restriction single_session:
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 11fd6fa5d1edf416991cd98a965de963efb0e2f0 (with uncommited changes), branch: fix/sapic-soundness
-Compiled at: 2026-09-17 09:52:12.248425871 UTC
+Git revision: 5cd5de25309ab22475ecca1457f9de4f4226a553, branch: HEAD
+Compiled at: 2026-09-20 11:25:18.797674569 UTC
 */
 
 end
@@ -1487,7 +1487,7 @@ summary of summaries:
 analyzed: examples/regression/trace/soundness-sapic-process-call-capture.spthy
 
   output:          examples/regression/trace/soundness-sapic-process-call-capture.spthy.tmp
-  processing time: 1.60s
+  processing time: 2.75s
   
   typed_distinct (exists-trace): verified (3 steps)
   untyped_distinct (exists-trace): verified (3 steps)

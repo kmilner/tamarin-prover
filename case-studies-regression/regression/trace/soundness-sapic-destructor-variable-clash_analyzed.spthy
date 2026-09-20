@@ -126,25 +126,25 @@ rule (modulo E) inx_0_2111[color=#628040, process="in(x.2);",
      [ State_2111( sk ), In( x ) ] --> [ State_21111( sk, x ) ]
   */
 
-rule (modulo E) letmadecxsk_0_21111[color=#ffffff,
-                                    process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+rule (modulo E) letmadecxsk_0_21111[color=#628040,
+                                    process="let m.1=adec(x.2, sk.1)", issapicrule, role='B']:
    [ State_21111( sk.1, x.2 ) ] --> [ Let_211111( <x.2, sk.1>, sk.1, x.2 ) ]
 
   /*
-  rule (modulo AC) letmadecxsk_0_21111[color=#ffffff,
-                                       process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+  rule (modulo AC) letmadecxsk_0_21111[color=#628040,
+                                       process="let m.1=adec(x.2, sk.1)", issapicrule, role='B']:
      [ State_21111( sk, x ) ] --> [ Let_211111( <x, sk>, sk, x ) ]
   */
 
-rule (modulo E) letmadecxsk_1_21111[color=#ffffff,
-                                    process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+rule (modulo E) letmadecxsk_1_21111[color=#628040,
+                                    process="let m.1=adec(x.2, sk.1)", issapicrule, role='B']:
    [ Let_211111( <aenc(m.1, pk(x.4)), x.4>, sk.1, x.2 ) ]
   -->
    [ State_211111( m.1, sk.1, x.2 ) ]
 
   /*
-  rule (modulo AC) letmadecxsk_1_21111[color=#ffffff,
-                                       process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+  rule (modulo AC) letmadecxsk_1_21111[color=#628040,
+                                       process="let m.1=adec(x.2, sk.1)", issapicrule, role='B']:
      [ Let_211111( <aenc(m, pk(x)), x>, sk, x.1 ) ]
     -->
      [ State_211111( m, sk, x.1 ) ]
@@ -163,15 +163,15 @@ restriction Restr_letmadecxsk_2_21111_1:
     (∀ m x.1. (<aenc(m, pk(x.1)), x.1> = x) ⇒ (⊥))"
   */
 
-rule (modulo E) letmadecxsk_2_21111[color=#ffffff,
-                                    process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+rule (modulo E) letmadecxsk_2_21111[color=#628040,
+                                    process="let m.1=adec(x.2, sk.1)", issapicrule, role='B']:
    [ Let_211111( <x.2, sk.1>, sk.1, x.2 ) ]
   --[ Restr_letmadecxsk_2_21111_1( <x.2, sk.1> ) ]->
    [ State_211112( sk.1, x.2 ) ]
 
   /*
-  rule (modulo AC) letmadecxsk_2_21111[color=#ffffff,
-                                       process="let m.1=adec(x.2, sk.1)", issapicrule, role='Process']:
+  rule (modulo AC) letmadecxsk_2_21111[color=#628040,
+                                       process="let m.1=adec(x.2, sk.1)", issapicrule, role='B']:
      [ Let_211111( <x, sk>, sk, x ) ]
     --[ Restr_letmadecxsk_2_21111_1( <x, sk> ) ]->
      [ State_211112( sk, x ) ]
@@ -238,8 +238,8 @@ restriction single_session:
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 0f38405632cbbbb1486edc6b67f9c2aaa9fe699b (with uncommited changes), branch: fix/sapic-soundness
-Compiled at: 2026-09-17 08:06:11.912386071 UTC
+Git revision: 5cd5de25309ab22475ecca1457f9de4f4226a553, branch: HEAD
+Compiled at: 2026-09-20 11:25:18.797674569 UTC
 */
 
 end
@@ -251,7 +251,7 @@ summary of summaries:
 analyzed: examples/regression/trace/soundness-sapic-destructor-variable-clash.spthy
 
   output:          examples/regression/trace/soundness-sapic-destructor-variable-clash.spthy.tmp
-  processing time: 0.08s
+  processing time: 0.13s
   
   dec_reach (exists-trace): verified (4 steps)
   no_dec (all-traces): falsified - found trace (4 steps)

@@ -110,33 +110,33 @@ rule (modulo E) news_0_111[color=#484080, process="new s.1;",
      [ State_111( ), Fr( s ) ] --> [ State_1111( s ) ]
   */
 
-rule (modulo E) letxdcs_0_1111[color=#ffffff,
-                               process="let x.1=d(c1(s.1))", issapicrule, role='Process']:
+rule (modulo E) letxdcs_0_1111[color=#484080,
+                               process="let x.1=d(c1(s.1))", issapicrule, role='P1']:
    [ State_1111( s.1 ) ] --> [ Let_11111( c1(s.1), s.1 ) ]
 
   /*
-  rule (modulo AC) letxdcs_0_1111[color=#ffffff,
-                                  process="let x.1=d(c1(s.1))", issapicrule, role='Process']:
+  rule (modulo AC) letxdcs_0_1111[color=#484080,
+                                  process="let x.1=d(c1(s.1))", issapicrule, role='P1']:
      [ State_1111( s ) ] --> [ Let_11111( c1(s), s ) ]
   */
 
-rule (modulo E) letxdcs_1_1111[color=#ffffff,
-                               process="let x.1=d(c1(s.1))", issapicrule, role='Process']:
+rule (modulo E) letxdcs_1_1111[color=#484080,
+                               process="let x.1=d(c1(s.1))", issapicrule, role='P1']:
    [ Let_11111( c1(x.1), s.1 ) ] --> [ State_11111( s.1, x.1 ) ]
 
   /*
-  rule (modulo AC) letxdcs_1_1111[color=#ffffff,
-                                  process="let x.1=d(c1(s.1))", issapicrule, role='Process']:
+  rule (modulo AC) letxdcs_1_1111[color=#484080,
+                                  process="let x.1=d(c1(s.1))", issapicrule, role='P1']:
      [ Let_11111( c1(x), s ) ] --> [ State_11111( s, x ) ]
   */
 
-rule (modulo E) letxdcs_2_1111[color=#ffffff,
-                               process="let x.1=d(c1(s.1))", issapicrule, role='Process']:
+rule (modulo E) letxdcs_2_1111[color=#484080,
+                               process="let x.1=d(c1(s.1))", issapicrule, role='P1']:
    [ Let_11111( c2(x.1), s.1 ) ] --> [ State_11111( s.1, x.1 ) ]
 
   /*
-  rule (modulo AC) letxdcs_2_1111[color=#ffffff,
-                                  process="let x.1=d(c1(s.1))", issapicrule, role='Process']:
+  rule (modulo AC) letxdcs_2_1111[color=#484080,
+                                  process="let x.1=d(c1(s.1))", issapicrule, role='P1']:
      [ Let_11111( c2(x), s ) ] --> [ State_11111( s, x ) ]
   */
 
@@ -162,16 +162,16 @@ restriction Restr_letxdcs_3_1111_2:
     (Restr_letxdcs_3_1111_2( x ) @ #NOW) ⇒ (∀ x.1. (c2(x.1) = x) ⇒ (⊥))"
   */
 
-rule (modulo E) letxdcs_3_1111[color=#ffffff,
-                               process="let x.1=d(c1(s.1))", issapicrule, role='Process']:
+rule (modulo E) letxdcs_3_1111[color=#484080,
+                               process="let x.1=d(c1(s.1))", issapicrule, role='P1']:
    [ Let_11111( c1(s.1), s.1 ) ]
   --[ Restr_letxdcs_3_1111_1( c1(s.1) ), Restr_letxdcs_3_1111_2( c1(s.1) )
   ]->
    [ State_11112( s.1 ) ]
 
   /*
-  rule (modulo AC) letxdcs_3_1111[color=#ffffff,
-                                  process="let x.1=d(c1(s.1))", issapicrule, role='Process']:
+  rule (modulo AC) letxdcs_3_1111[color=#484080,
+                                  process="let x.1=d(c1(s.1))", issapicrule, role='P1']:
      [ Let_11111( c1(s), s ) ]
     --[ Restr_letxdcs_3_1111_1( c1(s) ), Restr_letxdcs_3_1111_2( c1(s) ) ]->
      [ State_11112( s ) ]
@@ -235,33 +235,33 @@ rule (modulo E) news_0_121[color=#805040, process="new s.2;",
      [ State_121( ), Fr( s ) ] --> [ State_1211( s ) ]
   */
 
-rule (modulo E) letydcs_0_1211[color=#ffffff,
-                               process="let y.1=d(c2(s.2))", issapicrule, role='Process']:
+rule (modulo E) letydcs_0_1211[color=#805040,
+                               process="let y.1=d(c2(s.2))", issapicrule, role='P2']:
    [ State_1211( s.2 ) ] --> [ Let_12111( c2(s.2), s.2 ) ]
 
   /*
-  rule (modulo AC) letydcs_0_1211[color=#ffffff,
-                                  process="let y.1=d(c2(s.2))", issapicrule, role='Process']:
+  rule (modulo AC) letydcs_0_1211[color=#805040,
+                                  process="let y.1=d(c2(s.2))", issapicrule, role='P2']:
      [ State_1211( s ) ] --> [ Let_12111( c2(s), s ) ]
   */
 
-rule (modulo E) letydcs_1_1211[color=#ffffff,
-                               process="let y.1=d(c2(s.2))", issapicrule, role='Process']:
+rule (modulo E) letydcs_1_1211[color=#805040,
+                               process="let y.1=d(c2(s.2))", issapicrule, role='P2']:
    [ Let_12111( c1(y.1), s.2 ) ] --> [ State_12111( y.1, s.2 ) ]
 
   /*
-  rule (modulo AC) letydcs_1_1211[color=#ffffff,
-                                  process="let y.1=d(c2(s.2))", issapicrule, role='Process']:
+  rule (modulo AC) letydcs_1_1211[color=#805040,
+                                  process="let y.1=d(c2(s.2))", issapicrule, role='P2']:
      [ Let_12111( c1(y), s ) ] --> [ State_12111( y, s ) ]
   */
 
-rule (modulo E) letydcs_2_1211[color=#ffffff,
-                               process="let y.1=d(c2(s.2))", issapicrule, role='Process']:
+rule (modulo E) letydcs_2_1211[color=#805040,
+                               process="let y.1=d(c2(s.2))", issapicrule, role='P2']:
    [ Let_12111( c2(y.1), s.2 ) ] --> [ State_12111( y.1, s.2 ) ]
 
   /*
-  rule (modulo AC) letydcs_2_1211[color=#ffffff,
-                                  process="let y.1=d(c2(s.2))", issapicrule, role='Process']:
+  rule (modulo AC) letydcs_2_1211[color=#805040,
+                                  process="let y.1=d(c2(s.2))", issapicrule, role='P2']:
      [ Let_12111( c2(y), s ) ] --> [ State_12111( y, s ) ]
   */
 
@@ -287,16 +287,16 @@ restriction Restr_letydcs_3_1211_2:
     (Restr_letydcs_3_1211_2( x ) @ #NOW) ⇒ (∀ y. (c2(y) = x) ⇒ (⊥))"
   */
 
-rule (modulo E) letydcs_3_1211[color=#ffffff,
-                               process="let y.1=d(c2(s.2))", issapicrule, role='Process']:
+rule (modulo E) letydcs_3_1211[color=#805040,
+                               process="let y.1=d(c2(s.2))", issapicrule, role='P2']:
    [ Let_12111( c2(s.2), s.2 ) ]
   --[ Restr_letydcs_3_1211_1( c2(s.2) ), Restr_letydcs_3_1211_2( c2(s.2) )
   ]->
    [ State_12112( s.2 ) ]
 
   /*
-  rule (modulo AC) letydcs_3_1211[color=#ffffff,
-                                  process="let y.1=d(c2(s.2))", issapicrule, role='Process']:
+  rule (modulo AC) letydcs_3_1211[color=#805040,
+                                  process="let y.1=d(c2(s.2))", issapicrule, role='P2']:
      [ Let_12111( c2(s), s ) ]
     --[ Restr_letydcs_3_1211_1( c2(s) ), Restr_letydcs_3_1211_2( c2(s) ) ]->
      [ State_12112( s ) ]
@@ -350,29 +350,29 @@ rule (modulo E) PI_0_2[color=#ffffff, process="PI();", issapicrule,
 
   /* has exactly the trivial AC variant */
 
-rule (modulo E) letzdinvalid_0_21[color=#ffffff,
-                                  process="let z.1=d('invalid')", issapicrule, role='Process']:
+rule (modulo E) letzdinvalid_0_21[color=#804040,
+                                  process="let z.1=d('invalid')", issapicrule, role='PI']:
    [ State_21( ) ] --> [ Let_211( 'invalid' ) ]
 
   /* has exactly the trivial AC variant */
 
-rule (modulo E) letzdinvalid_1_21[color=#ffffff,
-                                  process="let z.1=d('invalid')", issapicrule, role='Process']:
+rule (modulo E) letzdinvalid_1_21[color=#804040,
+                                  process="let z.1=d('invalid')", issapicrule, role='PI']:
    [ Let_211( c1(z.1) ) ] --> [ State_211( z.1 ) ]
 
   /*
-  rule (modulo AC) letzdinvalid_1_21[color=#ffffff,
-                                     process="let z.1=d('invalid')", issapicrule, role='Process']:
+  rule (modulo AC) letzdinvalid_1_21[color=#804040,
+                                     process="let z.1=d('invalid')", issapicrule, role='PI']:
      [ Let_211( c1(z) ) ] --> [ State_211( z ) ]
   */
 
-rule (modulo E) letzdinvalid_2_21[color=#ffffff,
-                                  process="let z.1=d('invalid')", issapicrule, role='Process']:
+rule (modulo E) letzdinvalid_2_21[color=#804040,
+                                  process="let z.1=d('invalid')", issapicrule, role='PI']:
    [ Let_211( c2(z.1) ) ] --> [ State_211( z.1 ) ]
 
   /*
-  rule (modulo AC) letzdinvalid_2_21[color=#ffffff,
-                                     process="let z.1=d('invalid')", issapicrule, role='Process']:
+  rule (modulo AC) letzdinvalid_2_21[color=#804040,
+                                     process="let z.1=d('invalid')", issapicrule, role='PI']:
      [ Let_211( c2(z) ) ] --> [ State_211( z ) ]
   */
 
@@ -398,8 +398,8 @@ restriction Restr_letzdinvalid_3_21_2:
     (Restr_letzdinvalid_3_21_2( ) @ #NOW) ⇒ (∀ z. (c2(z) = 'invalid') ⇒ (⊥))"
   */
 
-rule (modulo E) letzdinvalid_3_21[color=#ffffff,
-                                  process="let z.1=d('invalid')", issapicrule, role='Process']:
+rule (modulo E) letzdinvalid_3_21[color=#804040,
+                                  process="let z.1=d('invalid')", issapicrule, role='PI']:
    [ Let_211( 'invalid' ) ]
   --[ Restr_letzdinvalid_3_21_1( ), Restr_letzdinvalid_3_21_2( ) ]->
    [ State_212( ) ]
@@ -453,8 +453,8 @@ restriction single_session:
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 0f38405632cbbbb1486edc6b67f9c2aaa9fe699b (with uncommited changes), branch: fix/sapic-soundness
-Compiled at: 2026-09-17 08:06:11.912386071 UTC
+Git revision: 5cd5de25309ab22475ecca1457f9de4f4226a553, branch: HEAD
+Compiled at: 2026-09-20 11:25:18.797674569 UTC
 */
 
 end
@@ -466,7 +466,7 @@ summary of summaries:
 analyzed: examples/regression/trace/soundness-sapic-destructor-alternatives.spthy
 
   output:          examples/regression/trace/soundness-sapic-destructor-alternatives.spthy.tmp
-  processing time: 0.10s
+  processing time: 0.18s
   
   success1 (exists-trace): verified (3 steps)
   success2 (exists-trace): verified (3 steps)
