@@ -105,17 +105,37 @@ restriction onlyOnce [right]:
   "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
+  */
+
 restriction onlyOnce [left]:
   "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
+  */
 
 restriction select_limited_votes [right]:
   "∀ a b c d #i. (Select_vote( (a++b++c++d) ) @ #i) ⇒ (⊥)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ a b c d #i. (Select_vote( (a++b++c++d) ) @ #i) ⇒ (⊥)"
+  */
+
 restriction select_limited_votes [left]:
   "∀ a b c d #i. (Select_vote( (a++b++c++d) ) @ #i) ⇒ (⊥)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ a b c d #i. (Select_vote( (a++b++c++d) ) @ #i) ⇒ (⊥)"
+  */
 
 lemma exec [right]:
   exists-trace
@@ -88332,8 +88352,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: 5f5feeb36d43da4cd9ab1de2f194f316df251d62 (with uncommited changes), branch: fix/diff-soundness
+Compiled at: 2026-09-20 11:52:40.567622193 UTC
 */
 
 end
@@ -88345,7 +88365,7 @@ summary of summaries:
 analyzed: examples/post17/okamoto_receipt_freeness.spthy
 
   output:          examples/post17/okamoto_receipt_freeness.spthy.tmp
-  processing time: 165.54s
+  processing time: 270.83s
   
   RHS :  exec (exists-trace): verified (12 steps)
   LHS :  exec (exists-trace): verified (12 steps)

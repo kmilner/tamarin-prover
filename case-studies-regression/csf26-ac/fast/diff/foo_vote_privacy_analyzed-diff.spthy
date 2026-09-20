@@ -82,9 +82,19 @@ restriction onlyOnce [right]:
   "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
+  */
+
 restriction onlyOnce [left]:
   "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ #i #j. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
+  */
 
 lemma exec [right]:
   exists-trace "∃ #i #j. ((V_4( ) @ #i) ∧ (V_4( ) @ #j)) ∧ (¬(#i = #j))"
@@ -21890,8 +21900,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: 5f5feeb36d43da4cd9ab1de2f194f316df251d62 (with uncommited changes), branch: fix/diff-soundness
+Compiled at: 2026-09-20 11:52:40.567622193 UTC
 */
 
 end
@@ -21903,7 +21913,7 @@ summary of summaries:
 analyzed: examples/csf26-ac/fast/diff/foo_vote_privacy.spthy
 
   output:          examples/csf26-ac/fast/diff/foo_vote_privacy.spthy.tmp
-  processing time: 31.36s
+  processing time: 56.92s
   
   RHS :  exec (exists-trace): verified (12 steps)
   LHS :  exec (exists-trace): verified (12 steps)

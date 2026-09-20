@@ -32,9 +32,19 @@ restriction OnlyOnce [right]:
   "∀ #j #i. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ #j #i. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
+  */
+
 restriction OnlyOnce [left]:
   "∀ #j #i. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ #j #i. ((OnlyOnce( ) @ #i) ∧ (OnlyOnce( ) @ #j)) ⇒ (#i = #j)"
+  */
 
 diffLemma Observational_equivalence:
 rule-equivalence
@@ -9047,8 +9057,8 @@ Subterm Convergence Warning
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: 5f5feeb36d43da4cd9ab1de2f194f316df251d62 (with uncommited changes), branch: fix/diff-soundness
+Compiled at: 2026-09-20 11:52:40.567622193 UTC
 */
 
 end
@@ -9060,7 +9070,7 @@ summary of summaries:
 analyzed: examples/csf26-ac/exponential_mixnet/exponential_mixnet_V2.spthy
 
   output:          examples/csf26-ac/exponential_mixnet/exponential_mixnet_V2.spthy.tmp
-  processing time: 33.24s
+  processing time: 87.79s
   
   WARNING: 1 wellformedness check failed!
            The analysis results might be wrong!

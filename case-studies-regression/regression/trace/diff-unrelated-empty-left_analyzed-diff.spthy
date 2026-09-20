@@ -414,35 +414,20 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 694c5d42fd970c7e081523088361f9afe24d5fea (with uncommited changes), branch: fix/diff-soundness
-Compiled at: 2026-09-19 08:28:00.942091369 UTC
+Git revision: 5f5feeb36d43da4cd9ab1de2f194f316df251d62 (with uncommited changes), branch: fix/diff-soundness
+Compiled at: 2026-09-20 11:52:40.567622193 UTC
 */
 
 end
 /* Output
-maude tool: 'maude'
- checking version: 3.5.1. OK.
- checking installation: OK.
-diffLemma
-[Theory UnrelatedEmptyFamily] Theory loaded
-[Theory UnrelatedEmptyFamily] Theory translated
-[Theory UnrelatedEmptyFamily] No Deconstruction Chain checks started
-[Theory UnrelatedEmptyFamily] No Deconstruction Chain checks ended
-[Theory UnrelatedEmptyFamily] No Deconstruction Chain checks for diff mode started
-[Theory UnrelatedEmptyFamily] No Deconstruction Chain checks ended
-[Theory UnrelatedEmptyFamily] Theory closed
-[Saturating Sources] Done
-[Saturating Sources] Done
-[Saturating Sources] Done
-[Saturating Sources] Done
 
 ==============================================================================
 summary of summaries:
 
 analyzed: examples/regression/trace/diff-unrelated-empty-left.spthy
 
-  output:          /tmp/round8-diff/unrelated-left.spthy
-  processing time: 0.10s
+  output:          examples/regression/trace/diff-unrelated-empty-left.spthy.tmp
+  processing time: 0.08s
   
   RHS :  setup (exists-trace): verified (2 steps)
   LHS :  setup (exists-trace): verified (2 steps)

@@ -67,17 +67,37 @@ restriction equality [right]:
   "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  */
+
 restriction equality [left]:
   "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  */
 
 restriction unique [right]:
   "∀ x #i #j. ((OnlyOnce( x ) @ #i) ∧ (OnlyOnce( x ) @ #j)) ⇒ (#i = #j)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ x #i #j. ((OnlyOnce( x ) @ #i) ∧ (OnlyOnce( x ) @ #j)) ⇒ (#i = #j)"
+  */
+
 restriction unique [left]:
   "∀ x #i #j. ((OnlyOnce( x ) @ #i) ∧ (OnlyOnce( x ) @ #j)) ⇒ (#i = #j)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ x #i #j. ((OnlyOnce( x ) @ #i) ∧ (OnlyOnce( x ) @ #j)) ⇒ (#i = #j)"
+  */
 
 lemma executable [right]:
   exists-trace "∃ x #j. Response( x, 'Tag' ) @ #j"
@@ -15117,8 +15137,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: 5f5feeb36d43da4cd9ab1de2f194f316df251d62 (with uncommited changes), branch: fix/diff-soundness
+Compiled at: 2026-09-20 11:52:40.567622193 UTC
 */
 
 end
@@ -15130,7 +15150,7 @@ summary of summaries:
 analyzed: examples/csf18-xor/diff-models/CH07-UK2.spthy
 
   output:          examples/csf18-xor/diff-models/CH07-UK2.spthy.tmp
-  processing time: 21.39s
+  processing time: 35.22s
   
   RHS :  executable (exists-trace): verified (5 steps)
   LHS :  executable (exists-trace): verified (5 steps)

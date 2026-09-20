@@ -44,18 +44,40 @@ restriction onylOnce [right]:
     ((OnlyOnce( x ) @ #i1) ∧ (OnlyOnce( x ) @ #i2)) ⇒ (#i1 = #i2)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ x #i1 #i2.
+    ((OnlyOnce( x ) @ #i1) ∧ (OnlyOnce( x ) @ #i2)) ⇒ (#i1 = #i2)"
+  */
+
 restriction onylOnce [left]:
   "∀ x #i1 #i2.
     ((OnlyOnce( x ) @ #i1) ∧ (OnlyOnce( x ) @ #i2)) ⇒ (#i1 = #i2)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ x #i1 #i2.
+    ((OnlyOnce( x ) @ #i1) ∧ (OnlyOnce( x ) @ #i2)) ⇒ (#i1 = #i2)"
+  */
+
 restriction equality [right]:
   "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
   // safety formula
 
+  /*
+  expanded formula:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  */
+
 restriction equality [left]:
   "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
   // safety formula
+
+  /*
+  expanded formula:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  */
 
 diffLemma Observational_equivalence:
 rule-equivalence
@@ -68,28 +90,22 @@ rule-equivalence
       step( solve( (#vl, 0) ~~> (#i, 1) ) )
         case d_0_fst
         step( solve( (#vr.1, 0) ~~> (#i, 1) ) )
-          case d_xor_case_1
+          case d_xor_case_3
           step( solve( (#vr.2, 0) ~~> (#i, 1) ) )
-            case xor
+            case Var_fresh_id
             step( solve( TagRun( <~k, ~id> ) ▶₂ #vr ) )
               case setup
-              step( solve( !KU( (~r2⊕z) ) @ #vk.2 ) )
-                case c_xor_case_1
-                step( solve( !KU( ~r2 ) @ #vk.4 ) )
-                  case tag1_case_2
-                  step( solve( !KU( h(<r1, ~k>) ) @ #vk.5 ) )
+              step( solve( !KU( ~r2 ) @ #vk.2 ) )
+                case tag1_case_2
+                step( solve( !KU( h(<r1, ~k>) ) @ #vk.3 ) )
+                  case transcript
+                  step( solve( !KU( ~id ) @ #vk.2 ) )
                     case transcript
-                    step( solve( !KU( ~r2.1 ) @ #vk.6 ) )
+                    step( solve( !KU( ~r2.1 ) @ #vk.4 ) )
                       case transcript_case_1
-                      step( solve( !KU( ~r1 ) @ #vk.5 ) )
+                      step( solve( !KU( ~r1 ) @ #vk.4 ) )
                         case transcript
-                        step( solve( !KU( (~id⊕z) ) @ #vk.5 ) )
-                          case c_xor_case_1
-                          step( solve( !KU( ~id ) @ #vk.7 ) )
-                            case transcript
-                            by ATTACK // trace found
-                          qed
-                        qed
+                        by ATTACK // trace found
                       qed
                     qed
                   qed
@@ -109,8 +125,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 41bc81379b23681e7057314a5cf66a25c45e1986, branch: canonicalise-subst
-Compiled at: 2026-07-27 16:11:34.947223 UTC
+Git revision: 5f5feeb36d43da4cd9ab1de2f194f316df251d62 (with uncommited changes), branch: fix/diff-soundness
+Compiled at: 2026-09-20 11:52:40.567622193 UTC
 */
 
 end
@@ -122,9 +138,9 @@ summary of summaries:
 analyzed: examples/csf18-xor/diff-models/KCL07-UK2.spthy
 
   output:          examples/csf18-xor/diff-models/KCL07-UK2.spthy.tmp
-  processing time: 23.18s
+  processing time: 43.33s
   
-  DiffLemma:  Observational_equivalence : falsified - found trace (16 steps)
+  DiffLemma:  Observational_equivalence : falsified - found trace (14 steps)
 
 ==============================================================================
 */
