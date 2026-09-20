@@ -10,20 +10,6 @@ equations:
     snd(<x.1, x.2>) = x.2,
     unionUD((x add y)) = x
 
-rule (modulo E) reader1:
-   [ Fr( ~nr ) ] --> [ Reader1( ~nr ), Out( ~nr ) ]
-
-rule (modulo E) reader2:
-   [ Reader1( ~nr ), ReaderRun( k ), In( h(<~nr, k>) ) ]
-  --[ Finished( ) ]->
-   [ ]
-
-rule (modulo E) select_reader:
-   [ Reader( (~k add z) ) ] --> [ ReaderRun( ~k ), Reader( z ) ]
-
-rule (modulo E) select_tag:
-   [ Tag( (~k add z) ) ] --> [ TagRun( ~k ), Tag( z ) ]
-
 rule (modulo E) setup:
    [ Fr( key1 ), Fr( key2 ) ]
   --[ Setup( ) ]->
@@ -31,21 +17,25 @@ rule (modulo E) setup:
    Reader( ('1' add diff((key1 add key2), (key1 add key1))) ),
    Tag( ('1' add diff((key1 add key2), (key1 add key1))) )
    ]
- left
-  rule (modulo E) setup:
-     [ Fr( key1 ), Fr( key2 ) ]
-    --[ Setup( ) ]->
-     [ Reader( ('1' add key1 add key2) ), Tag( ('1' add key1 add key2) ) ]
- right
-  rule (modulo E) setup:
-     [ Fr( key1 ), Fr( key2 ) ]
-    --[ Setup( ) ]->
-     [ Reader( ('1' add key1 add key1) ), Tag( ('1' add key1 add key1) ) ]
+
+rule (modulo E) select_tag:
+   [ Tag( (~k add z) ) ] --> [ TagRun( ~k ), Tag( z ) ]
+
+rule (modulo E) select_reader:
+   [ Reader( (~k add z) ) ] --> [ ReaderRun( ~k ), Reader( z ) ]
+
+rule (modulo E) reader1:
+   [ Fr( ~nr ) ] --> [ Reader1( ~nr ), Out( ~nr ) ]
 
 rule (modulo E) tag1:
    [ In( x ), TagRun( k ), Fr( ~nt ) ]
   --[ TagRun( k ) ]->
    [ Out( h(<x, k>) ) ]
+
+rule (modulo E) reader2:
+   [ Reader1( ~nr ), ReaderRun( k ), In( h(<~nr, k>) ) ]
+  --[ Finished( ) ]->
+   [ ]
 
 lemma executable [right]:
   exists-trace "∃ #i. Finished( ) @ #i"
@@ -150,8 +140,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 1e4622f694f4f4caddc5a6df509f44c6c7e00e5f (with uncommited changes), branch: HEAD
-Compiled at: 2026-09-17 09:37:03.614454025 UTC
+Git revision: 5f5feeb36d43da4cd9ab1de2f194f316df251d62 (with uncommited changes), branch: fix/diff-soundness
+Compiled at: 2026-09-20 11:52:40.567622193 UTC
 */
 
 end
@@ -163,7 +153,7 @@ summary of summaries:
 analyzed: examples/csf26-ac/fast/diff/traceable.spthy
 
   output:          examples/csf26-ac/fast/diff/traceable.spthy.tmp
-  processing time: 0.60s
+  processing time: 0.49s
   
   RHS :  executable (exists-trace): verified (8 steps)
   LHS :  executable (exists-trace): verified (8 steps)

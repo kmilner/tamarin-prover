@@ -12,12 +12,6 @@ rule (modulo E) DDH:
    [ Fr( ~x ), Fr( ~y ), Fr( ~z ) ]
   -->
    [ Out( <g^~x, g^~y, diff(g^~z, g^~x^~y)> ) ]
- left
-  rule (modulo E) DDH:
-     [ Fr( ~x ), Fr( ~y ), Fr( ~z ) ] --> [ Out( <g^~x, g^~y, g^~z> ) ]
- right
-  rule (modulo E) DDH:
-     [ Fr( ~x ), Fr( ~y ), Fr( ~z ) ] --> [ Out( <g^~x, g^~y, g^(~x*~y)> ) ]
 
 diffLemma Observational_equivalence:
 rule-equivalence
@@ -7563,8 +7557,8 @@ qed
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: c8f67ec1caa3e57e489eb70f7e01acb68f1b767e (with uncommited changes), branch: fix/diff-soundness
-Compiled at: 2026-09-17 09:26:49.324027181 UTC
+Git revision: 5f5feeb36d43da4cd9ab1de2f194f316df251d62 (with uncommited changes), branch: fix/diff-soundness
+Compiled at: 2026-09-20 11:52:40.567622193 UTC
 */
 
 end
@@ -7576,7 +7570,7 @@ summary of summaries:
 analyzed: examples/ccs15/DDH.spthy
 
   output:          examples/ccs15/DDH.spthy.tmp
-  processing time: 2.92s
+  processing time: 2.88s
   
   DiffLemma:  Observational_equivalence : verified (2522 steps)
 
