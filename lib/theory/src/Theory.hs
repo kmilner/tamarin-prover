@@ -209,6 +209,12 @@ module Theory (
   , prettyNDCcheck
 
   , ClosedProtoRule(..)
+  , ClosedRuleFamily(..)
+  , ClosedDiffRule(..)
+  , closedFamilyRules
+  , closedDiffSide
+  , closedDiffParent
+  , SideRuleView
   , OpenProtoRule(..)
   , oprRuleE
   , oprRuleAC

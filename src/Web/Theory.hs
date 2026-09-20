@@ -71,7 +71,7 @@ import System.Process hiding (system)
 import Logic.Connectives
 import Theory hiding (lPlaintext)
 import Theory.Text.Pretty
-import ClosedTheory (prettyClosedProtoRule)
+import ClosedTheory (prettyClosedProtoRule, openClosedDiffRule, openDiffRuleFamily)
 import TheoryObject (theoryMacros, prettyTactic, diffTheoryMacros, diffTheorySideRules, DiffLemma (..))
 
 import Web.Settings
@@ -952,7 +952,7 @@ rulesDiffSnippet thy = vcat
         vsep $ map prettyDiffRule msrRules
     ]
   where
-    msrRules   = diffTheoryDiffRules thy
+    msrRules   = map (openClosedDiffRule openDiffRuleFamily) (diffTheoryDiffRules thy)
     ppWithHeader header body =
         caseEmptyDoc
             emptyDoc

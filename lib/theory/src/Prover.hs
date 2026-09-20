@@ -9,6 +9,7 @@ module Prover (
 import           Prelude                             hiding (id, (.))
 
 import qualified Data.Map                            as M
+import           Data.Functor.Identity (Identity(..))
 import           Data.Maybe
 import qualified Data.Set                            as S
 
@@ -106,10 +107,10 @@ closePreparedDiffTheory prepared autoSources =
     --
     -- NOTE that 'rdeepseq' is OK here, as the proof has not yet been checked
     -- and therefore no constraint systems will be unnecessarily cached.
-    (items, _solveRel, _breakers) = (`runReader` hnd) $ addSolvingLoopBreakers $ unfoldClosedRules
+    items = (`runReader` hnd) $ addSolvingLoopBreakers
        ((closeDiffTheoryItem <$> theoryItems) `using` parList rdeepseq)
 
-    closeDiffTheoryItem :: DiffTheoryItem DiffProtoRule [ClosedProtoRule] DiffProofSkeleton ProofSkeleton -> DiffTheoryItem DiffProtoRule [ClosedProtoRule] IncrementalDiffProof IncrementalProof
+    closeDiffTheoryItem :: DiffTheoryItem ClosedDiffRule ClosedRuleFamily DiffProofSkeleton ProofSkeleton -> DiffTheoryItem ClosedDiffRule ClosedRuleFamily IncrementalDiffProof IncrementalProof
     closeDiffTheoryItem = foldDiffTheoryItem
       DiffRuleItem
       EitherRuleItem
@@ -122,25 +123,13 @@ closePreparedDiffTheory prepared autoSources =
       DiffTextItem
       DiffConfigBlockItem
 
-    unfoldClosedRules :: [DiffTheoryItem DiffProtoRule [ClosedProtoRule] IncrementalDiffProof IncrementalProof] -> [DiffTheoryItem DiffProtoRule ClosedProtoRule IncrementalDiffProof IncrementalProof]
-    unfoldClosedRules    (EitherRuleItem (s,r):is) = map (\x -> EitherRuleItem (s,x)) r ++ unfoldClosedRules is
-    unfoldClosedRules          (DiffRuleItem i:is) = DiffRuleItem i:unfoldClosedRules is
-    unfoldClosedRules         (DiffLemmaItem i:is) = DiffLemmaItem i:unfoldClosedRules is
-    unfoldClosedRules       (EitherLemmaItem i:is) = EitherLemmaItem i:unfoldClosedRules is
-    unfoldClosedRules (EitherRestrictionItem i:is) = EitherRestrictionItem i:unfoldClosedRules is
-    unfoldClosedRules          (DiffTextItem i:is) = DiffTextItem i:unfoldClosedRules is
-    unfoldClosedRules         (DiffMacroItem i:is) = DiffMacroItem i:unfoldClosedRules is
-    unfoldClosedRules (DiffConfigBlockItem i:is)   = DiffConfigBlockItem i:unfoldClosedRules is
-    unfoldClosedRules                           [] = []
-
     -- Name of the auto-generated lemma
     lemmaName = "AUTO_typing"
 
     itemsModAC = unfoldRules items
 
-    unfoldRules (EitherRuleItem (s,r):is) = map (\x -> EitherRuleItem (s,x)) (unfoldRuleVariants r) ++ unfoldRules is
-    unfoldRules                    (i:is) = i:unfoldRules is
-    unfoldRules                        [] = []
+    unfoldRules = map $ runIdentity . traverseDiffRuleMembers
+      (\_ e ac -> pure $ map (L.get cprRuleAC) (unfoldRuleVariants (ClosedProtoRule e ac)))
 
     items' = addAutoSourcesLemmaDiff hnd lemmaName (cacheLeft itemsModAC) (cacheRight itemsModAC) itemsModAC
 
@@ -155,25 +144,21 @@ closePreparedDiffTheory prepared autoSources =
       guard (isSourceLemma lem)
       return $ formulaToGuarded_ $ L.get lFormula lem
 
-    -- extract protocol rules
-    leftClosedRules  :: [DiffTheoryItem DiffProtoRule ClosedProtoRule IncrementalDiffProof s] -> [ClosedProtoRule]
-    leftClosedRules its = leftTheoryRules  (DiffTheory errClose errClose errClose errClose errClose errClose errClose errClose errClose its errClose False)
-    rightClosedRules :: [DiffTheoryItem DiffProtoRule ClosedProtoRule IncrementalDiffProof s] -> [ClosedProtoRule]
-    rightClosedRules its = rightTheoryRules (DiffTheory errClose errClose errClose errClose errClose errClose errClose errClose errClose its errClose False)
-    errClose  = error "closeDiffTheory"
+    leftClosedRules = concatMap (diffItemSideRules LHS)
+    rightClosedRules = concatMap (diffItemSideRules RHS)
 
-    addSolvingLoopBreakers = useAutoLoopBreakersAC
-        (liftToItem $ enumPrems . L.get cprRuleAC)
-        (liftToItem $ enumConcs . L.get cprRuleAC)
-        (liftToItem $ getDisj . L.get (pracVariants . rInfo . cprRuleAC))
-        addBreakers
-      where
-        liftToItem f (EitherRuleItem (_, ru)) = f ru
-        liftToItem _ _                        = []
-
-        addBreakers bs (EitherRuleItem (s, ru)) =
-            EitherRuleItem (s, L.set (pracLoopBreakers . rInfo . cprRuleAC) bs ru)
-        addBreakers _  item              = item
+    -- Loop-breaker analysis still sees the same side/rule pairs, but writes
+    -- its annotations back into owned members rather than detached items.
+    addSolvingLoopBreakers its = do
+      let rules = [(side,ru) | item <- its, side <- [LHS,RHS], ru <- diffItemSideRules side item]
+      (annotated, _, _) <- useAutoLoopBreakersAC
+        (enumPrems . L.get cprRuleAC . snd)
+        (enumConcs . L.get cprRuleAC . snd)
+        (getDisj . L.get (pracVariants . rInfo . cprRuleAC) . snd)
+        (\bs (side,ru) -> (side, L.set (pracLoopBreakers . rInfo . cprRuleAC) bs ru)) rules
+      let updated = M.fromList $ zip rules (map (L.get cprRuleAC . snd) annotated)
+      pure $ map (runIdentity . traverseDiffRuleMembers
+        (\side e ac -> pure [updated M.! (side, ClosedProtoRule e ac)])) its
 
 -- | Prove both the assertion soundness as well as all lemmas of the theory. If
 -- the prover fails on a lemma, then its proof remains unchanged.
@@ -439,11 +424,11 @@ exportDiffTheory :: ClosedDiffTheory -> OpenDiffTheory
 exportDiffTheory thy = openDiffTheoryWith
     (exportDiffRuleFamily (L.get (sigmMaudeHandle . diffThySignature) thy)) thy
 
-openDiffTheoryWith :: ([ClosedProtoRule] -> OpenProtoRule) -> ClosedDiffTheory -> OpenDiffTheory
+openDiffTheoryWith :: (ClosedRuleFamily -> OpenProtoRule) -> ClosedDiffTheory -> OpenDiffTheory
 openDiffTheoryWith reopen (DiffTheory n f h t sig c1 c2 c3 c4 items opts sapic) =
     DiffTheory n f h t (toSignaturePure sig) (openRuleCache c1) (openRuleCache c2) (openRuleCache c3) (openRuleCache c4)
       (map (mapDiffTheoryItem id id (\(DiffLemma s a p) -> (DiffLemma s a (incrementalToSkeletonDiffProof p))) (\(x, Lemma a p m b c c' d e) -> (x, Lemma a p m b c c' d (incrementalToSkeletonProof e))))
-           (reconstructDiffRuleFamilies reopen items))
+           (map (mapDiffTheoryItem (openClosedDiffRule reopen) (fmap reopen) id id) items))
       opts sapic
 
 ------------------------------------------------------------------------------

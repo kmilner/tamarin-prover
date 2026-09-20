@@ -59,6 +59,40 @@ data ClosedProtoRule = ClosedProtoRule
        }
        deriving( Eq, Ord, Show, Generic, NFData, Binary )
 
+-- | A compiled family owns its E-rule even when compilation removes every
+-- variant. Unlike an OpenProtoRule, an empty member list means no executions.
+data ClosedRuleFamily = ClosedRuleFamily ProtoRuleE [ProtoRuleAC]
+       deriving (Eq, Ord, Show, Generic, NFData, Binary)
+
+-- | The two compiled sides belong to this parent throughout closing, source
+-- annotation and reopening. Member names are not used to recover ownership.
+data ClosedDiffRule = ClosedDiffRule ProtoRuleE ClosedRuleFamily ClosedRuleFamily
+       deriving (Eq, Ord, Show, Generic, NFData, Binary)
+
+closedFamilyRules :: ClosedRuleFamily -> [ClosedProtoRule]
+closedFamilyRules (ClosedRuleFamily parent members) = map (ClosedProtoRule parent) members
+
+closedDiffSide :: Side -> ClosedDiffRule -> ClosedRuleFamily
+closedDiffSide LHS (ClosedDiffRule _ left _) = left
+closedDiffSide RHS (ClosedDiffRule _ _ right) = right
+
+closedDiffParent :: ClosedDiffRule -> ProtoRuleE
+closedDiffParent (ClosedDiffRule parent _ _) = parent
+
+-- | Transform members in place, retaining their parent and positional slots.
+traverseClosedFamily :: Applicative f
+    => (ProtoRuleE -> ProtoRuleAC -> f [ProtoRuleAC])
+    -> ClosedRuleFamily -> f ClosedRuleFamily
+traverseClosedFamily f (ClosedRuleFamily parent members) =
+    ClosedRuleFamily parent . concat <$> traverse (f parent) members
+
+traverseClosedDiffRule :: Applicative f
+    => (Side -> ProtoRuleE -> ProtoRuleAC -> f [ProtoRuleAC])
+    -> ClosedDiffRule -> f ClosedDiffRule
+traverseClosedDiffRule f (ClosedDiffRule parent left right) =
+    ClosedDiffRule parent <$> traverseClosedFamily (f LHS) left
+                         <*> traverseClosedFamily (f RHS) right
+
 type OpenRuleCache = [IntrRuleAC]
 
 data ClosedRuleCache = ClosedRuleCache

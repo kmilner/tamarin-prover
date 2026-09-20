@@ -19,12 +19,12 @@ import Theory.Proof
 import TheoryObject
 
 type OpenItem = DiffTheoryItem DiffProtoRule OpenProtoRule DiffProofSkeleton ProofSkeleton
-type PreparedItem = DiffTheoryItem DiffProtoRule [ClosedProtoRule] DiffProofSkeleton ProofSkeleton
+type PreparedItem = DiffTheoryItem ClosedDiffRule ClosedRuleFamily DiffProofSkeleton ProofSkeleton
 type VariantReport = (Side, OpenProtoRule, [ProtoRuleAC], Bool)
 
 data PreparedDiffTheory = PreparedDiffTheory
     SignatureWithMaude OpenDiffTheory OpenDiffTheory
-    [([VariantReport], [PreparedItem])]
+    [([VariantReport], PreparedItem)]
 
 preparedDiffTheory :: PreparedDiffTheory -> OpenDiffTheory
 preparedDiffTheory (PreparedDiffTheory _ _ thy _) = thy
@@ -44,19 +44,20 @@ prepareDiffTheory sig input = PreparedDiffTheory sig input normalized blocks
           reports = case L.get dprLeftRight ru of
             Nothing -> []
             Just _ -> [fst left, fst right]
-          label (side, family) = (side, map labelClosed family)
-          labelClosed (ClosedProtoRule e ac) =
+          label (_, ClosedRuleFamily e members) =
             let name = "DiffProto" ++ getRuleName e
-            in ClosedProtoRule (addDiffLabel e name) (addDiffLabel ac name)
-      in (reports, DiffRuleItem ru : map (EitherRuleItem . label . snd) [left, right])
+            in ClosedRuleFamily (addDiffLabel e name) (map (`addDiffLabel` name) members)
+      in (reports, DiffRuleItem (ClosedDiffRule (L.get dprRule ru)
+                                 (label (snd left)) (label (snd right))))
     prepareItem (EitherRuleItem (side, ru)) =
-      ([], [EitherRuleItem (snd (prepareSide side ru))])
+      ([], EitherRuleItem (snd (prepareSide side ru)))
     prepareItem _ = error "prepareDiffTheory: non-rule in rule sequence"
     prepareSide side ru =
       let ((aligned, canonical, valid), automatic) = prepareDiffRuleWithAutomatic hnd ru
           closed | null (L.get oprRuleAC ru) = automatic
                  | otherwise = closeProtoRule hnd [] aligned
-      in ((side, ru, canonical, valid), (side, closed))
+      in ((side, ru, canonical, valid),
+          (side, ClosedRuleFamily (L.get oprRuleE aligned) (map (L.get cprRuleAC) closed)))
 
 -- | Reuse only when the signature, rules and macros are unchanged. The loader
 -- adds intruder caches and a default lemma between checking and closing. Those
@@ -90,7 +91,7 @@ reusePreparedDiffTheory sig input (PreparedDiffTheory oldSig original normalized
 preparedDiffVariantReports :: PreparedDiffTheory -> [VariantReport]
 preparedDiffVariantReports (PreparedDiffTheory _ _ _ blocks) = concatMap fst blocks
 
--- | Flatten prepared parent-owned families only at the compiled boundary.
+-- | Retain prepared families as the authoritative compiled representation.
 -- Adding a generated label commutes with compilation and alignment: it is a
 -- final zero-arity fact, so term abstraction, freshness and substitutions are
 -- unchanged. Every old action subsequence match extends by the final pair;
@@ -100,9 +101,9 @@ preparedDiffItems :: PreparedDiffTheory -> [PreparedItem]
 preparedDiffItems (PreparedDiffTheory _ _ thy blocks) = merge blocks (L.get diffThyItems thy)
   where
     merge _ [] = []
-    merge ((_,rs):rest) (i:is) | isRule i = rs ++ merge rest is
+    merge ((_,rule):rest) (i:is) | isRule i = rule : merge rest is
     merge [] (i:_) | isRule i = error "preparedDiffItems: missing prepared family"
-    merge rest (i:is) = mapDiffTheoryItem id (const (error "preparedDiffItems: missing rule block")) id id i : merge rest is
+    merge rest (i:is) = mapDiffTheoryItem (const (error "preparedDiffItems: missing parent block")) (const (error "preparedDiffItems: missing rule block")) id id i : merge rest is
 
 isRule :: OpenItem -> Bool
 isRule (DiffRuleItem _) = True

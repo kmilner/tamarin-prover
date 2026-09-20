@@ -1,4 +1,8 @@
 {-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -50,6 +54,11 @@ module TheoryObject
     theoryRules,
     diffTheoryDiffRules,
     diffTheorySideRules,
+    SideRuleView(..),
+    mapDiffTheoryItems,
+    traverseDiffRuleMembers,
+    legacyDiffItems,
+    ownDiffItems,
     leftTheoryRules,
     rightTheoryRules,
     theoryRestrictions,
@@ -164,6 +173,9 @@ import Items.CaseTestItem
 import Items.ExportInfo
 import Items.OptionItem
 import Items.ProcessItem
+import Rule (removeGeneratedDiffLabel)
+import Items.RuleItem
+import Data.Map.Strict qualified as M
 import Items.TheoryItem
 import Lemma
 import Pretty
@@ -209,9 +221,75 @@ data DiffTheory sig c r r2 p p2 = DiffTheory
     _diffThyOptions :: Option,
     _diffThyIsSapic :: Bool
   }
-  deriving (Eq, Ord, Show, Generic, NFData, Binary)
+  deriving (Eq, Ord, Show, Generic, NFData)
+
+instance (Binary sig, Binary c, Binary r2, Binary p, Binary p2) =>
+    Binary (DiffTheory sig c DiffProtoRule r2 p p2)
 
 $(mkLabels [''DiffTheory])
+
+-- | Change item representation without rebuilding the unrelated theory fields.
+mapDiffTheoryItems :: ([DiffTheoryItem r r2 p p2] -> [DiffTheoryItem r' r2' q q2])
+    -> DiffTheory sig c r r2 p p2 -> DiffTheory sig c r' r2' q q2
+mapDiffTheoryItems f (DiffTheory n file h t sig l r dl dr items opts sapic) =
+    DiffTheory n file h t sig l r dl dr (f items) opts sapic
+
+traverseDiffRuleMembers :: Applicative f
+    => (Side -> ProtoRuleE -> ProtoRuleAC -> f [ProtoRuleAC])
+    -> DiffTheoryItem ClosedDiffRule ClosedRuleFamily p p2
+    -> f (DiffTheoryItem ClosedDiffRule ClosedRuleFamily p p2)
+traverseDiffRuleMembers f (DiffRuleItem ru) = DiffRuleItem <$> traverseClosedDiffRule f ru
+traverseDiffRuleMembers f (EitherRuleItem (side, family)) =
+    (EitherRuleItem . (side,)) <$> traverseClosedFamily (f side) family
+traverseDiffRuleMembers _ item = pure item
+
+-- | Interactive sessions retain their original binary format. Flat side rules
+-- are imported once at this boundary; the live theory stores owned families.
+legacyDiffItems :: [DiffTheoryItem ClosedDiffRule ClosedRuleFamily p p2]
+    -> [DiffTheoryItem DiffProtoRule ClosedProtoRule p p2]
+legacyDiffItems = concatMap flatten
+  where
+    flatten (DiffRuleItem (ClosedDiffRule parent left right)) =
+      DiffRuleItem (DiffProtoRule parent (Just (declaration left, declaration right))) :
+        [EitherRuleItem (side, ru) | (side, family) <- [(LHS,left),(RHS,right)], ru <- closedFamilyRules family]
+    flatten (EitherRuleItem (side, family)) = map (EitherRuleItem . (side,)) (closedFamilyRules family)
+    flatten item = [mapDiffTheoryItem (error "Unexpected parent rule") (error "Unexpected side rule") id id item]
+    -- The old parent stored unlabelled declarations. The final zero-arity
+    -- parent marker belongs only to the compiled side members.
+    declaration (ClosedRuleFamily e _) =
+      OpenProtoRule (removeGeneratedDiffLabel ("DiffProto" ++ getRuleName e) e) []
+
+ownDiffItems :: [DiffTheoryItem DiffProtoRule ClosedProtoRule p p2]
+    -> Either String [DiffTheoryItem ClosedDiffRule ClosedRuleFamily p p2]
+ownDiffItems items = concat <$> traverse own items
+  where
+    families = foldr collect M.empty items
+    collect (EitherRuleItem (side, ru)) = M.insertWith (++) (side, ruleName (L.get cprRuleE ru)) [ru]
+    collect _ = id
+    parents = S.fromList [ruleName ru | DiffRuleItem ru <- items]
+    own (DiffRuleItem (DiffProtoRule parent declared)) = do
+      let (left,right) = fromMaybe (OpenProtoRule (getLeftRule parent) [], OpenProtoRule (getRightRule parent) []) declared
+      l <- family LHS left
+      r <- family RHS right
+      pure [DiffRuleItem (ClosedDiffRule parent l r)]
+    own (EitherRuleItem (side, ru))
+      | ruleName (L.get cprRuleE ru) `S.member` parents = pure []
+      | otherwise = pure [EitherRuleItem (side, ClosedRuleFamily (L.get cprRuleE ru) [L.get cprRuleAC ru])]
+    own item = pure [mapDiffTheoryItem (error "Unexpected parent rule") (error "Unexpected side rule") id id item]
+    family side (OpenProtoRule e _) = case M.lookup (side, ruleName e) families of
+      Nothing -> pure $ ClosedRuleFamily (addDiffLabel e ("DiffProto" ++ getRuleName e)) []
+      Just rules@(ClosedProtoRule parent _:_) | all ((== parent) . L.get cprRuleE) rules ->
+        pure $ ClosedRuleFamily parent (map (L.get cprRuleAC) rules)
+      _ -> Left $ "Inconsistent E-rules in saved diff family " ++ getRuleName e
+
+instance (Binary sig, Binary c, Binary p, Binary p2) =>
+    Binary (DiffTheory sig c ClosedDiffRule ClosedRuleFamily p p2) where
+  put = put . mapDiffTheoryItems legacyDiffItems
+  get = do
+    old <- Data.Binary.get
+    case ownDiffItems (L.get diffThyItems old) of
+      Left err -> fail err
+      Right items -> pure $ mapDiffTheoryItems (const items) old
 
 -- Shared theory modification functions
 ---------------------------------------
@@ -310,20 +388,27 @@ diffTheoryDiffRules :: DiffTheory sig c r r2 p p2 -> [r]
 diffTheoryDiffRules =
   foldDiffTheoryItem return (const []) (const []) (const []) (const []) (const []) (const []) (const []) <=< L.get diffThyItems
 
--- | All rules of a theory.
-diffTheorySideRules :: Side -> DiffTheory sig c r r2 p p2 -> [r2]
-diffTheorySideRules s =
-  foldDiffTheoryItem (const []) (\(x, y) -> if (x == s) then [y] else []) (const []) (const []) (const []) (const []) (const []) (const []) <=< L.get diffThyItems
+-- | Query flat rule views without making them a second writable store.
+class SideRuleView r r2 rule | r r2 -> rule where
+  diffItemSideRules :: Side -> DiffTheoryItem r r2 p p2 -> [rule]
 
--- | All left rules of a theory.
-leftTheoryRules :: DiffTheory sig c r r2 p p2 -> [r2]
-leftTheoryRules =
-  foldDiffTheoryItem (const []) (\(x, y) -> if (x == LHS) then [y] else []) (const []) (const []) (const []) (const []) (const []) (const []) <=< L.get diffThyItems
+instance SideRuleView DiffProtoRule r r where
+  diffItemSideRules side (EitherRuleItem (s, ru)) | s == side = [ru]
+  diffItemSideRules _ _ = []
 
--- | All right rules of a theory.
-rightTheoryRules :: DiffTheory sig c r r2 p p2 -> [r2]
-rightTheoryRules =
-  foldDiffTheoryItem (const []) (\(x, y) -> if (x == RHS) then [y] else []) (const []) (const []) (const []) (const []) (const []) (const []) <=< L.get diffThyItems
+instance SideRuleView ClosedDiffRule ClosedRuleFamily ClosedProtoRule where
+  diffItemSideRules side (DiffRuleItem parent) = closedFamilyRules (closedDiffSide side parent)
+  diffItemSideRules side (EitherRuleItem (s, family)) | s == side = closedFamilyRules family
+  diffItemSideRules _ _ = []
+
+diffTheorySideRules :: SideRuleView r r2 rule => Side -> DiffTheory sig c r r2 p p2 -> [rule]
+diffTheorySideRules side = concatMap (diffItemSideRules side) . L.get diffThyItems
+
+leftTheoryRules :: SideRuleView r r2 rule => DiffTheory sig c r r2 p p2 -> [rule]
+leftTheoryRules = diffTheorySideRules LHS
+
+rightTheoryRules :: SideRuleView r r2 rule => DiffTheory sig c r r2 p p2 -> [rule]
+rightTheoryRules = diffTheorySideRules RHS
 
 -- |  All macros of a theory.
 theoryMacros :: Theory sig c r p s -> [LNMacro]

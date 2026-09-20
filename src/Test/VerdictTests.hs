@@ -2,6 +2,7 @@
 module Test.VerdictTests (tests) where
 
 import Data.List (isInfixOf, sort)
+import qualified Data.Binary as Bin
 import Data.Maybe (fromJust)
 import qualified Control.Category as C
 import Control.Monad.Reader (runReader)
@@ -301,7 +302,8 @@ diffFamilyLifecycleTests maudePath = do
             oldRules = [closeEitherProtoRule hnd (whichSide, addProtoRuleLabel (project ru))
               | DiffRuleItem ru <- L.get diffThyItems normalized
               , (whichSide, project) <- [(LHS, getLeftProtoRule), (RHS, getRightProtoRule)]]
-            sharedRules = [pair | EitherRuleItem pair <- preparedDiffItems prepared]
+            sharedRules = [(side, closedFamilyRules (closedDiffSide side ru))
+              | DiffRuleItem ru <- preparedDiffItems prepared, side <- [LHS,RHS]]
         assertEqual "preparation commutes with generated labels; all metadata and order" oldRules sharedRules
         assertEqual "shared preparation preserves the warning report"
           (render (prettyWfErrorReport warnings))
@@ -314,6 +316,28 @@ diffFamilyLifecycleTests maudePath = do
                      getRuleName (L.get cprRuleE r) == "R"])) [LHS, RHS]
         assertBool "canonical opening has no duplicate side items" $
           null [() | EitherRuleItem _ <- L.get diffThyItems (openDiffTheory first)]
+        assertBool "compiled families remain parent-owned" $
+          null [() | EitherRuleItem _ <- L.get diffThyItems first]
+        let pureTheory = first { _diffThySignature = toSignaturePure sig }
+            legacy = mapDiffTheoryItems legacyDiffItems pureTheory
+            oldDeclarations item@(DiffRuleItem ru) =
+              case [original | DiffRuleItem original <- L.get diffThyItems normalized,
+                               ruleName original == ruleName ru] of
+                [original] -> DiffRuleItem original
+                _ -> item
+            oldDeclarations item = item
+            oldSession = mapDiffTheoryItems (map oldDeclarations) legacy
+            imported = Bin.decode (Bin.encode oldSession) `asTypeOf` pureTheory
+            legacyReader = Bin.decode (Bin.encode pureTheory) `asTypeOf` legacy
+        assertEqual "old binary sessions import complete families" pureTheory imported
+        assertEqual "new binary sessions retain the old wire representation" legacy legacyReader
+        case [pair | EitherRuleItem pair <- L.get diffThyItems legacy] of
+          (side, ClosedProtoRule e ac):_ -> do
+            let different = L.modify rConcs (protoFact Linear "DifferentParent" [] :) e
+                invalid = EitherRuleItem (side, ClosedProtoRule different ac) : L.get diffThyItems legacy
+            assertBool "legacy import rejects inconsistent parent declarations" $
+              case ownDiffItems invalid of Left _ -> True; Right _ -> False
+          [] -> pure ()
         check (reclose first)
         let repeated = cyclic || shape `elem` ["asymmetric-indexed", "asymmetric-local"]
         if repeated then check (reclose (reclose first)) else pure ()
@@ -489,7 +513,8 @@ sharedPreparationTests maudePath = do
           assertEqual "label equivariance of canonical variants" (map label canonical) labelledCanonical
           assertEqual "label equivariance of acceptance" valid labelledValid
           assertEqual "shared closing preserves warning-tolerant supplied members"
-            expected [r | EitherRuleItem r <- preparedDiffItems prep]
+            expected [(s, closedFamilyRules (closedDiffSide s ru))
+                      | DiffRuleItem ru <- preparedDiffItems prep, s <- [LHS,RHS]]
           if name `elem` ["incomplete", "changed body"] then
             assertBool "invalid family still produces a manual-variant warning"
               ("cannot confirm manual variants" `isInfixOf`
