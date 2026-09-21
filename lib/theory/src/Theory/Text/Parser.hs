@@ -43,7 +43,7 @@ import           Text.Parsec                hiding ((<|>))
 import           Text.Parsec.Error          (newErrorMessage, Message(..))
 import           Text.Parsec.Pos            (initialPos)
 import           Text.PrettyPrint.Class     (render)
-import           TheoryObject               (theoryMacros)
+import           TheoryObject               (theoryMacros, diffTheoryMacros)
 import           Theory
 import           Theory.Text.Parser.Token
 
@@ -163,34 +163,25 @@ liftedAddCaseTest thy cTest =
    liftMaybeToEx (DuplicateItem $ TranslationItem $ CaseTestItem cTest) (addCaseTest cTest thy)
 
 
--- | Add new protocol rule and introduce restrictions for _restrict contruct
---  1. expand syntactic restrict constructs
---  2. for each, chose fresh action and restriction name
---  3. add action names to rule
---  4. add rule, fail if duplicate
---  5. add restrictions, fail if duplicate
--- FIXME: we only deal we the rule modulo E here, if variants modulo AC are
---        imported we do not check if they have _restrict annotations
---        (but they should not, as they will not be exported)
+-- | Generate matching restrictions and action facts for a rule's annotations.
+ruleRestrictions :: Monad m => (SyntacticLNFormula -> m LNFormula) -> String
+                 -> ProtoRuleE -> m ([Restriction], [LNFact])
+ruleRestrictions expand name rule = do
+    formulas <- mapM expand (get (preRestriction . rInfo) rule)
+    return $ unzip [fromRuleRestriction (name ++ "_" ++ show i) f
+                   | (i, f) <- zip [1 :: Int ..] formulas]
+
+-- | Expand embedded restrictions before adding a trace rule.
 liftedAddProtoRule :: Catch.MonadThrow m => OpenTheory -> OpenProtoRule -> m OpenTheory
 liftedAddProtoRule thy ru
     | (StandRule rname) <- get (preName . rInfo . oprRuleE) ru = do
-        rformulasE <- mapM (liftedExpandFormula thy) (rfacts $ get oprRuleE ru)
-        thy'      <- foldM addExpandedRestriction thy  (restrictions rname rformulasE)
-        thy''     <- liftedAddProtoRuleNoExpand   thy' (addActions   rname rformulasE) -- TODO was ru instead of rformulas
-        return thy''
+        (restrictions, actions) <- ruleRestrictions (liftedExpandFormula thy) rname (get oprRuleE ru)
+        thy' <- foldM addExpandedRestriction thy restrictions
+        liftedAddProtoRuleNoExpand thy' (modify (rActs . oprRuleE) (++ actions) ru)
     | otherwise = Catch.throwM TryingToAddFreshRule
-            where
-                rfacts = get (preRestriction . rInfo)
-                addExpandedRestriction thy' xrstr = liftMaybeToEx
-                                                     (DuplicateItem $ RestrictionItem xrstr)
-                                                     (addRestriction xrstr thy')
-                addActions   rname rformulas = modify (rActs . oprRuleE) (++ actions rname rformulas) ru
-
-                restrictions rname rformulas =  map (fst . fromRuleRestriction' rname) (counter rformulas)
-                actions      rname rformulas =  map (snd . fromRuleRestriction' rname) (counter rformulas)
-                fromRuleRestriction' rname (i,f) = fromRuleRestriction (rname ++ "_" ++ show i) f
-                counter = zip [1::Int ..]
+  where
+    addExpandedRestriction thy' rstr =
+        liftMaybeToEx (DuplicateItem $ RestrictionItem rstr) (addRestriction rstr thy')
 
 -- | Flag formulas
 
@@ -517,9 +508,42 @@ diffTheory inFile = do
         Just thy' -> return thy'
         Nothing   -> fail $ "default tactic already defined"
 
-    liftedAddDiffRule thy ru = case addOpenProtoDiffRule ru thy of
-        Just thy' -> return thy'
-        Nothing   -> fail $ "duplicate rule or inconsistent names: " ++ render (prettyRuleName $ get dprRule ru)
+    liftedAddDiffRule thy (DiffProtoRule parent sides) = do
+        (restrictions, actions) <- expandEmbedded "" parent
+        (sides', sideRestrictions) <- case sides of
+            Nothing -> return (Nothing, [])
+            Just (left, right) -> do
+                (left', lr) <- expandSide LHS actions left
+                (right', rr) <- expandSide RHS actions right
+                return (Just (left', right'), lr ++ rr)
+        thy' <- foldM addEmbeddedRestriction thy $
+            [(side, r) | side <- [LHS, RHS], r <- restrictions] ++ sideRestrictions
+        let ru = DiffProtoRule (appendActions actions parent) sides'
+        case addOpenProtoDiffRule ru thy' of
+            Just thy'' -> return thy''
+            Nothing -> fail $ "duplicate rule or inconsistent names: " ++ render (prettyRuleName parent)
+      where
+        -- Expand macros and generate actions before projection: a variable may
+        -- disappear on one side of a diff term, but the action arity must agree.
+        expandEmbedded suffix rule = ruleRestrictions
+            (fmap (applyMacroInFormula $ diffTheoryMacros thy) . liftEitherToEx UndefinedPredicate . expandFormula [])
+            (getRuleName rule ++ suffix) rule
+        appendActions actions rule =
+            let rule' = modify rActs (++ actions) rule
+            in set rNewVars (newVariables (get rPrems rule') (get rConcs rule' ++ get rActs rule')) rule'
+        expandSide side inherited (OpenProtoRule rule variants) = do
+            (restrictions, actions) <- expandEmbedded ("_" ++ show side) rule
+            -- Compiled members need instantiated action arguments, not the
+            -- E-rule's variables. Require explicit facts in that case.
+            when (not (null variants) && (not (null inherited) || not (null restrictions))) $
+                fail "Embedded restrictions with explicit AC variants are not supported; use named restrictions and action facts instead."
+            let project = if side == LHS then getLeftFact else getRightFact
+            return (OpenProtoRule (appendActions (actions ++ map project inherited) rule) variants,
+                    [(side, r) | r <- restrictions])
+        addEmbeddedRestriction thy' (side, rstr) =
+            let project = if side == LHS then getLeftTerm else getRightTerm
+                rstr' = modify rstrFormula (mapAtoms $ const $ fmap project) rstr
+            in addRestrictionOnSide thy' (side, rstr')
 
     liftedAddDiffLemma thy ru = case addDiffLemma ru thy of
         Just thy' -> return thy'
@@ -543,16 +567,14 @@ diffTheory inFile = do
                                                              Nothing   -> fail $ "duplicate lemma: " ++ get lName lem
                                              Nothing   -> fail $ "duplicate lemma: " ++ get lName lem
 
-    liftedAddRestriction' thy rstr = if isLeftRestriction rstr
-                                       then case addRestrictionDiff LHS (toRestriction rstr) thy of
-                                               Just thy' -> return thy'
-                                               Nothing   -> fail $ "duplicate restriction: " ++ get rstrName (toRestriction rstr)
-                                       else if isRightRestriction rstr
-                                               then case addRestrictionDiff RHS (toRestriction rstr) thy of
-                                                  Just thy' -> return thy'
-                                                  Nothing   -> fail $ "duplicate restriction: " ++ get rstrName (toRestriction rstr)
-                                               else case addRestrictionDiff RHS (toRestriction rstr) thy of
-                                                  Just thy' -> case addRestrictionDiff LHS (toRestriction rstr) thy' of
-                                                     Just thy'' -> return thy''
-                                                     Nothing   -> fail $ "duplicate restriction: " ++ get rstrName (toRestriction rstr)
-                                                  Nothing   -> fail $ "duplicate restriction: " ++ get rstrName (toRestriction rstr)
+    addRestrictionOnSide thy (side, rstr) =
+        case addRestrictionDiff side rstr thy of
+            Just thy' -> return thy'
+            Nothing -> fail $ "duplicate restriction: " ++ get rstrName rstr
+
+    liftedAddRestriction' thy rstr =
+        foldM addRestrictionOnSide thy [(side, toRestriction rstr) | side <- sides]
+      where
+        sides | isLeftRestriction rstr  = [LHS]
+              | isRightRestriction rstr = [RHS]
+              | otherwise               = [RHS, LHS]

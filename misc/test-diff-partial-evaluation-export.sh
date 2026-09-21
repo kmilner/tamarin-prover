@@ -45,9 +45,36 @@ analyze() {
   check_verdicts "$tmp_dir/$1.log"
 }
 
-for model in refinement variants explicit asymmetric singleton families auto-sources explicit-macros empty-left empty-right empty-both unrelated-empty-left unrelated-empty-right unrelated-empty-both hidden-reuse; do
+for model in refinement variants explicit asymmetric singleton families auto-sources explicit-macros empty-left empty-right empty-both unrelated-empty-left unrelated-empty-right unrelated-empty-both hidden-reuse embedded embedded-projections; do
   input="$examples/soundness-diff-partial-evaluation-$model.spthy"
   case "$model" in
+    embedded)
+      input="$examples/diff-embedded-restrictions.spthy"
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+LHS :  always_a (all-traces): verified
+RHS :  always_a (all-traces): verified
+LHS :  a_reachable (exists-trace): verified
+RHS :  a_reachable (exists-trace): verified
+DiffLemma:  Observational_equivalence : verified
+VERDICTS
+      ;;
+    embedded-projections)
+      input="$examples/diff-embedded-restriction-projections.spthy"
+      cat >"$tmp_dir/expected" <<'VERDICTS'
+LHS :  left_choice (all-traces): verified
+RHS :  right_choice (all-traces): verified
+LHS :  left_reachable (exists-trace): verified
+RHS :  right_reachable (exists-trace): verified
+LHS :  left_local (all-traces): verified
+RHS :  right_local (all-traces): verified
+LHS :  left_local_reachable (exists-trace): verified
+RHS :  right_local_reachable (exists-trace): verified
+LHS :  left_mixed (exists-trace): verified
+RHS :  right_mixed (all-traces): verified
+RHS :  right_mixed_reachable (exists-trace): verified
+DiffLemma:  Observational_equivalence : falsified - found trace
+VERDICTS
+      ;;
     unrelated-empty-*)
       input="$examples/diff-$model.spthy"
       cat >"$tmp_dir/expected" <<'VERDICTS'
@@ -191,7 +218,7 @@ VERDICTS
   # proof/export/reload/replay sequence.
   run_tamarin unproved "$input" --partial-evaluation=summary
   case "$model" in
-    families|auto-sources)
+    families|auto-sources|embedded|embedded-projections)
       analyze evaluated "$input" --partial-evaluation=summary --prove
       analyze reloaded "$tmp_dir/unproved.spthy" --prove
       analyze replay "$tmp_dir/evaluated.spthy"
@@ -201,3 +228,33 @@ VERDICTS
 done
 
 echo 'Diff partial-evaluation export preserves all expected verdicts.'
+
+# Raw annotations cannot be silently discarded from hand-written AC members,
+# or copied into them without knowing the member's substitution.
+for location in parent side member; do
+  parent_actions='A(x)'
+  side_actions='A(x)'
+  member_actions='A(x)'
+  case "$location" in
+    parent) parent_actions="A(x), _restrict(x = 'a')" ;;
+    side) side_actions="A(x), _restrict(x = 'a')" ;;
+    member) member_actions="A(x), _restrict(x = 'a')" ;;
+  esac
+  cat >"$tmp_dir/embedded-variants.spthy" <<MODEL
+theory EmbeddedVariants begin
+rule Test: [In(x)] --[$parent_actions]-> []
+left rule Test: [In(x)] --[$side_actions]-> []
+  variants rule (modulo AC) Test: [In(x)] --[$member_actions]-> []
+right rule Test: [In(x)] --[A(x)]-> []
+end
+MODEL
+  if "$tamarin" "$tmp_dir/embedded-variants.spthy" --diff --parse-only >"$tmp_dir/rejected.log" 2>&1; then
+    echo "accepted unsupported embedded restriction in $location" >&2
+    exit 1
+  fi
+  grep -Fq 'use named restrictions and action facts instead' "$tmp_dir/rejected.log" || {
+    cat "$tmp_dir/rejected.log" >&2
+    exit 1
+  }
+done
+echo 'Unsupported embedded restrictions in explicit variants are rejected.'
