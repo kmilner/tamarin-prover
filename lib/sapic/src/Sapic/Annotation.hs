@@ -24,7 +24,6 @@ module Sapic.Annotation
   , getProcessNames
   , setProcessNames
   , translationVars
-  , annElse
   ) where
 
 import Data.List.NonEmpty (NonEmpty)
@@ -144,9 +143,6 @@ annUnlock v = mempty {unlock = Just v}
 
 annSecretChannel :: AnVar v -> ProcessAnnotation v
 annSecretChannel v = mempty { secretChannel = Just v}
-
-annElse ::  Bool -> ProcessAnnotation v
-annElse b = mempty {elseBranch = b}
 
 -- | Convert to and from Process, i.e., LProcess with processnames only.
 toAnProcess :: GoodAnnotation an => PlainProcess -> LProcess an
