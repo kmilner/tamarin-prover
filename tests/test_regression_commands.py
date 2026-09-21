@@ -96,6 +96,37 @@ rule Real: [F('/* literal */'), G("// literal")] --> []
         self.assertIn("F('/* literal */'), G(\"// literal\")", stripped)
         self.assertEqual(stripped.count("\n"), text.count("\n"))
 
+    def test_fact_arity_counts_only_outer_arguments(self):
+        test = {"name": "payload", "fact_arities": {"Let_[0-9]+": 2, "Empty": 0}}
+        commands.validate(test)
+        output = '''/* Let_0(a,b,c) /* nested */ */
+// Let_1(a,b,c)
+rule Test:
+  [ Let_11(f(a,g(b,c)), <x,<y,z>>), Empty(),
+    Let_12('commas, brackets () <>', "Let_13(a,b,c)"),
+    OtherLet_14(a,b,c) ]
+  --> [ Let_15(
+    h(<x,y>), z) ]
+'''
+        commands.check_output(test, 0, output)
+        with self.assertRaisesRegex(commands.RegressionFailure, "arity 3 exceeds maximum 2"):
+            commands.check_output(test, 0, output + "Let_16(f(a,b), <c,d>, e)")
+
+    def test_fact_arity_requires_a_matching_fact(self):
+        for output in ["", "/* Let_1(x) */", "'Let_1(x)'", "OtherLet_1(x)"]:
+            with self.subTest(output=output), self.assertRaisesRegex(commands.RegressionFailure, "No facts match"):
+                commands.check_output({"fact_arities": {"Let_[0-9]+": 2}}, 0, output)
+
+    def test_fact_arity_rejects_incomplete_or_unbalanced_terms(self):
+        for output in ["Let_1(", "Let_1(f(x)", "Let_1(<x,y))", "Let_1(x>"]:
+            with self.subTest(output=output), self.assertRaises(commands.RegressionFailure):
+                commands.check_output({"fact_arities": {"Let_[0-9]+": 2}}, 0, output)
+
+    def test_fact_arity_metadata_is_validated(self):
+        for assertions in [[], {"": 2}, {"(": 2}, {"Let_.*": -1}, {"Let_.*": True}, {"Let_.*": 2.5}]:
+            with self.subTest(assertions=assertions), self.assertRaises(commands.RegressionFailure):
+                commands.validate({"name": "payload", "fact_arities": assertions})
+
 
 class ProcessTests(unittest.TestCase):
     def test_stderr_and_exit_status_are_retained(self):

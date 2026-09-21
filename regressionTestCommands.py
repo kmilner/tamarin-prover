@@ -56,7 +56,7 @@ def theory_text(text):
 
 
 def validate(test):
-    allowed = {"name", "args", "exit_code", "contains", "matches", "baseline", "checks", "timeout", "slow"}
+    allowed = {"name", "args", "exit_code", "contains", "matches", "fact_arities", "baseline", "checks", "timeout", "slow"}
     if not isinstance(test, dict) or set(test) - allowed:
         raise RegressionFailure(f"Unknown test fields or invalid test: {test!r}")
     if not isinstance(test.get("name"), str) or not re.fullmatch(r"[\w-]+", test["name"]):
@@ -114,6 +114,47 @@ def validate(test):
             raise RegressionFailure("Match min exceeds max")
         if type(match.get("theory_only", False)) is not bool:
             raise RegressionFailure("theory_only must be true or false")
+    arities = test.get("fact_arities", {})
+    if not isinstance(arities, dict):
+        raise RegressionFailure("fact_arities must map fact-name regexes to maximum arities")
+    for pattern, maximum in arities.items():
+        if not isinstance(pattern, str) or not pattern or type(maximum) is not int or maximum < 0:
+            raise RegressionFailure("Fact arity assertions need a non-empty regex and a non-negative integer maximum")
+        try:
+            re.compile(pattern)
+        except re.error as error:
+            raise RegressionFailure(f"Invalid fact-name regex: {error}") from error
+
+
+def check_fact_arities(text, assertions):
+    # Quoted terms are single tokens; commas in tuples and function applications
+    # belong to the nested term, not to the enclosing fact's argument list.
+    tokens = re.findall(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\w+|[^\s]''', theory_text(text))
+    for pattern, maximum in assertions.items():
+        found = False
+        for index, name in enumerate(tokens[:-1]):
+            if not re.fullmatch(r"\w+", name) or not re.fullmatch(pattern, name) or tokens[index + 1] != "(":
+                continue
+            found = True
+            closing = [")"]
+            arity = 0 if tokens[index + 2:index + 3] == [")"] else 1
+            for position in range(index + 2, len(tokens)):
+                token = tokens[position]
+                if token in ("(", "<"):
+                    closing.append(")" if token == "(" else ">")
+                elif token in (")", ">"):
+                    if token != closing.pop():
+                        raise RegressionFailure(f"Unbalanced term in {name}")
+                    if not closing:
+                        break
+                elif token == "," and len(closing) == 1:
+                    arity += 1
+            else:
+                raise RegressionFailure(f"Unterminated argument list in {name}")
+            if arity > maximum:
+                raise RegressionFailure(f"Fact {name}: arity {arity} exceeds maximum {maximum}")
+        if not found:
+            raise RegressionFailure(f"No facts match {pattern!r}")
 
 
 def run_process(command, timeout):
@@ -148,6 +189,8 @@ def check_output(test, code, output):
         count = len(re.findall(match["regex"], text, re.MULTILINE))
         if not match.get("min", 0) <= count <= match.get("max", math.inf):
             raise RegressionFailure(f"Pattern {match['regex']!r}: {count} matches, expected {match}\n{output}")
+    if test.get("fact_arities"):
+        check_fact_arities(output, test["fact_arities"])
 
 
 def run_test(source, test, tamarin, baseline_dir, artifacts):

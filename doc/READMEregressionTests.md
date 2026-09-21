@@ -214,6 +214,18 @@ counting, so source-process comments cannot masquerade as generated rules.
 Assertions apply to every invocation in a test. For checks specific to one export
 format, add a separate test with that format in `args`.
 
+`fact_arities` bounds the number of arguments in generated facts, for example
+to check that SAPIC intermediate facts do not retain unnecessary variables:
+
+```json
+"fact_arities": {"Let_[0-9]+": 2}
+```
+
+Each regex matches a whole fact name and maps to its maximum allowed arity.
+At least one matching fact must occur, and every occurrence must fit the bound.
+Comments are ignored; commas inside nested function applications, tuples, or
+quoted strings do not count as argument separators.
+
 Each test needs a unique `name` within its companion file. Optional `timeout`
 sets a positive per-invocation limit in seconds (default 120). On POSIX systems a
 timeout kills the process group, including Maude. Set `slow` to `true` for tests
