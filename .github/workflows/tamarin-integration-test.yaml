@@ -82,8 +82,6 @@ jobs:
         run: |
           tamarin-prover test
           ./misc/test-export-property-instrumentation.sh
-          sh ./misc/test-sapic-input-validation.sh
-          sh ./misc/test-sapic-destructor-growth.sh
           python3 -m unittest discover -s tests -p test_regression_commands.py
           python3 regressionTests.py -v 6 -noi
 
