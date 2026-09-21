@@ -1,0 +1,15 @@
+{
+  "tests": [
+    {
+      "name": "unsupported-annotation",
+      "args": [
+        "--diff",
+        "--parse-only"
+      ],
+      "exit_code": 1,
+      "contains": [
+        "use named restrictions and action facts instead"
+      ]
+    }
+  ]
+}

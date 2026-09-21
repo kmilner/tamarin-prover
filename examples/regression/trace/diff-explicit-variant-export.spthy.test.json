@@ -1,0 +1,24 @@
+{
+  "tests": [
+    {
+      "name": "export-roundtrip",
+      "args": [
+        "--diff",
+        "--quit-on-warning",
+        "--bound=6"
+      ],
+      "checks": [
+        "roundtrip"
+      ]
+    },
+    {
+      "name": "partial-evaluation-printing",
+      "args": [
+        "--diff",
+        "--quit-on-warning",
+        "--bound=6",
+        "--partial-evaluation=summary"
+      ]
+    }
+  ]
+}

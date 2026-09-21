@@ -1,0 +1,12 @@
+theory DiffEmbeddedVariantMember
+begin
+
+// Embedded restrictions in an explicit variant family cannot be discarded
+// or copied between members without knowing their substitutions.
+// Reject the annotation on the member; named restrictions remain supported.
+rule Test: [In(x)] --[A(x)]-> []
+left rule Test: [In(x)] --[A(x)]-> []
+  variants rule (modulo AC) Test: [In(x)] --[A(x), _restrict(x = 'a')]-> []
+right rule Test: [In(x)] --[A(x)]-> []
+
+end
