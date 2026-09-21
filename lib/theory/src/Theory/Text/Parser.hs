@@ -43,7 +43,7 @@ import           Text.Parsec                hiding ((<|>))
 import           Text.Parsec.Error          (newErrorMessage, Message(..))
 import           Text.Parsec.Pos            (initialPos)
 import           Text.PrettyPrint.Class     (render)
-import           TheoryObject               (theoryMacros)
+import           TheoryObject               (theoryMacros, diffTheoryMacros)
 import           Theory
 import           Theory.Text.Parser.Token
 
@@ -517,9 +517,52 @@ diffTheory inFile = do
         Just thy' -> return thy'
         Nothing   -> fail $ "default tactic already defined"
 
-    liftedAddDiffRule thy ru = case addOpenProtoDiffRule ru thy of
-        Just thy' -> return thy'
-        Nothing   -> fail $ "duplicate rule or inconsistent names: " ++ render (prettyRuleName $ get dprRule ru)
+    -- Embedded restrictions of the parent constrain both sides; those of an
+    -- explicit side rule only its own side. Side rules replace the parent's
+    -- projection, so they also receive the parent's generated actions.
+    liftedAddDiffRule thy (DiffProtoRule parent sides) = do
+        (restrictions, actions) <- expandEmbedded "" parent
+        let parent' = appendActions actions parent
+            choices = get rNewVars $ applyMacroInRule (diffTheoryMacros thy) parent'
+        (sides', sideRestrictions) <- case sides of
+            Nothing -> return (Nothing, [])
+            Just (left, right) -> do
+                (left', lr) <- expandSide LHS choices actions left
+                (right', rr) <- expandSide RHS choices actions right
+                return (Just (left', right'), lr ++ rr)
+        thy' <- foldM addEmbeddedRestriction thy $
+            [(side, r) | side <- [LHS, RHS], r <- restrictions] ++ sideRestrictions
+        let ru = DiffProtoRule parent' sides'
+        case addOpenProtoDiffRule ru thy' of
+            Just thy'' -> return thy''
+            Nothing -> fail $ "duplicate rule or inconsistent names: " ++ render (prettyRuleName parent)
+      where
+        -- Expand macros and generate actions before projection: a variable may
+        -- disappear on one side of a diff term, but the action arity must agree.
+        expandEmbedded suffix rule = do
+            formulas <- mapM (fmap (applyMacroInFormula $ diffTheoryMacros thy)
+                               . liftEitherToEx UndefinedPredicate . expandFormula [])
+                             (get (preRestriction . rInfo) rule)
+            return $ unzip [ fromRuleRestriction (getRuleName rule ++ suffix ++ "_" ++ show i) f
+                           | (i, f) <- zip [1 :: Int ..] formulas ]
+        appendActions actions rule =
+            let rule' = modify rActs (++ actions) rule
+            in set rNewVars (newVariables (get rPrems rule') (get rConcs rule' ++ get rActs rule')) rule'
+        expandSide side choices inherited (OpenProtoRule rule variants) = do
+            (restrictions, actions) <- expandEmbedded ("_" ++ show side) rule
+            let project = if side == LHS then getLeftFact else getRightFact
+                -- Only the expanded parent's choices correspond across sides.
+                -- Side-local choices (including names erased by a parent macro)
+                -- must not acquire positional counterparts in the other side.
+                rule' = set rNewVars choices $
+                          modify rActs (++ actions ++ map project inherited) rule
+            return (OpenProtoRule rule' variants, [(side, r) | r <- restrictions])
+        addEmbeddedRestriction thy'' (side, rstr) =
+            let project = if side == LHS then getLeftTerm else getRightTerm
+                rstr' = modify rstrFormula (mapAtoms $ const $ fmap project) rstr
+            in case addRestrictionDiff side rstr' thy'' of
+                 Just thy''' -> return thy'''
+                 Nothing -> fail $ "duplicate restriction: " ++ get rstrName rstr'
 
     liftedAddDiffLemma thy ru = case addDiffLemma ru thy of
         Just thy' -> return thy'
