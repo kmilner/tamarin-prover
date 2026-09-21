@@ -8,7 +8,7 @@ builtins: multiset
 
 let P(a:rofl) =
         new x:lol;
-        new y; // TODO should be typed with test, too... need to propagate back
+        new y; // Inferred as bitstring from f(y) below.
         out(x); out(y); 
         out(f(y));
         /* out(f(x)); // should fail */

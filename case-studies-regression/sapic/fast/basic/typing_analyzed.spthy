@@ -136,15 +136,15 @@ rule (modulo E) newxlol_0_1121[color=#6c8040, process="new x.1:lol;",
      [ State_1121( a ), Fr( x ) ] --> [ State_11211( a, x ) ]
   */
 
-rule (modulo E) newy_0_11211[color=#6c8040, process="new y.1;",
-                             issapicrule, role='P']:
+rule (modulo E) newybitstring_0_11211[color=#6c8040,
+                                      process="new y.1:bitstring;", issapicrule, role='P']:
    [ State_11211( a.1, x.1 ), Fr( y.1 ) ]
   -->
    [ State_112111( a.1, x.1, y.1 ) ]
 
   /*
-  rule (modulo AC) newy_0_11211[color=#6c8040, process="new y.1;",
-                                issapicrule, role='P']:
+  rule (modulo AC) newybitstring_0_11211[color=#6c8040,
+                                         process="new y.1:bitstring;", issapicrule, role='P']:
      [ State_11211( a, x ), Fr( y ) ] --> [ State_112111( a, x, y ) ]
   */
 
@@ -186,43 +186,49 @@ rule (modulo E) outfybitstring_0_11211111[color=#6c8040,
      [ State_112111111( a, x, y ), Out( f(y) ) ]
   */
 
-rule (modulo E) outxloly_0_112111111[color=#6c8040,
-                                     process="out(<x.1:lol, y.1>);", issapicrule, role='P']:
+rule (modulo E) outxlolybitstring_0_112111111[color=#6c8040,
+                                              process="out(<x.1:lol, y.1:bitstring>);", issapicrule,
+                                              role='P']:
    [ State_112111111( a.1, x.1, y.1 ) ]
   -->
    [ State_1121111111( a.1, x.1, y.1 ), Out( <x.1, y.1> ) ]
 
   /*
-  rule (modulo AC) outxloly_0_112111111[color=#6c8040,
-                                        process="out(<x.1:lol, y.1>);", issapicrule, role='P']:
+  rule (modulo AC) outxlolybitstring_0_112111111[color=#6c8040,
+                                                 process="out(<x.1:lol, y.1:bitstring>);", issapicrule,
+                                                 role='P']:
      [ State_112111111( a, x, y ) ]
     -->
      [ State_1121111111( a, x, y ), Out( <x, y> ) ]
   */
 
-rule (modulo E) outxloly_0_1121111111[color=#6c8040,
-                                      process="out((x.1:lol++y.1));", issapicrule, role='P']:
+rule (modulo E) outxlolybitstring_0_1121111111[color=#6c8040,
+                                               process="out((x.1:lol++y.1:bitstring));", issapicrule,
+                                               role='P']:
    [ State_1121111111( a.1, x.1, y.1 ) ]
   -->
    [ State_11211111111( a.1, x.1, y.1 ), Out( (x.1++y.1) ) ]
 
   /*
-  rule (modulo AC) outxloly_0_1121111111[color=#6c8040,
-                                         process="out((x.1:lol++y.1));", issapicrule, role='P']:
+  rule (modulo AC) outxlolybitstring_0_1121111111[color=#6c8040,
+                                                  process="out((x.1:lol++y.1:bitstring));", issapicrule,
+                                                  role='P']:
      [ State_1121111111( a, x, y ) ]
     -->
      [ State_11211111111( a, x, y ), Out( (x++y) ) ]
   */
 
-rule (modulo E) outfxloly_0_11211111111[color=#6c8040,
-                                        process="out(f(<x.1:lol, y.1>));", issapicrule, role='P']:
+rule (modulo E) outfxlolybitstring_0_11211111111[color=#6c8040,
+                                                 process="out(f(<x.1:lol, y.1:bitstring>));", issapicrule,
+                                                 role='P']:
    [ State_11211111111( a.1, x.1, y.1 ) ]
   -->
    [ State_112111111111( a.1, x.1, y.1 ), Out( f(<x.1, y.1>) ) ]
 
   /*
-  rule (modulo AC) outfxloly_0_11211111111[color=#6c8040,
-                                           process="out(f(<x.1:lol, y.1>));", issapicrule, role='P']:
+  rule (modulo AC) outfxlolybitstring_0_11211111111[color=#6c8040,
+                                                    process="out(f(<x.1:lol, y.1:bitstring>));", issapicrule,
+                                                    role='P']:
      [ State_11211111111( a, x, y ) ]
     -->
      [ State_112111111111( a, x, y ), Out( f(<x, y>) ) ]
@@ -348,12 +354,12 @@ rule (modulo E) Qhalol_0_12[color=#ffffff, process="Q(h(a.1:lol));",
   */
 
 rule (modulo E) inyhalol_0_121[color=#807140,
-                               process="in(<y.2, h(a.1:lol)>);", issapicrule, role='Q']:
+                               process="in(<y.2, h(=a.1:lol)>);", issapicrule, role='Q']:
    [ State_121( a.1 ), In( <y.2, h(a.1)> ) ] --> [ State_1211( a.1, y.2 ) ]
 
   /*
   rule (modulo AC) inyhalol_0_121[color=#807140,
-                                  process="in(<y.2, h(a.1:lol)>);", issapicrule, role='Q']:
+                                  process="in(<y.2, h(=a.1:lol)>);", issapicrule, role='Q']:
      [ State_121( a ), In( <y, h(a)> ) ] --> [ State_1211( a, y ) ]
   */
 
@@ -382,8 +388,8 @@ restriction single_session:
 Generated from:
 Tamarin version 1.13.0
 Maude version 3.5.1
-Git revision: 217556c87c752bd640e2d3b166c5582518c793bc, branch: HEAD
-Compiled at: 2026-09-17 15:29:54.020316904 UTC
+Git revision: 52bcdf79638eddf664ff2519c0fbd01ee62619a8 (with uncommited changes), branch: HEAD
+Compiled at: 2026-09-21 09:34:30.652631054 UTC
 */
 
 end
@@ -395,7 +401,7 @@ summary of summaries:
 analyzed: examples/sapic/fast/basic/typing.spthy
 
   output:          examples/sapic/fast/basic/typing.spthy.tmp
-  processing time: 0.10s
+  processing time: 0.16s
 
 
 ==============================================================================

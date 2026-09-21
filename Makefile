@@ -484,10 +484,12 @@ accountability-case-studies:	$(ACCOUNTABILITY_CS_TARGETS)
 
 FAST_REGRESSION_CASE_STUDIES=issue446-1.spthy issue446-2.spthy issue753-4.spthy issue753-5.spthy issue753-6.spthy issue834.spthy issue777.spthy issue770.spthy issue914.spthy negated-equivalence.spthy
 COMMON_REGRESSION_CASE_STUDIES=soundness-sapic-destructor-generated-binders.spthy soundness-sapic-state-phases.spthy soundness-sapic-nested-destructor-failure-chain.spthy soundness-sapic-nested-destructor-progress.spthy sapic-process-call-location-scope.spthy soundness-sapic-destructor-patterns.spthy soundness-sapic-destructor-failure-chain.spthy soundness-sapic-nested-destructors.spthy soundness-sapic-destructor-variable-clash.spthy soundness-sapic-destructor-alternatives.spthy soundness-sapic-channel-alias.spthy soundness-sapic-channel-embedded.spthy soundness-sapic-channel-pattern.spthy soundness-sapic-let-match-else.spthy soundness-sapic-unlocked-lookup.spthy soundness-sapic-progress-let.spthy soundness-sapic-state-alias.spthy soundness-sapic-state-delete.spthy soundness-sapic-state-double-insert.spthy soundness-sapic-state-equivalent-key.spthy soundness-sapic-state-overwrite.spthy soundness-sapic-state-repeated-insert.spthy soundness-sapic-state-supported.spthy soundness-sapic-process-call-capture.spthy sapic-else-binding-scope.spthy sapic-process-call-caller-scope.spthy sapic-nested-call-caller-scope.spthy
+COMMON_REGRESSION_CASE_STUDIES+=sapic-inferred-lock-types.spthy
 FAST_REGRESSION_CASE_STUDIES+=$(COMMON_REGRESSION_CASE_STUDIES)
 FAST_REGRESSION_TARGETS=$(subst .spthy,_analyzed.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(FAST_REGRESSION_CASE_STUDIES)))
 
 
+case-studies$(SUBDIR)regression/trace/sapic-inferred-lock-types_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
 case-studies$(SUBDIR)regression/trace/soundness-sapic-destructor-generated-binders_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
 case-studies$(SUBDIR)regression/trace/soundness-sapic-state-phases_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
 case-studies$(SUBDIR)regression/trace/sapic-process-call-location-scope_analyzed.spthy: TRACE_EXTRA_ARGS=--quit-on-warning
