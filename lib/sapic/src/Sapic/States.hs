@@ -84,7 +84,7 @@ addStatesChannels ::  LProcess (ProcessAnnotation LVar) -> LProcess (ProcessAnno
 addStatesChannels p = evalFresh (declareStateChannel p (S.toList allBoundStates) S.empty M.empty) initStateChan
  where
    allBoundStates =  fst $ getAllStates p S.empty
-   initState = avoidPreciseVars . map (\(SapicLVar lvar _) -> lvar) $ S.toList $ varsProc p
+   initState = avoidPreciseVars $ translationVars p
    initStateChan = fromMaybe 0 (M.lookup stateChannelName initState)
 
 -- Descends into a process. Whenever all the names of a state term are declared, we declare a name corresponding to this state term, that will be used as the corresponding channel name.

@@ -23,10 +23,12 @@ module Sapic.Annotation
   , unAnProcess
   , getProcessNames
   , setProcessNames
+  , translationVars
   , annElse
   ) where
 
 import Data.List.NonEmpty (NonEmpty)
+import Data.Foldable qualified as F
 import Data.Set (Set)
 import Data.Binary
 import Data.Data
@@ -110,6 +112,16 @@ newtype AnProcess ann = AnProcess (LProcess ann)
 
 type AnnotatedProcess = LProcess (ProcessAnnotation LVar)
 type AnnotatedSapicException = SapicException (ProcessAnnotation LVar)
+
+-- | Variables to reserve before adding state channels and lock identifiers.
+-- Destructor-equation variables and intermediate results can occur only in
+-- let plans, where the ordinary process traversal cannot see them.
+translationVars :: AnnotatedProcess -> [LVar]
+translationVars p = map toLVar (F.toList $ varsProcWithAnnotations p) ++ pfoldMap planVars p
+  where
+    planVars node = concat
+      [ frees (input, F.toList patterns, bound)
+      | LetStage input patterns bound <- (processGetAnnotation node).letPlan ]
 
 -- This instance is useful for modifying annotations, but not for much more.
 instance Functor AnProcess where
