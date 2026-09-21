@@ -234,7 +234,6 @@ mkDiffSystem _ _ _ = emptyDiffSystem
 data PartialEvaluationFamilyPlan
     = KeepOriginal
     | EmitRefinements [ProtoRuleE]
-    | DropFamily
 
 -- | Apply partial evaluation.
 applyPartialEvaluation :: EvaluationStyle -> Bool -> ClosedTheory -> ClosedTheory
@@ -275,7 +274,6 @@ applyPartialEvaluation evalStyle autosources thy0 =
     familyPlans = M.fromList
       [ (familyId ru, planFamily (M.findWithDefault [] (familyId ru) refinements))
       | ru <- originals ]
-    planFamily [] = DropFamily
     planFamily rs
       | any (not . exportable) rs = KeepOriginal
       | otherwise = EmitRefinements rs
@@ -310,7 +308,6 @@ applyPartialEvaluation evalStyle autosources thy0 =
     replaceRule (RuleItem ru) = case namedFamilyPlans M.! owner of
       KeepOriginal -> [RuleItem ru]
       EmitRefinements rs -> map (RuleItem . openCompiledRule) rs
-      DropFamily -> []
       where
         owner = familyId (L.get oprRuleE ru)
     replaceRule item = [item]
