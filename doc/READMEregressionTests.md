@@ -23,9 +23,9 @@ $ python3 regressionTests.py
 ## What does the script do?
 
 - it calls `stack install` (prevented by `-noi`)
-- it calls `make case-studies` (prevented by `-nom`) with the options
-  - `-j` for parallel execution
-  - `fast-case-studies FAST=y` if not `-s` (slow) is given
+- it runs the case studies (unless `-nom` is given), using `make -j` for parallel execution:
+  - `make fast-case-studies sapic-case-studies-fast FAST=y` by default
+  - `make case-studies` if `-s` (slow) is given
 - for each `.spthy` in the folder `case-studies`
   - it searches for the equivalent in `case-studies-regression` (or another folder specified by `-d`)
   - it parses the steps and times for both files
@@ -98,3 +98,135 @@ The Makefile is also important. To make the `fast-case-studies` (used in the scr
 ## Contact
 
 For any problem, please contact Philip Lukert.
+
+## Command checks and expected failures
+
+Some regressions concern rejection, translation, or saved-proof handling rather
+than the result of a single proof search. Add a companion file named
+`<example>.spthy.test.json` beside the affected input to enable these checks.
+Examples without a companion file do not get additional prover runs.
+
+`regressionTests.py` discovers companion files under `examples/` and runs their
+checks before the ordinary case studies. They also run in CI. No separate shell
+script or Makefile target is needed. `--no-make` skips these executions, just as
+it skips generating case studies. Each repetition requested with `-r` reruns them.
+
+To run only the command checks, optionally selecting particular companion files:
+
+```sh
+python3 regressionTests.py -noi --command-tests-only
+python3 regressionTests.py -noi --command-tests-only examples/regression/negative/missing-end.spthy.test.json
+python3 regressionTests.py -noi --command-tests-only --tamarin=/path/to/tamarin-prover
+```
+
+`--tamarin` selects the executable for command checks, case-study generation,
+and existing output-parsing checks. It defaults to the `TAMARIN` environment
+variable, or `tamarin-prover` on `PATH`. Use `-noi` with an already built executable;
+otherwise the usual `stack install` runs first.
+
+### Negative tests
+
+For example, `examples/regression/negative/missing-end.spthy.test.json` contains:
+
+```json
+{
+  "tests": [
+    {
+      "name": "missing-end",
+      "args": ["--parse-only"],
+      "exit_code": 1,
+      "contains": ["unexpected end of input"]
+    }
+  ]
+}
+```
+
+Both the exit status and every diagnostic substring must match. A timeout,
+signal, missing executable, or unrelated rejection fails the test. Use a stable
+part of the diagnostic rather than a full message containing paths or line numbers.
+Arguments are passed directly to Tamarin, without a shell. The runner supplies
+`-d=0` to disable derivation-check timeouts in these focused tests.
+
+Put intentionally invalid parser inputs in `examples/regression/negative/`.
+The Tree-sitter success-only sweep excludes that directory; the command runner
+still discovers its companion files.
+
+### Comparing exports and saved proofs
+
+Use an existing regression baseline as the expected result:
+
+```json
+{
+  "tests": [
+    {
+      "name": "saved-diff-proofs",
+      "args": ["--diff", "--quit-on-warning"],
+      "checks": ["roundtrip"]
+    }
+  ]
+}
+```
+
+For these checks, the baseline is inferred from the example's path under
+`examples/`: `ccs15/probEnc.spthy` uses `ccs15/probEnc_analyzed-diff.spthy`
+when `args` includes `--diff`, or `ccs15/probEnc_analyzed.spthy` otherwise.
+Only set `baseline` to override this convention for a differently named target.
+
+These paths are relative to `case-studies-regression/fast-tests/`, or to
+`case-studies-regression/` with `--slow`. `--directory` changes that root using
+the same convention as ordinary regression comparisons. A missing baseline or
+missing proof summary fails the test. The runner never updates baselines.
+
+The runner first proves the source. Each requested check then
+compares its proof results with that same baseline:
+
+- `roundtrip`: print without proofs and prove the reloaded output; also replay
+  the saved original proof without `--prove`.
+- `partial-evaluation`: prove the partially evaluated source; export without
+  proofs and prove the reloaded output; replay the saved evaluated proof; and
+  partially evaluate and prove the unproved export again.
+
+Both checks can be requested together. Comparisons preserve lemma names,
+quantifiers, LHS/RHS labels, duplicate results, and verdicts (including incomplete
+results), but ignore proof-step counts and timings. In particular, two equally
+wrong runs do not pass merely because they agree with each other. The ordinary
+baseline comparison still checks step counts as before.
+
+For these proof checks, leave `--prove`, `--partial-evaluation`, and output paths
+out of `args`: the runner controls them separately for each step. Tests without
+`checks` or a `baseline` override run their specified command once, expecting exit
+status zero by default. An explicit `baseline` without `checks` compares just the source proof.
+
+### Other output assertions
+
+`contains` checks literal substrings in the combined stdout/stderr. `matches`
+can count regular-expression matches, for example to bound generated rule growth:
+
+```json
+"matches": [
+  {"regex": "^rule ", "min": 8, "max": 52, "theory_only": true}
+]
+```
+
+Either bound can be omitted; use equal bounds for an exact count. Regexes use
+Python syntax with multiline matching. `theory_only` removes comments (including nested comments) before
+counting, so source-process comments cannot masquerade as generated rules.
+Assertions apply to every invocation in a test. For checks specific to one export
+format, add a separate test with that format in `args`.
+
+Each test needs a unique `name` within its companion file. Optional `timeout`
+sets a positive per-invocation limit in seconds (default 120). On POSIX systems a
+timeout kills the process group, including Maude. Set `slow` to `true` for tests
+that should run only with `--slow`; other tests run in both suites. Unknown fields
+and malformed settings fail rather than silently disabling a check.
+
+Logs and generated theories are kept under `case-studies/command-tests/`, grouped
+by input and test name, and included in the existing CI artifact. Generated
+copies use a `.theory` extension so the ordinary `.spthy` baseline scan does not
+pick them up. They are diagnostic artifacts, never expected results.
+
+The runner itself has tests that need no Tamarin build:
+
+```sh
+python3 -m unittest discover -s tests -p test_regression_commands.py
+```
