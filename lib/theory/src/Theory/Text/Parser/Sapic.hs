@@ -70,7 +70,7 @@ processDef thy= do
                 vs <- optionMaybe $ parens $ commaSep sapicvar
                 equalSign
                 p <- processAvoiding (map toLVar $ fromMaybe [] vs) thy
-                return (ProcessDef (BC.unpack i) p vs)
+                return (ProcessDef (BC.unpack i) (matchBoundMSRVariables (map toLVar $ fromMaybe [] vs) p) vs)
 
 toplevelprocess :: OpenTheory -> Parser PlainProcess
 toplevelprocess thy = do
@@ -187,7 +187,26 @@ sapicAction = (do
 --     | IDENTIFIER
 --     | msr
 process :: OpenTheory -> Parser PlainProcess
-process = processAvoiding []
+process thy = matchBoundMSRVariables [] <$> processAvoiding [] thy
+
+-- Embedded MSR premises bind only new variables. Mark references to existing
+-- binders before process-call substitution or uniqueness renaming can capture them.
+matchBoundMSRVariables :: [LVar] -> PlainProcess -> PlainProcess
+matchBoundMSRVariables vars = go (S.fromList vars)
+  where
+    extend bound vs = S.union bound (S.fromList $ map toLVar vs)
+    go _ p@(ProcessNull _) = p
+    -- Called bodies were classified in their definitions, before substitution.
+    -- A caller's binders must not change a callee's local bindings into matches.
+    go _ p@(ProcessAction ProcessCall{} _ _) = p
+    go bound (ProcessAction ac ann rest) =
+      let ac' = case ac of
+            MSR l a r phi matches -> MSR l a r phi $ S.union matches $ S.fromList
+              [v | v <- concatMap freesSapicFact l, toLVar v `S.member` bound]
+            _ -> ac
+      in ProcessAction ac' ann (go (extend bound $ actionBinders ac') rest)
+    go bound (ProcessComb comb ann left right) =
+      ProcessComb comb ann (go (extend bound $ combinatorBinders comb) left) (go bound right)
 
 -- Reserve caller names during process-call expansion, including bindings that
 -- are not passed as arguments. This set only guides fresh-name allocation;

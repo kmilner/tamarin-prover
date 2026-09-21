@@ -327,6 +327,8 @@ applyMatchVars' f = fromList . concatMap extractVars . toList
 
 instance Apply SapicSubst (SapicAction SapicLVar) where
     apply subst (ChIn mt t vs) = ChIn (apply subst mt) (apply subst t) (applyMatchVars subst vs)
+    apply subst (MSR l a r phi vs) = MSR (apply subst l) (apply subst a) (apply subst r)
+                                       (apply subst phi) (applyMatchVars subst vs)
     apply subst ac = mapTermsAction (apply subst) (apply subst) (apply subst) ac
 
 -- | Substitute for LVars, ignoring types

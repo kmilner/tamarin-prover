@@ -30,9 +30,19 @@ expect_rejection soundness-sapic-destructor-nonvariable-result \
   'SAPIC destructor equations with non-variable right-hand sides'
 expect_rejection sapic-typed-binding-reuse 'Variable bound twice: y.'
 expect_rejection sapic-nested-call-binding-reuse 'Variable bound twice: y.'
+expect_rejection sapic-msr-call-binding-reuse 'Variable bound twice: x.'
 expect_rejection sapic-location-only-variable 'Unbound variables'
 
 echo 'SAPIC input validation rejects the invalid examples with the expected diagnostics.'
+
+# Allowing the call-boundary warning must still leave Read's x as a local
+# binder, so the caller's fresh x cannot prevent it from consuming the token.
+"$tamarin" "$examples/sapic-msr-call-binding-reuse.spthy" --prove -d=0 \
+  >"$tmp_dir/msr-call.log" 2>&1
+grep -Fq 'consumes_token (exists-trace): verified' "$tmp_dir/msr-call.log" || {
+  cat "$tmp_dir/msr-call.log" >&2
+  exit 1
+}
 
 # Semantic proofs alone would also pass if pure-state optimization were
 # disabled. Check that the supported fragment still uses its optimized fact.
