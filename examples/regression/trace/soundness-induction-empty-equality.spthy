@@ -1,0 +1,20 @@
+theory SoundnessInductionEmptyEquality
+begin
+
+// This rule supplies the action-bearing part of the formula that made the
+// old induction applicability check accept the lemma. A is reachable: the
+// intruder can generate a fresh name and send it.
+rule Receive:
+  [ In(~x) ]
+  --[ A() ]->
+  []
+
+// Message quantifiers range over terms even on the empty trace. In particular,
+// x='a' has the witness x='a', so this conjunction is false on every trace.
+lemma false_direct:
+  "(All x. x='a' ==> F) & (All #i. A()@i ==> T)"
+
+lemma false_induction [use_induction]:
+  "(All x. x='a' ==> F) & (All #i. A()@i ==> T)"
+
+end
