@@ -63,6 +63,10 @@ openProtoRule r = OpenProtoRule ruleE ruleAC
 unfoldRuleVariants :: ClosedProtoRule -> [ClosedProtoRule]
 unfoldRuleVariants (ClosedProtoRule ruE ruAC@(Rule ruACInfoOld ps cs as nvs))
    | isTrivialProtoVariantAC ruAC ruE = [ClosedProtoRule ruE ruAC]
+   -- Supplied or previously unfolded members already have their own names.
+   -- Re-unfolding their identity substitution must not append another suffix.
+   | L.get pracVariants ruACInfoOld == Disj [emptySubstVFresh]
+   , ruleName ruAC /= ruleName ruE = [ClosedProtoRule ruE ruAC]
    | otherwise = map toClosedProtoRule variants
         where
           ruACInfo i = ProtoRuleACInfo (rName i (L.get pracName ruACInfoOld)) rAttributes (Disj [emptySubstVFresh]) loopBreakers
@@ -83,7 +87,8 @@ closeProtoRule :: MaudeHandle -> [LNMacro] -> OpenProtoRule -> [ClosedProtoRule]
 -- if there are no macros, we do not call applyMacroInRule to make sure that new vars are not overwritten (important for diff mode)
 closeProtoRule hnd []     (OpenProtoRule ruE [])   = ClosedProtoRule ruE <$> maybeToList (variantsProtoRule hnd ruE)
 closeProtoRule hnd macros (OpenProtoRule ruE [])   = ClosedProtoRule ruE <$> maybeToList (variantsProtoRule hnd (applyMacroInRule macros ruE))
-closeProtoRule _   _      (OpenProtoRule ruE ruAC) = map (ClosedProtoRule ruE) ruAC
+closeProtoRule _   macros (OpenProtoRule ruE ruAC) =
+    map (ClosedProtoRule ruE . applyMacroInRulePreservingNewVars macros) ruAC
 
 
 -- | Returns true if the REFINED sources contain open chains.

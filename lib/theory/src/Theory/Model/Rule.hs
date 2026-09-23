@@ -110,6 +110,7 @@ module Theory.Model.Rule (
   , compareRulesUpToNewVars
   , equalUpToAddedActions
   , equalUpToTerms
+  , alignRuleUpToRenaming
 
   -- ** Conversion
   , ruleACToIntrRuleAC
@@ -133,6 +134,7 @@ module Theory.Model.Rule (
   , xorRuleInstance
   , addAction
   , applyMacroInRule
+  , applyMacroInRulePreservingNewVars
 
   -- ** Unification
   , unifyRuleACInstEqs
@@ -955,6 +957,56 @@ equalUpToAddedActions ruAC@(Rule _ ps cs as _) ruE@(Rule _ ps' cs' as' _) =
       then compareActions ass ass'
       else compareActions ass (a':ass')
 
+-- | @alignRuleUpToRenaming member computed@ checks that @member@ equals
+-- @computed@ up to a bijective, sort-preserving renaming of variables and up
+-- to added actions: the premises and conclusions of @member@ are the renamed
+-- ones of @computed@, and the renamed actions of @computed@ occur in order
+-- among the actions of @member@. It returns those actions of @member@, that
+-- is, the actions of @computed@ in the variable names of @member@; the other
+-- actions of @member@ are added. The first alignment found is returned.
+-- Terms are compared modulo AC, and macros must already be expanded.
+alignRuleUpToRenaming :: (HasRuleName (Rule i), HasRuleName (Rule j))
+                      => Rule i -> Rule j -> WithMaude (Maybe [LNFact])
+alignRuleUpToRenaming member computed
+  | ruleName member /= ruleName computed = return Nothing
+  | equalUpToAddedActions member computed = return (Just acts')
+  | skeleton (facts' []) /= skeleton (L.get rPrems computed, L.get rConcs computed, []) =
+      return Nothing
+  | otherwise = reader $ \hnd -> listToMaybe
+      [ chosen
+      | chosen <- orderedChoices (L.get rActs member) acts'
+      , let actual = facts' chosen
+      , skeleton actual == skeleton expected
+      , isRenamingOf hnd actual expected ]
+  where
+    acts' = L.get rActs computed
+    facts' as = (L.get rPrems member, L.get rConcs member, as)
+    -- Rename apart, so that the unifier relates two disjoint sets of variables.
+    expected = (L.get rPrems computed, L.get rConcs computed, acts')
+                 `renameAvoiding` facts' (L.get rActs member)
+    -- Ordered selections of member actions with the tags of the computed ones.
+    orderedChoices _      []     = [[]]
+    orderedChoices []     _      = []
+    orderedChoices (a:as) (e:es) =
+      [ a : rest | factTag a == factTag e, rest <- orderedChoices as es ] ++
+      orderedChoices as (e:es)
+    -- A renaming preserves the facts once every variable is replaced by one
+    -- variable of the same sort; this cheap test avoids most unifications.
+    skeleton :: ([LNFact], [LNFact], [LNFact]) -> ([LNFact], [LNFact], [LNFact])
+    skeleton fs = apply (substFromList [ (v, varTerm (LVar "_" (lvarSort v) 0))
+                                       | v <- frees fs ] :: LNSubst) fs
+    isRenamingOf hnd actual@(ps, cs, as) (ps', cs', as') =
+      case concat <$> sequence (zipWith factEqs (ps ++ cs ++ as) (ps' ++ cs' ++ as')) of
+        Just eqs | length ps == length ps' && length cs == length cs' ->
+          any renamesBoth (unifyLNTerm eqs `runReader` hnd)
+        _ -> False
+      where
+        renamesBoth subst = isRenaming (restrictVFresh (frees actual) subst)
+                         && isRenaming (restrictVFresh (frees (ps', cs', as')) subst)
+    factEqs (Fact tag _ ts) (Fact tag' _ ts')
+      | tag == tag' && length ts == length ts' = Just (zipWith Equal ts ts')
+      | otherwise                              = Nothing
+
 -- | returns true if the first Rule has the same name, premise, conclusion and
 -- action facts, ignoring terms
 equalUpToTerms :: (HasRuleName (Rule i), HasRuleName (Rule i2)) => (Rule i) -> (Rule i2) -> Bool
@@ -1119,6 +1171,15 @@ applyMacroInRule mcs (Rule info ruPrems ruConcs ruActs _) = Rule info mRuPrems m
     mRuConcs   = map (applyMacroInFact mcs) ruConcs
     mRuActs    = map (applyMacroInFact mcs) ruActs
     mRuNewVars = newVariables mRuPrems (mRuConcs ++ mRuActs)
+
+-- | Expand macros in an explicit variant member. Its new variables are kept
+-- in their positions, with macros expanded, instead of being recomputed from
+-- the expanded facts.
+applyMacroInRulePreservingNewVars :: [LNMacro] -> Rule i -> Rule i
+applyMacroInRulePreservingNewVars [] ru = ru
+applyMacroInRulePreservingNewVars mcs ru =
+    L.set rNewVars (map (applyMacros mcs) (L.get rNewVars ru)) $
+      applyMacroInRule mcs ru
 
 
 -- Unification
