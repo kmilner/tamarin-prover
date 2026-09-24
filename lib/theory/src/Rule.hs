@@ -21,6 +21,10 @@ import Theory.Tools.RuleVariants
 import Term.Macro
 import Theory.Constraint.Solver.Sources (IntegerParameters)
 import Data.Maybe (maybeToList)
+import Data.List (nub)
+import qualified Data.Map.Strict as M
+import Control.Monad (foldM, guard)
+import Control.Monad.Reader (runReader)
 
 -- | Get an OpenProtoRule's name
 getOpenProtoRuleName :: OpenProtoRule -> String
@@ -30,10 +34,16 @@ getOpenProtoRuleName (OpenProtoRule ruE _) = getRuleName ruE
 addProtoDiffLabel :: OpenProtoRule -> String -> OpenProtoRule
 addProtoDiffLabel (OpenProtoRule ruE ruAC) label = OpenProtoRule (addDiffLabel ruE label) (fmap ((flip addDiffLabel) label) ruAC)
 
-equalOpenRuleUpToDiffAnnotation :: OpenProtoRule -> OpenProtoRule -> Bool
-equalOpenRuleUpToDiffAnnotation (OpenProtoRule ruE1 ruAC1) (OpenProtoRule ruE2 ruAC2) =
-  equalRuleUpToDiffAnnotationSym ruE1 ruE2 && length ruAC1 == length ruAC2 &&
-  all (uncurry equalRuleUpToDiffAnnotationSym) (zip ruAC1 ruAC2)
+-- | Closing appends one parent-owned label. Remove that final occurrence when
+-- reopening, retaining any identically named actions supplied by the user.
+removeGeneratedDiffLabel :: String -> Rule i -> Rule i
+removeGeneratedDiffLabel label = L.modify rActs (reverse . removeFirst . reverse)
+  where
+    marker = protoFact Linear label []
+    removeFirst [] = []
+    removeFirst (fact:rest)
+      | fact == marker = rest
+      | otherwise = fact : removeFirst rest
 
 -- Relation between open and closed rule sets
 ---------------------------------------------
@@ -89,6 +99,102 @@ closeProtoRule hnd []     (OpenProtoRule ruE [])   = ClosedProtoRule ruE <$> may
 closeProtoRule hnd macros (OpenProtoRule ruE [])   = ClosedProtoRule ruE <$> maybeToList (variantsProtoRule hnd (applyMacroInRule macros ruE))
 closeProtoRule _   macros (OpenProtoRule ruE ruAC) =
     map (ClosedProtoRule ruE . applyMacroInRulePreservingNewVars macros) ruAC
+
+
+-- | Recover a diff member's positional new-variable vector from its canonical
+-- variant. Hidden parent slots can change the fresh indices used by unfolding,
+-- so accept a bijective syntactic renaming of an explicit member as well.
+-- Added actions are retained, and ambiguous alignments are rejected. This is
+-- deliberately separate from trace-mode manual-variant validation.
+diffVariantNewVars :: ProtoRuleAC -> ProtoRuleAC -> Maybe [LNTerm]
+diffVariantNewVars supplied canonical
+  -- Exact names preserve deliberate references to hidden parent variables in
+  -- added actions, including annotations on an already compiled member.
+  | equalUpToAddedActions supplied canonical && substitutions supplied == substitutions canonical =
+      Just (L.get rNewVars canonical)
+  | ruleName supplied /= ruleName canonical
+    || substitutions supplied /= Disj [emptySubstVFresh]
+    || substitutions canonical /= Disj [emptySubstVFresh] = Nothing
+  | otherwise = do
+      premises <- matchFacts M.empty (L.get rPrems supplied) (L.get rPrems canonical)
+      initial <- matchFacts premises (L.get rConcs supplied) (L.get rConcs canonical)
+      case take 2 $ nub [transport renaming | renaming <-
+               matchActions initial (L.get rActs supplied) (L.get rActs canonical)] of
+        [vector] -> Just vector
+        _ -> Nothing
+  where
+    substitutions = L.get (pracVariants . rInfo)
+    matchFacts env actual expected = do
+      guard (length actual == length expected)
+      foldM matchFactVariables env (zip actual expected)
+    matchFactVariables env (Fact tag ann ts, Fact tag' ann' ps) = do
+      guard (tag == tag' && ann == ann' && length ts == length ps)
+      let actual = freesList ts
+          expected = freesList ps
+      guard (length actual == length expected)
+      mapping <- foldM matchVariable env (zip actual expected)
+      -- Term's Functor preserves the exact constructor order, including AC
+      -- arguments. Substitution/mapFrees would normalize them and could admit
+      -- an AC permutation that the syntactic matcher deliberately rejects.
+      guard (map (fmap (fmap (mapping M.!))) ps == ts)
+      pure mapping
+    matchVariable env (target, source) = do
+      guard (lvarSort target == lvarSort source)
+      case M.lookup source env of
+        Just previous -> guard (previous == target) >> pure env
+        Nothing -> do
+          guard (target `notElem` M.elems env)
+          pure (M.insert source target env)
+    matchActions env _ [] = [env]
+    matchActions _ [] _ = []
+    matchActions env (a:as) expected@(p:ps) =
+      [result | next <- maybeToList (matchFactVariables env (a,p)),
+                result <- matchActions next as ps]
+      ++ matchActions env as expected
+    transport env = apply (substFromList [(v,varTerm w) | (v,w) <- M.toList complete] :: LNSubst)
+                          (L.get rNewVars canonical)
+      where
+        -- An invisible canonical variable must not capture an extra action's
+        -- variable (or another transported slot) in the supplied member.
+        complete = foldl addHidden env (frees (L.get rNewVars canonical))
+        suppliedFacts = (L.get rPrems supplied, L.get rConcs supplied, L.get rActs supplied)
+        addHidden mapping v
+          | M.member v mapping = mapping
+          | otherwise = M.insert v fresh mapping
+          where
+            fresh | v `notElem` frees suppliedFacts && v `notElem` M.elems mapping = v
+                  | otherwise = renameAvoiding v (suppliedFacts, canonical, M.elems mapping)
+
+-- | Prepare a supplied diff family with one shared match matrix. Coverage and
+-- unique positional alignment and added-action checks use the same matches.
+-- Invalid input retains its members for the usual wellformedness diagnostics.
+prepareDiffRule :: MaudeHandle -> OpenProtoRule
+                -> (OpenProtoRule, [(ProtoRuleAC, [LNFact])], Bool)
+prepareDiffRule hnd (OpenProtoRule ruE supplied) =
+    (OpenProtoRule ruE aligned, inheritedActions, null supplied || complete)
+  where
+    automatic = closeProtoRule hnd [] (OpenProtoRule ruE [])
+    compact = map (L.get cprRuleAC) automatic
+    unfolded = map (L.get cprRuleAC) (concatMap unfoldRuleVariants automatic)
+    candidates = nub (compact ++ unfolded)
+    matches = [[(c, vector) | c <- candidates, Just vector <- [diffVariantNewVars p c]]
+              | p <- supplied]
+    -- Keep the existing action alignment, but only for accepted candidates.
+    -- Closing does not need this lazy result; validation consumes it once.
+    inheritedActions =
+      [ (member, inherited)
+      | (member, accepted) <- zip aligned matches, (canonical, _) <- accepted
+      , Just inherited <- [alignRuleUpToRenaming member canonical `runReader` hnd] ]
+    vectors = map (nub . map snd) matches
+    aligned = zipWith align supplied vectors
+    align p [vector] = L.set rNewVars vector p
+    align p _ = p
+    unique [_] = True
+    unique _ = False
+    covered c = any (any ((== c) . fst)) matches
+    -- A matching compact member represents its whole unfolded family.
+    complete = all unique vectors &&
+      (all covered compact || all covered unfolded)
 
 
 -- | Returns true if the REFINED sources contain open chains.

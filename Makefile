@@ -497,10 +497,15 @@ DIFF_REGRESSION_CASE_STUDIES+=soundness-diff-multisession-restriction.spthy soun
 DIFF_REGRESSION_CASE_STUDIES+=soundness-diff-mirror-unifiers.spthy soundness-diff-unreachable-trivial-goal.spthy soundness-diff-conditional-restriction.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-alternative-conditional-restrictions.spthy diff-joint-conditional-restrictions.spthy diff-joint-conditional-attack.spthy
 DIFF_REGRESSION_CASE_STUDIES+=diff-mirror-reuse-specialization.spthy
-DIFF_REGRESSION_CASE_STUDIES+=diff-disequality-attack.spthy
+DIFF_REGRESSION_CASE_STUDIES+=diff-disequality-attack.spthy diff-asymmetric-explicit-variants.spthy diff-singleton-trivial-variants.spthy
+DIFF_REGRESSION_CASE_STUDIES+=diff-variant-family-roundtrip.spthy diff-explicit-variant-export.spthy diff-auto-source-variable-alignment.spthy
 case-studies$(SUBDIR)regression/trace/diff-auto-source-macros_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--auto-sources --bound=8 --quit-on-warning
 case-studies$(SUBDIR)regression/trace/diff-multisession-observable-restriction_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--bound=6
+case-studies$(SUBDIR)regression/trace/diff-explicit-variant-export_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--bound=6
+case-studies$(SUBDIR)regression/trace/diff-auto-source-variable-alignment_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--auto-sources --bound=6 --quit-on-warning
 DIFF_REGRESSION_CASE_STUDIES+=diff-side-restriction-choices.spthy
+DIFF_REGRESSION_CASE_STUDIES+=diff-auto-source-duplicate-members.spthy
+case-studies$(SUBDIR)regression/trace/diff-auto-source-duplicate-members_analyzed-diff.spthy: DIFF_EXTRA_ARGS=--auto-sources --bound=6 --quit-on-warning
 DIFF_REGRESSION_TARGETS=$(subst .spthy,_analyzed-diff.spthy,$(addprefix case-studies$(SUBDIR)regression/trace/,$(DIFF_REGRESSION_CASE_STUDIES)))
 
 
