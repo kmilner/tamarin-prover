@@ -1053,6 +1053,10 @@
             "type": "SYMBOL",
             "name": "heuristic"
           }
+        },
+        {
+          "type": "SYMBOL",
+          "name": "heuristic_end"
         }
       ]
     },
@@ -7086,6 +7090,14 @@
     {
       "type": "SYMBOL",
       "name": "single_comment"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "heuristic_end"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "_error_sentinel"
     }
   ],
   "inline": [],

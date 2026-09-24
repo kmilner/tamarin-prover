@@ -12,7 +12,8 @@ end
   theory_name: (ident)
   (global_heuristic
     heuristic: (heuristic
-      (ranking_sequence))))
+      (ranking_sequence))
+    (heuristic_end)))
 
 ==================================================
 Mixed uppercase and lowercase oracle rankings
@@ -28,7 +29,8 @@ end
   theory_name: (ident)
   (global_heuristic
     heuristic: (heuristic
-      (ranking_sequence))))
+      (ranking_sequence))
+    (heuristic_end)))
 
 ==================================================
 Lemma heuristic with default oracle rankings
@@ -64,7 +66,8 @@ end
   theory_name: (ident)
   (global_heuristic
     heuristic: (heuristic
-      (ranking_sequence))))
+      (ranking_sequence))
+    (heuristic_end)))
 
 ==================================================
 Spaces around oracle paths and tactics
@@ -85,7 +88,8 @@ end
       (tactic_reference
         name: (ident))
       (ranking_sequence)
-      (ranking_sequence))))
+      (ranking_sequence))
+    (heuristic_end)))
 
 ==================================================
 Rankings do not consume the following declaration
@@ -103,7 +107,8 @@ end
   theory_name: (ident)
   (global_heuristic
     heuristic: (heuristic
-      (ranking_sequence)))
+      (ranking_sequence))
+    (heuristic_end))
   (formal_comment
     comment_identifier: (ident))
   (process
@@ -206,7 +211,8 @@ end
   theory_name: (ident)
   (global_heuristic
     heuristic: (heuristic
-      (ranking_sequence))))
+      (ranking_sequence))
+    (heuristic_end)))
 
 ==================================================
 Heuristic must not be empty

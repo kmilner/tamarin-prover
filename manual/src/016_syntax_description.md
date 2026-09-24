@@ -39,7 +39,9 @@ enable it to parse terms containing exponentiations, e.g.,  g ^ x.
 
 A global heuristic sets the default heuristic that will be used when autoproving
 lemmas in the file. The specified proof method ranking can be any of those discussed in
-Section [Heuristics](010_advanced-features.html#sec:heuristics).
+Section [Heuristics](010_advanced-features.html#sec:heuristics). Rankings can be separated by
+ASCII spaces. A line break, tab, or comment ends the sequence; the external
+`heuristic_end` marker denotes this boundary without consuming it.
 
 ~~~~ {.tamarin grammar="grammar/grammar.ebnf" rules="global_heuristic,heuristic,ranking_sequence,tactic_reference"}
 ~~~~

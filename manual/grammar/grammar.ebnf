@@ -2,7 +2,7 @@ extras  ::=  { multi_comment single_comment /\s|\\\r?\n|\u00A0/ }
 
 conflicts  ::=  { { pub_var } { fresh_var } { temporal_var } { nat_var } { pub_var fresh_var msg_var_or_nullary_fun temporal_var nat_var } { pub_var fresh_var msg_var_or_nullary_fun nat_var } { nary_app predicate_ref } { _base_fact _term_ident } { nullary_fun nary_app msg_var_or_nullary_fun } }
 
-externals  ::=  { multi_comment single_comment }
+externals  ::=  { multi_comment single_comment heuristic_end _error_sentinel }
 
 precedences  ::=  { { 'PROCESS' 'NESTED' 'FUNCTION' 'VARIABLE' 'EXPONENTIAL' 'MULTIPLY' 'ADD' 'MUL_SET' 'TUPLE' 'NULLARY_FUN' 'ATOM' 'LOGICAL_NOT' 'EXCLUSIVE_OR' 'LOGICAL_AND' 'LOGICAL_OR' 'LOGICAL_IMPLICATION' 'LOGICAL_IFF' 'QUANTIFIER' 'CHAIN_CONSTRAINT' } { 'NON_DIFF' 'DIFF' } { 'REPLICATION' 'EVENT' 'CHOICE' 'PROCESS_LET' 'LOOKUP' 'CONDITIONAL' } }
 
@@ -36,7 +36,7 @@ rules:
   predicate  ::=  (ident: predicate_identifier) '(' arguments? ')' '<=>' (_formula: formula)
   options  ::=  'options' ':' option (',' option)* ','?
   option  ::=  'translation-state-optimisation' | 'translation-progress' | 'translation-asynchronous-channels' | 'translation-compress-events' | 'translation-allow-pattern-lookups'
-  global_heuristic  ::=  'heuristic' ':' (heuristic: heuristic)
+  global_heuristic  ::=  'heuristic' ':' (heuristic: heuristic) heuristic_end
   heuristic  ::=  (ranking_sequence | tactic_reference)+
   builtin_ranking  ::=  'C' | 'I' | 'S' | 'P' | 'c' | 'i' | 's' | 'p'
   ranking_sequence  ::=  @((/[Oo]/ (/ */ '"' /[^"\n\r]+/ '"')?)+ | ((/[Oo]/ (/ */ '"' /[^"\n\r]+/ '"')?)* ('C' | 'I' | 'S' | 'P' | 'c' | 'i' | 's' | 'p') (('C' | 'I' | 'S' | 'P' | 'c' | 'i' | 's' | 'p') | /[Oo]/)*))

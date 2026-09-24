@@ -32,7 +32,9 @@ module.exports = grammar({
 
   externals: $ => [
       $.multi_comment,
-      $.single_comment
+      $.single_comment,
+      $.heuristic_end,
+      $._error_sentinel
   ],
 
   precedences: $ => [
@@ -328,7 +330,8 @@ module.exports = grammar({
       global_heuristic: $ => seq(
           'heuristic',
           ':',
-          field('heuristic', $.heuristic)
+          field('heuristic', $.heuristic),
+          $.heuristic_end
       ),
 
       heuristic: $ => repeat1(choice(

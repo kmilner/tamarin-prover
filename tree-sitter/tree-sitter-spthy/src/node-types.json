@@ -2572,6 +2572,16 @@
           }
         ]
       }
+    },
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "heuristic_end",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -7322,6 +7332,10 @@
   {
     "type": "heuristic",
     "named": false
+  },
+  {
+    "type": "heuristic_end",
+    "named": true
   },
   {
     "type": "hide_lemma",

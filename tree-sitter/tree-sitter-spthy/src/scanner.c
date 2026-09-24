@@ -5,7 +5,9 @@
 
 enum TokenType {
     MULTI_COMMENT,
-    SINGLE_COMMENT
+    SINGLE_COMMENT,
+    HEURISTIC_END,
+    ERROR_SENTINEL
 };
 
 // Code inspired by:
@@ -17,6 +19,21 @@ unsigned tree_sitter_spthy_external_scanner_serialize(void *payload, char *buffe
 void tree_sitter_spthy_external_scanner_deserialize(void *payload, const char *buffer, unsigned length) {}
 
 bool tree_sitter_spthy_external_scanner_scan(void *payload, TSLexer *lexer, const bool *valid_symbols) {
+    // goalRanking consumes ASCII spaces between rankings, but a newline, tab
+    // or comment ends the global heuristic. Check before skipping whitespace
+    // so a following formal-comment header is lexed as an identifier.
+    // The unused sentinel is only valid during error recovery. Do not emit
+    // a zero-width boundary there, where it could obscure the actual error.
+    if (valid_symbols[HEURISTIC_END] && !valid_symbols[ERROR_SENTINEL]) {
+        while (lexer->lookahead == ' ') lexer->advance(lexer, true);
+        if (!iswalpha(lexer->lookahead) && lexer->lookahead != '{'
+                && lexer->lookahead != '"') {
+            lexer->mark_end(lexer);
+            lexer->result_symbol = HEURISTIC_END;
+            return true;
+        }
+    }
+
     while (iswspace(lexer->lookahead)) lexer->advance(lexer, true);
 
     if (lexer->lookahead == '/') {
