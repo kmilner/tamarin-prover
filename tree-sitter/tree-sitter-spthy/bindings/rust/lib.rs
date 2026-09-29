@@ -65,7 +65,19 @@ mod tests {
         parser.set_language(&super::LANGUAGE.into()).unwrap();
 
         // Use escaped bytes: the repository normalizes corpus files to LF.
-        for boundary in ["\n", "\r\n    ", "\t", " /* boundary */", " // boundary\n"] {
+        for boundary in [
+            "\n",
+            "\r\n    ",
+            "\t",
+            "\x0c",
+            "\x0b",
+            " /* boundary */",
+            " // boundary\n",
+            "\x0c/* boundary */",
+            "\x0b/* boundary */",
+            "\x0c// boundary\n",
+            "\x0b// boundary\n",
+        ] {
             let source =
                 format!("theory Test begin\nheuristic: s{boundary}s{{* comment *}}\nend\n");
             let tree = parser.parse(&source, None).unwrap();
@@ -80,12 +92,66 @@ mod tests {
         // Check native error flags too: CLI output can omit missing anonymous tokens.
         for source in [
             "theory Test begin\nheuristic: s\ni\nend\n",
+            "theory Test begin\nheuristic: s\x0ci\nend\n",
+            "theory Test begin\nheuristic: s\x0bi\nend\n",
             "theory Test begin\nheuristic: s text{* comment *}\nend\n",
             "theory Test begin\nheuristic: s",
         ] {
             let tree = parser.parse(source, None).unwrap();
             assert!(tree.root_node().has_error(), "{source:?}");
         }
+    }
+
+    #[test]
+    fn test_nonbreaking_space_before_rankings() {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&super::LANGUAGE.into()).unwrap();
+        for space in ["\u{a0}", " \u{a0} ", "\u{a0}/* comment */\u{a0}"] {
+            for ranking in ["s", "o \"path\"", "{Custom}"] {
+                for body in [
+                    format!("heuristic:{space}{ranking}"),
+                    format!("lemma L [heuristic={space}{ranking}]: \"T\""),
+                ] {
+                    let source = format!("theory Test begin\n{body}\nend\n");
+                    let tree = parser.parse(&source, None).unwrap();
+                    assert!(
+                        !tree.root_node().has_error(),
+                        "{source:?}: {}",
+                        tree.root_node().to_sexp()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_individual_rankings() {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&super::LANGUAGE.into()).unwrap();
+        let source = "theory Test begin\nheuristic: sO \"my oracle.py\"{Custom}io\nend\n";
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let global = tree.root_node().named_child(1).unwrap();
+        let heuristic = global.child_by_field_name("heuristic").unwrap();
+        let mut cursor = heuristic.walk();
+        let rankings: Vec<_> = heuristic.named_children(&mut cursor).collect();
+        assert_eq!(
+            rankings.iter().map(|node| node.kind()).collect::<Vec<_>>(),
+            [
+                "builtin_ranking",
+                "oracle_ranking",
+                "tactic_reference",
+                "builtin_ranking",
+                "oracle_ranking"
+            ]
+        );
+        let path = rankings[1].child_by_field_name("path").unwrap();
+        assert_eq!(
+            path.utf8_text(source.as_bytes()).unwrap().trim_start(),
+            "\"my oracle.py\""
+        );
+        let name = rankings[2].child_by_field_name("name").unwrap();
+        assert_eq!(name.utf8_text(source.as_bytes()).unwrap(), "Custom");
     }
 
     #[test]
@@ -108,11 +174,18 @@ mod tests {
             point
         };
 
-        for (before, after, has_error) in [
-            ("\n", " ", true),
-            (" ", "\r\n", false),
-            (" ", " /* boundary */", false),
-            (" /* boundary */", " ", true),
+        for (before, after, suffix, has_error) in [
+            ("\n", " ", suffix, true),
+            (" ", "\r\n", suffix, false),
+            ("\n", "\x0c", suffix, false),
+            ("\x0b", " ", suffix, true),
+            (" ", " /* boundary */", suffix, false),
+            (" /* boundary */", " ", suffix, true),
+            ("", " ", "O\"my oracle.py\"\nend\n", false),
+            (" ", "\n", "O\"my oracle.py\"\nend\n", true),
+            ("\n", " ", "O\"my oracle.py\"\nend\n", false),
+            (" ", " /* boundary */", "O\"my oracle.py\"\nend\n", true),
+            (" /* boundary */", " ", "O\"my oracle.py\"\nend\n", false),
         ] {
             let old_source = format!("{prefix}{before}{suffix}");
             let new_source = format!("{prefix}{after}{suffix}");
