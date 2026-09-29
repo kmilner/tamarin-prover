@@ -7,11 +7,17 @@
 module Test.ParserTests (
    testParseFile
  , testParseDirectory
+ , testHeuristics
  ) where
 
 import Test.HUnit
 
 import Control.Basics
+
+import Data.Either (isLeft, isRight)
+import Text.Parsec (eof)
+import Theory.Text.Parser.Signature qualified as Signature
+import Theory.Text.Parser.Token (parseString)
 
 import System.Directory
 import System.FilePath
@@ -87,3 +93,17 @@ testParseDirectory mkTest n dir
                 | file <- contents, takeExtension file == ".spthy" ]
     mapM_ (putStrLn . (" peparing: " ++)) tests
     pure $ map mkTest tests ++ map TestList innerTests
+
+-- | Rankings are individual items, and only spaces separate them.
+testHeuristics :: Test
+testHeuristics = TestLabel "heuristic parsing" $ TestCase $ do
+  let parse = fmap prettyGoalRankings . parseString [] "heuristic"
+        (Signature.heuristic False Nothing <* eof)
+  assertEqual "oracle path after a builtin" (Right "s O \"path\" i {Custom}") $
+    parse "heuristic: sO \"path\"i{Custom}\n"
+  forM_ ["\n", "\t", "\f", "\v", "\f/* comment */", "\v// comment\n"] $ \boundary ->
+    assertEqual (show boundary) (Right "s") (parse ("heuristic: s" ++ boundary))
+  forM_ ["sx\n", "s\ni\n", "s #endif"] $ \rankings ->
+    assertBool rankings (isLeft (parse ("heuristic: " ++ rankings)))
+  assertBool "lemma heuristic whitespace" $ isRight $ parseOpenTheoryString []
+    "theory T begin lemma L [heuristic=\160sO \"path\" /* trailing */]: \"T\" end"
